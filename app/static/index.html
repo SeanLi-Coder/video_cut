@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f5f7fb">
+    <meta name="description" content="在本机快速预览并剪辑视频片段">
+    <title>本地视频剪辑</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+
+    <div class="page-glow page-glow-one" aria-hidden="true"></div>
+    <div class="page-glow page-glow-two" aria-hidden="true"></div>
+
+    <header class="site-header">
+      <div class="header-inner">
+        <a class="brand" href="/" aria-label="本地视频剪辑首页">
+          <span class="brand-mark" aria-hidden="true">
+            <img src="/assets/favicon.svg" alt="">
+          </span>
+          <span>
+            <span class="brand-name" id="app-name">本地视频剪辑</span>
+            <span class="brand-caption">LOCAL VIDEO CUTTER</span>
+          </span>
+        </a>
+
+        <div class="privacy-chip" title="视频只在这台电脑上处理">
+          <span class="privacy-dot" aria-hidden="true"></span>
+          仅在本机处理
+        </div>
+      </div>
+    </header>
+
+    <main id="main-content" class="main-content">
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">高保真精准剪辑，不绕弯</p>
+        <h1 id="page-title">留下想要的这一段</h1>
+        <p class="hero-copy">选一个视频，填好起点和终点，预览满意后直接保存。原视频始终不会被修改。</p>
+
+        <ol class="journey" aria-label="剪辑步骤">
+          <li class="journey-item is-active" id="journey-source">
+            <span class="journey-number">1</span>
+            <span>选择视频</span>
+          </li>
+          <li class="journey-line" aria-hidden="true"></li>
+          <li class="journey-item" id="journey-trim">
+            <span class="journey-number">2</span>
+            <span>设置片段</span>
+          </li>
+          <li class="journey-line" aria-hidden="true"></li>
+          <li class="journey-item" id="journey-export">
+            <span class="journey-number">3</span>
+            <span>确认导出</span>
+          </li>
+        </ol>
+      </section>
+
+      <div id="system-banner" class="system-banner" role="alert" hidden>
+        <span class="system-banner-icon" aria-hidden="true">!</span>
+        <div>
+          <strong id="system-banner-title">暂时无法使用</strong>
+          <p id="system-banner-message"></p>
+        </div>
+        <button class="text-button" id="reload-button" type="button">刷新页面</button>
+      </div>
+
+      <noscript>
+        <div class="system-banner">
+          <span class="system-banner-icon" aria-hidden="true">!</span>
+          <div><strong>需要启用 JavaScript</strong><p>请在浏览器设置中启用 JavaScript 后刷新页面。</p></div>
+        </div>
+      </noscript>
+
+      <section class="workflow-card source-card is-active" id="source-card" aria-labelledby="source-heading">
+        <div class="section-heading">
+          <span class="step-badge" aria-hidden="true">1</span>
+          <div>
+            <h2 id="source-heading">选择本地视频</h2>
+            <p>支持常见视频格式，文件不会上传到网络。</p>
+          </div>
+        </div>
+
+        <div class="source-empty" id="source-empty">
+          <div class="file-illustration" aria-hidden="true">
+            <span class="file-play"></span>
+          </div>
+          <div class="source-empty-copy">
+            <strong>先从 Mac 中选一个视频</strong>
+            <span>将在 Finder 中打开文件选择窗口</span>
+          </div>
+          <button class="button button-primary" id="select-video-button" type="button">
+            <span class="button-spinner" aria-hidden="true"></span>
+            <svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6.75A2.75 2.75 0 0 1 6.75 4h3.19c.73 0 1.42.29 1.94.8l.57.58c.24.24.57.37.91.37h3.89A2.75 2.75 0 0 1 20 8.5v7.75A2.75 2.75 0 0 1 17.25 19H6.75A2.75 2.75 0 0 1 4 16.25v-9.5Z"/><path d="M8 12h8M12 8v8"/></svg>
+            <span class="button-label">选择视频</span>
+          </button>
+        </div>
+
+        <div class="selected-file" id="selected-file" hidden>
+          <div class="selected-file-main">
+            <div class="selected-file-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9 5 3-5 3V9Z"/></svg>
+            </div>
+            <div class="selected-file-copy">
+              <strong id="video-name">—</strong>
+              <span id="video-path">—</span>
+            </div>
+          </div>
+          <dl class="media-facts" aria-label="视频信息">
+            <div><dt>总时长</dt><dd id="video-duration">—</dd></div>
+            <div><dt>画面</dt><dd id="video-resolution">—</dd></div>
+            <div><dt>帧率</dt><dd id="video-fps">—</dd></div>
+            <div><dt>编码</dt><dd id="video-codecs">—</dd></div>
+          </dl>
+          <button class="button button-secondary button-compact" id="replace-video-button" type="button">
+            <span class="button-spinner" aria-hidden="true"></span>
+            <span class="button-label">更换视频</span>
+          </button>
+        </div>
+      </section>
+
+      <section class="workflow-card trim-card is-disabled" id="trim-card" aria-labelledby="trim-heading" aria-disabled="true">
+        <div class="section-heading">
+          <span class="step-badge" aria-hidden="true">2</span>
+          <div>
+            <h2 id="trim-heading">设置剪辑范围</h2>
+            <p>只需填写起始时间和结束时间，预览会自动更新。</p>
+          </div>
+          <div class="clip-length" id="clip-length" aria-live="polite">
+            <span>片段时长</span>
+            <strong id="clip-duration">—</strong>
+          </div>
+        </div>
+
+        <div class="trim-layout">
+          <div class="time-panel">
+            <div class="time-field">
+              <label for="start-time">起始时间</label>
+              <div class="time-input-wrap">
+                <input id="start-time" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="00:00:00.000" disabled aria-describedby="time-format-hint start-time-error">
+                <span class="time-input-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>
+                </span>
+              </div>
+              <p class="field-error" id="start-time-error" aria-live="polite"></p>
+            </div>
+
+            <div class="time-connector" aria-hidden="true">
+              <span></span>
+              <svg viewBox="0 0 24 24"><path d="M5 12h14M15 8l4 4-4 4"/></svg>
+              <span></span>
+            </div>
+
+            <div class="time-field">
+              <label for="end-time">结束时间</label>
+              <div class="time-input-wrap">
+                <input id="end-time" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="00:00:00.000" disabled aria-describedby="time-format-hint end-time-error">
+                <span class="time-input-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>
+                </span>
+              </div>
+              <p class="field-error" id="end-time-error" aria-live="polite"></p>
+            </div>
+
+            <p class="time-format-hint" id="time-format-hint">例如 75.5、01:15.500 或 00:01:15.500</p>
+
+            <div class="range-readout" id="range-readout" role="img" aria-label="当前剪辑范围">
+              <div class="range-track">
+                <span class="range-selection"></span>
+              </div>
+              <div class="range-labels">
+                <span>0:00</span>
+                <span id="range-total">—</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="preview-panel" id="preview-panel">
+            <div class="preview-frame">
+              <video id="preview-video" controls playsinline preload="metadata" hidden></video>
+              <div class="preview-placeholder" id="preview-placeholder">
+                <div class="preview-placeholder-icon" aria-hidden="true">
+                  <svg viewBox="0 0 48 48"><rect x="5" y="8" width="38" height="32" rx="7"/><path d="m20 17 13 7-13 7V17Z"/></svg>
+                </div>
+                <strong>视频预览会显示在这里</strong>
+                <span>选择视频后即可查看</span>
+              </div>
+              <div class="preview-loading" id="preview-loading" hidden>
+                <span class="large-spinner" aria-hidden="true"></span>
+                <strong id="preview-loading-title">正在更新预览…</strong>
+                <span>新的时间范围马上就好</span>
+              </div>
+            </div>
+            <div class="preview-footer">
+              <div class="preview-status" aria-live="polite">
+                <span class="status-dot" id="preview-status-dot" aria-hidden="true"></span>
+                <span id="preview-status-text">等待选择视频</span>
+              </div>
+              <button class="text-button" id="retry-preview-button" type="button" hidden>重试预览</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="workflow-card export-card is-disabled" id="export-card" aria-labelledby="export-heading" aria-disabled="true">
+        <div class="section-heading export-heading-row">
+          <span class="step-badge" aria-hidden="true">3</span>
+          <div>
+            <h2 id="export-heading">确认并导出</h2>
+            <p>导出为新文件，原视频不会有任何变化。</p>
+          </div>
+          <span class="quality-chip">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7.5 12 3 3 6-7"/><circle cx="12" cy="12" r="9"/></svg>
+            保持原分辨率与高品质音频
+          </span>
+        </div>
+
+        <div id="export-setup">
+          <div class="destination-row">
+            <div class="destination-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M3.5 7.5A2.5 2.5 0 0 1 6 5h3.7c.5 0 1 .2 1.35.55l.9.9c.35.35.84.55 1.34.55H18a2.5 2.5 0 0 1 2.5 2.5v7A2.5 2.5 0 0 1 18 19H6a2.5 2.5 0 0 1-2.5-2.5v-9Z"/></svg>
+            </div>
+            <div class="destination-copy">
+              <span class="destination-label">保存到</span>
+              <strong id="output-directory">首次使用，请选择保存目录</strong>
+            </div>
+            <button class="button button-secondary button-compact" id="select-directory-button" type="button" disabled>
+              <span class="button-spinner" aria-hidden="true"></span>
+              <span class="button-label">选择文件夹</span>
+            </button>
+          </div>
+
+          <div class="filename-preview">
+            <span class="filename-label">文件名</span>
+            <span class="filename-value" id="suggested-output-name">选择视频后自动生成</span>
+            <span class="filename-note">如遇同名文件会自动添加编号</span>
+          </div>
+
+          <div class="export-action-row">
+            <div class="ready-note" id="ready-note">
+              <span class="ready-note-icon" aria-hidden="true">i</span>
+              <span id="ready-note-text">请先选择视频并设置剪辑范围</span>
+            </div>
+            <button class="button button-primary button-export" id="export-button" type="button" disabled>
+              <span class="button-spinner" aria-hidden="true"></span>
+              <span class="button-label">确定并导出</span>
+              <svg class="button-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M15 8l4 4-4 4"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="export-progress-panel" id="export-progress-panel" hidden>
+          <div class="progress-topline">
+            <div>
+              <span class="progress-kicker" id="export-progress-kicker">正在准备</span>
+              <strong id="export-progress-title">正在导出视频…</strong>
+            </div>
+            <strong class="progress-percentage" id="export-progress-value">0%</strong>
+          </div>
+          <div class="progress-track" id="export-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <span id="export-progress-bar"></span>
+          </div>
+          <div class="progress-bottomline">
+            <span id="export-progress-message">正在安全地创建新文件，请不要关闭此页面。</span>
+            <span id="export-elapsed"></span>
+            <button class="text-button danger-text" id="cancel-export-button" type="button">取消导出</button>
+          </div>
+        </div>
+
+        <div class="export-complete-panel" id="export-complete-panel" hidden>
+          <div class="success-icon" aria-hidden="true">
+            <svg viewBox="0 0 32 32"><path d="m9 16 4.5 4.5L23 11"/></svg>
+          </div>
+          <div class="success-copy">
+            <span>剪辑完成，原视频未被修改</span>
+            <strong id="completed-output-name">—</strong>
+            <span class="success-path" id="completed-output-path">—</span>
+          </div>
+          <div class="success-actions">
+            <button class="button button-primary button-compact" id="reveal-output-button" type="button">在 Finder 中显示</button>
+            <button class="button button-secondary button-compact" id="continue-button" type="button">继续剪辑</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>本地处理 · 不上传 · 不修改原文件</span>
+      <span class="footer-separator" aria-hidden="true">·</span>
+      <span id="version-label">正在连接本地服务…</span>
+    </footer>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden>
+      <span class="toast-icon" aria-hidden="true"></span>
+      <span id="toast-message"></span>
+    </div>
+  </body>
+</html>

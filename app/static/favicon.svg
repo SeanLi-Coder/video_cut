@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="本地视频剪辑">
+  <defs>
+    <linearGradient id="bg" x1="8" y1="7" x2="57" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7771F2"/>
+      <stop offset="1" stop-color="#4842CF"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="19" y1="18" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF" stop-opacity=".98"/>
+      <stop offset="1" stop-color="#DDDFFF" stop-opacity=".88"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="18" fill="url(#bg)"/>
+  <path d="M14 21.5A5.5 5.5 0 0 1 19.5 16h25a5.5 5.5 0 0 1 5.5 5.5v21a5.5 5.5 0 0 1-5.5 5.5h-25a5.5 5.5 0 0 1-5.5-5.5v-21Z" fill="none" stroke="url(#shine)" stroke-width="3"/>
+  <path d="M14.5 25h35M14.5 39h35M23 17v8M41 17v8M23 39v8M41 39v8" fill="none" stroke="url(#shine)" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="m28 27.2 9.2 5.3L28 37.8V27.2Z" fill="#fff"/>
+</svg>

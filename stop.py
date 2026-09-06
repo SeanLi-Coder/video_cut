@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+RECORD_PATH = PROJECT_ROOT / "data" / "runtime" / "runtime.json"
+APP_ID = "com.seanli.local-video-cutter"
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, ProcessLookupError):
+        return False
+    completed = subprocess.run(
+        ["/bin/ps", "-p", str(pid), "-o", "state="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.returncode == 0 and not completed.stdout.strip().startswith("Z")
+
+
+def _request_starting_stop(record: dict[str, Any]) -> tuple[int, bool]:
+    try:
+        launcher_pid = int(record["launcher_pid"])
+        control_port = int(record["control_port"])
+        stop_token = str(record["stop_token"])
+    except (KeyError, TypeError, ValueError):
+        return 0, False
+    try:
+        with socket.create_connection(("127.0.0.1", control_port), timeout=1) as connection:
+            connection.settimeout(1)
+            connection.sendall(f"{stop_token}\n".encode("ascii"))
+            connection.shutdown(socket.SHUT_WR)
+            accepted = connection.recv(32).strip() == b"stopping"
+    except (OSError, UnicodeEncodeError):
+        return launcher_pid, False
+    return launcher_pid, accepted
+
+
+def _request_json(request: Request, timeout: float = 1.0) -> dict[str, Any] | None:
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read(32_768).decode("utf-8"))
+    except (
+        HTTPError,
+        URLError,
+        OSError,
+        TimeoutError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def main() -> int:
+    try:
+        record = json.loads(RECORD_PATH.read_text(encoding="utf-8"))
+        instance_id = str(record["instance_id"])
+        stop_token = str(record["stop_token"])
+        project_root = Path(record["project_root"]).resolve()
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        print("Local Video Cutter is not running.")
+        return 0
+    if project_root != PROJECT_ROOT.resolve() or record.get("app_id") != APP_ID:
+        print("Stop refused because the runtime record does not match this project.")
+        return 1
+    if record.get("phase") == "starting":
+        launcher_pid, accepted = _request_starting_stop(record)
+        if not accepted:
+            print("The saved startup process did not accept the authenticated stop request.")
+            return 1
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                current = json.loads(RECORD_PATH.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                current = None
+            if (
+                not _pid_is_alive(launcher_pid)
+                or not isinstance(current, dict)
+                or current.get("instance_id") != instance_id
+            ):
+                print("Local Video Cutter startup stopped.")
+                return 0
+            time.sleep(0.2)
+        print("The startup process is still stopping.")
+        return 1
+    try:
+        port = int(record["port"])
+        server_pid = int(record["server_pid"])
+        launcher_pid = int(record["launcher_pid"])
+    except (KeyError, TypeError, ValueError):
+        print("The runtime record is incomplete.")
+        return 1
+    health = _request_json(Request(f"http://127.0.0.1:{port}/api/health"))
+    if (
+        not health
+        or health.get("app_id") != APP_ID
+        or health.get("instance_id") != instance_id
+        or health.get("server_pid") != server_pid
+    ):
+        print("Local Video Cutter is not running, or the saved runtime identity is stale.")
+        return 1
+    response = _request_json(
+        Request(
+            f"http://127.0.0.1:{port}/api/runtime/stop",
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json", "X-Stop-Token": stop_token},
+        )
+    )
+    if not response or response.get("instance_id") != instance_id:
+        print("The verified server did not accept the stop request.")
+        return 1
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        health = _request_json(Request(f"http://127.0.0.1:{port}/api/health"), 0.25)
+        if health is None and not _pid_is_alive(server_pid) and not _pid_is_alive(launcher_pid):
+            print("Local Video Cutter stopped.")
+            return 0
+        time.sleep(0.2)
+    print("The server accepted the stop request but is still shutting down.")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
