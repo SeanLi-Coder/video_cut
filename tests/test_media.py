@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -11,14 +12,17 @@ import pytest
 from app.media import (
     ExportJob,
     ExportManager,
+    FrameExtractionManager,
     MediaError,
     VideoSource,
     available_output_path,
+    default_frame_directory_name,
     default_output_name,
     format_timecode,
     parse_timecode,
     probe_video,
     safe_output_stem,
+    validate_frame_range,
     validate_time_range,
 )
 
@@ -70,11 +74,24 @@ def test_validate_time_range_clamps_rounded_end() -> None:
         validate_time_range("1", "10.2", duration=10)
 
 
+def test_validate_frame_range_has_an_exact_five_second_limit() -> None:
+    assert validate_frame_range("2", "7", duration=10, fps=30) == (2.0, 7.0)
+    assert validate_frame_range("0", "0.001", duration=10, fps=30) == (0.0, 0.001)
+    with pytest.raises(MediaError, match="maximum duration"):
+        validate_frame_range("2", "7.001", duration=10, fps=30)
+
+
 def test_default_output_name_is_safe_and_predictable() -> None:
     source = Path("旅行/不可能:name.mp4")
     name = default_output_name(source, 70.25, 85.5)
     assert name == "不可能_name_clip_00-01-10_250-00-01-25_500.mp4"
     assert safe_output_stem("  a\x00 / b  ") == "a_ _ b"
+
+
+def test_default_frame_directory_name_is_safe_and_predictable() -> None:
+    source = Path("旅行/不可能:name.mp4")
+    name = default_frame_directory_name(source, 1.25, 2.75)
+    assert name == "不可能_name_frames_00-00-01_250-00-00-02_750"
 
 
 def test_available_output_path_never_overwrites(tmp_path: Path) -> None:
@@ -171,6 +188,313 @@ def _wait_for_job(job, timeout: float = 60) -> dict:
             return snapshot
         time.sleep(0.05)
     raise AssertionError("export did not finish")
+
+
+def test_frame_extraction_keeps_every_frame_and_original_dimensions(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "frame boundary.mkv"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=10:duration=1",
+            "-c:v",
+            "ffv1",
+            str(source_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    original_digest = _sha256(source_path)
+    source = VideoSource(
+        "frame-boundary",
+        source_path,
+        probe_video(source_path, ffprobe=ffprobe),
+    )
+    manager = FrameExtractionManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    job = manager.create(source, start=0.25, end=0.75, output_directory=tmp_path)
+    snapshot = _wait_for_job(job)
+
+    assert snapshot["status"] == "completed", snapshot
+    assert snapshot["operation"] == "frames"
+    assert snapshot["frame_count"] == 5
+    assert job.output_path.is_dir()
+    assert _sha256(source_path) == original_digest
+    frames = sorted(job.output_path.glob("frame_*.png"))
+    assert [path.name for path in frames] == [f"frame_{number:06d}.png" for number in range(1, 6)]
+    for frame in frames:
+        header = frame.read_bytes()[:26]
+        assert header[:8] == b"\x89PNG\r\n\x1a\n"
+        assert int.from_bytes(header[16:20], "big") == 160
+        assert int.from_bytes(header[20:24], "big") == 90
+        assert header[24] == 8
+
+
+def test_frame_extraction_does_not_duplicate_or_drop_variable_rate_frames(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "variable-rate.mkv"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=10:duration=1",
+            "-vf",
+            "setpts='if(lt(N,5),N/(10*TB),(0.5+(N-5)/5)/TB)'",
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "ffv1",
+            str(source_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    timestamps = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "frame=pts_time",
+            "-of",
+            "csv=p=0",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    start, end = 0.15, 0.85
+    expected_count = sum(
+        start <= float(value.strip()) < end
+        for value in timestamps.stdout.splitlines()
+        if value.strip()
+    )
+    source = VideoSource("variable-rate", source_path, probe_video(source_path, ffprobe=ffprobe))
+    manager = FrameExtractionManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    job = manager.create(source, start=start, end=end, output_directory=tmp_path)
+    snapshot = _wait_for_job(job)
+
+    assert snapshot["status"] == "completed", snapshot
+    assert snapshot["frame_count"] == expected_count
+    assert len(list(job.output_path.glob("frame_*.png"))) == expected_count
+
+
+def test_frame_extraction_handles_a_nonzero_container_start_time(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "nonzero-start.ts"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=10:duration=1",
+            "-c:v",
+            "mpeg2video",
+            "-f",
+            "mpegts",
+            str(source_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    start_time = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=start_time",
+            "-of",
+            "default=nw=1:nk=1",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert float(start_time.stdout.strip()) > 0
+
+    source = VideoSource("nonzero-start", source_path, probe_video(source_path, ffprobe=ffprobe))
+    manager = FrameExtractionManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    job = manager.create(source, start=0.25, end=0.75, output_directory=tmp_path)
+    snapshot = _wait_for_job(job)
+
+    assert snapshot["status"] == "completed", snapshot
+    assert snapshot["frame_count"] == 5
+    assert len(list(job.output_path.glob("frame_*.png"))) == 5
+
+
+def test_frame_extraction_keeps_every_frame_after_a_long_gop(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "long-gop.ts"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=32x24:rate=1:duration=110",
+            "-c:v",
+            "mpeg2video",
+            "-g",
+            "102",
+            "-bf",
+            "2",
+            "-f",
+            "mpegts",
+            str(source_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    source = VideoSource("long-gop", source_path, probe_video(source_path, ffprobe=ffprobe))
+    manager = FrameExtractionManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    job = manager.create(source, start=100, end=105, output_directory=tmp_path)
+    snapshot = _wait_for_job(job)
+
+    assert snapshot["status"] == "completed", snapshot
+    assert snapshot["frame_count"] == 5
+
+
+def test_frame_extraction_accepts_a_subframe_window_that_contains_a_frame(
+    sample_video: Path,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source = VideoSource("short-window", sample_video, probe_video(sample_video, ffprobe=ffprobe))
+    manager = FrameExtractionManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    job = manager.create(source, start=0, end=0.001, output_directory=tmp_path)
+    snapshot = _wait_for_job(job)
+
+    assert snapshot["status"] == "completed", snapshot
+    assert snapshot["frame_count"] == 1
+
+
+def test_frame_directory_publish_never_overwrites_an_existing_directory(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    desired = tmp_path / "frames.with.dot"
+    desired.mkdir()
+    sentinel = desired / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    temporary = tmp_path / ".frames.partial"
+    temporary.mkdir()
+    frame = temporary / "frame_000001.png"
+    frame.write_bytes(b"complete frame")
+    manager = FrameExtractionManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        encoders={"png"},
+    )
+
+    published = manager._publish_directory(temporary, desired)
+
+    assert published == tmp_path / "frames.with.dot_2"
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert (published / frame.name).read_bytes() == b"complete frame"
+    assert not temporary.exists()
+
+
+def test_cancelled_frame_extraction_removes_partial_directory(
+    monkeypatch,
+    sample_video: Path,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source = VideoSource("cancel-frames", sample_video, probe_video(sample_video, ffprobe=ffprobe))
+    manager = FrameExtractionManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    process_started = threading.Event()
+    process_stopped = threading.Event()
+
+    class SlowOutput:
+        def __iter__(self):
+            process_started.set()
+            yield "frame=1\n"
+            process_stopped.wait(timeout=5)
+
+    class SlowProcess:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.stdout = SlowOutput()
+            self.stderr = io.StringIO("")
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def send_signal(self, _signal) -> None:
+            self.returncode = 130
+            process_stopped.set()
+
+        def terminate(self) -> None:
+            self.send_signal(None)
+
+        def kill(self) -> None:
+            self.send_signal(None)
+
+        def wait(self, timeout=None):
+            if not process_stopped.wait(timeout=timeout):
+                raise subprocess.TimeoutExpired("ffmpeg", timeout)
+            return self.returncode
+
+    monkeypatch.setattr("app.media.subprocess.Popen", SlowProcess)
+    job = manager.create(source, start=0, end=1, output_directory=tmp_path)
+    assert process_started.wait(timeout=5)
+    manager.cancel(job.id)
+    snapshot = _wait_for_job(job, timeout=10)
+
+    assert snapshot["status"] == "cancelled"
+    assert not job.output_path.exists()
+    assert not list(tmp_path.glob(".*.partial-*"))
 
 
 def test_rotated_video_exports_with_display_dimensions(

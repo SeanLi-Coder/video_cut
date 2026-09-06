@@ -26,6 +26,7 @@ class MediaError(RuntimeError):
 
 
 TIME_EPSILON_SECONDS = 0.002
+MAX_FRAME_EXTRACTION_SECONDS = 5.0
 
 
 def executable_path(name: str) -> str:
@@ -56,6 +57,14 @@ def _finite_float(value: object, *, label: str) -> float:
     if not math.isfinite(result):
         raise MediaError(f"Invalid {label}")
     return result
+
+
+def _optional_finite_float(value: object, *, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return result if math.isfinite(result) else default
 
 
 def _parse_frame_rate(value: object) -> float | None:
@@ -147,10 +156,10 @@ def probe_video(path: Path, *, ffprobe: str | None = None) -> dict[str, Any]:
         "error",
         "-show_entries",
         (
-            "format=duration,format_name,size,bit_rate:"
+            "format=duration,start_time,format_name,size,bit_rate:"
             "stream=index,codec_type,codec_name,width,height,avg_frame_rate,"
             "r_frame_rate,pix_fmt,sample_fmt,sample_rate,channels,channel_layout,"
-            "bit_rate,duration,duration_ts,time_base,profile,bits_per_sample,"
+            "bit_rate,duration,start_time,duration_ts,time_base,profile,bits_per_sample,"
             "bits_per_raw_sample,color_range,"
             "color_space,color_transfer,color_primaries:"
             "stream_disposition=default,attached_pic:"
@@ -262,9 +271,17 @@ def probe_video(path: Path, *, ffprobe: str | None = None) -> dict[str, Any]:
     swaps_dimensions = rotation in {90, 270}
     width = encoded_height if swaps_dimensions else encoded_width
     height = encoded_width if swaps_dimensions else encoded_height
-    rate = _parse_frame_rate(video_stream.get("avg_frame_rate"))
-    if rate is None:
-        rate = _parse_frame_rate(video_stream.get("r_frame_rate"))
+    average_rate = _parse_frame_rate(video_stream.get("avg_frame_rate"))
+    nominal_rate = _parse_frame_rate(video_stream.get("r_frame_rate"))
+    rate = average_rate or nominal_rate
+    maximum_rate = max(
+        (candidate for candidate in (average_rate, nominal_rate) if candidate is not None),
+        default=None,
+    )
+    video_start_time = _optional_finite_float(
+        video_stream.get("start_time"),
+        default=_optional_finite_float(media_format.get("start_time")),
+    )
 
     pixel_format = str(video_stream.get("pix_fmt") or "unknown")
     pixel_details = _pixel_format_catalog(ffprobe_path).get(pixel_format, {})
@@ -312,6 +329,8 @@ def probe_video(path: Path, *, ffprobe: str | None = None) -> dict[str, Any]:
         "rotation": rotation,
         "display_matrix": display_matrix,
         "fps": rate,
+        "max_fps": maximum_rate,
+        "video_start_time": video_start_time,
         "video_codec": str(video_stream.get("codec_name") or "unknown"),
         "audio_codec": (
             str(audio_stream.get("codec_name") or "unknown")
@@ -402,6 +421,19 @@ def validate_time_range(
     duration: float,
     fps: float | None = None,
 ) -> tuple[float, float]:
+    start, end = _validate_range_bounds(start_value, end_value, duration=duration)
+    minimum_duration = 1 / max(1.0, fps or 25.0)
+    if end - start + 0.000001 < minimum_duration:
+        raise MediaError("The selected range is shorter than one video frame")
+    return start, end
+
+
+def _validate_range_bounds(
+    start_value: str | int | float,
+    end_value: str | int | float,
+    *,
+    duration: float,
+) -> tuple[float, float]:
     start = parse_timecode(start_value)
     end = parse_timecode(end_value)
     if start >= end:
@@ -411,9 +443,24 @@ def validate_time_range(
     if end > duration + TIME_EPSILON_SECONDS:
         raise MediaError("End time exceeds the video duration")
     end = min(end, duration)
-    minimum_duration = 1 / max(1.0, fps or 25.0)
-    if end - start + 0.000001 < minimum_duration:
-        raise MediaError("The selected range is shorter than one video frame")
+    return start, end
+
+
+def validate_frame_range(
+    start_value: str | int | float,
+    end_value: str | int | float,
+    *,
+    duration: float,
+    fps: float | None = None,
+) -> tuple[float, float]:
+    del fps
+    start, end = _validate_range_bounds(
+        start_value,
+        end_value,
+        duration=duration,
+    )
+    if end - start > MAX_FRAME_EXTRACTION_SECONDS + 0.000001:
+        raise MediaError("Frame extraction range exceeds maximum duration")
     return start, end
 
 
@@ -447,6 +494,12 @@ def default_output_name(
     return f"{stem}_clip_{range_text}{suffix}"
 
 
+def default_frame_directory_name(source: Path, start: float, end: float) -> str:
+    stem = safe_output_stem(source.stem)
+    range_text = f"{_filename_timecode(start)}-{_filename_timecode(end)}"
+    return f"{stem}_frames_{range_text}"
+
+
 def _numbered_path(directory: Path, desired_name: str, number: int = 1) -> Path:
     desired = Path(desired_name)
     suffix = desired.suffix
@@ -459,6 +512,19 @@ def available_output_path(directory: Path, desired_name: str) -> Path:
     for number in range(1, 100_000):
         candidate = _numbered_path(directory, desired_name, number)
         if not candidate.exists():
+            return candidate
+    raise MediaError("Could not allocate a unique output filename")
+
+
+def _numbered_directory_path(directory: Path, desired_name: str, number: int = 1) -> Path:
+    name = desired_name if number == 1 else f"{desired_name}_{number}"
+    return directory / name
+
+
+def available_output_directory(directory: Path, desired_name: str) -> Path:
+    for number in range(1, 100_000):
+        candidate = _numbered_directory_path(directory, desired_name, number)
+        if not candidate.exists() and not candidate.is_symlink():
             return candidate
     raise MediaError("Could not allocate a unique output filename")
 
@@ -1200,3 +1266,537 @@ class ExportManager:
                 job.process = None
             if process is not None and process.poll() is None:
                 self._escalate_process_stop(process)
+
+
+@dataclass
+class FrameExtractionJob:
+    id: str
+    source: VideoSource
+    start: float
+    end: float
+    output_path: Path
+    frame_extension: str
+    status: str = "queued"
+    progress: float = 0.0
+    frame_count: int = 0
+    message: str = "等待逐帧截图"
+    error: str | None = None
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    process: subprocess.Popen[str] | None = field(default=None, repr=False)
+    worker: threading.Thread | None = field(default=None, repr=False)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            end_time = self.finished_at or time.time()
+            start_time = self.started_at or self.created_at
+            return {
+                "job_id": self.id,
+                "operation": "frames",
+                "status": self.status,
+                "progress": round(self.progress, 1),
+                "frame_count": self.frame_count,
+                "output_name": self.output_path.name,
+                "output_path": str(self.output_path) if self.status == "completed" else None,
+                "error": self.error,
+                "message": self.message,
+                "elapsed_seconds": round(max(0.0, end_time - start_time), 1),
+            }
+
+
+class FrameExtractionManager:
+    def __init__(
+        self,
+        *,
+        ffmpeg: str | None = None,
+        ffprobe: str | None = None,
+        encoders: set[str] | None = None,
+    ) -> None:
+        self.ffmpeg = ffmpeg or executable_path("ffmpeg")
+        self.ffprobe = ffprobe or executable_path("ffprobe")
+        self.encoders = set(encoders) if encoders is not None else self._read_encoders()
+        if "png" not in self.encoders:
+            raise MediaError("Required FFmpeg encoder is not available: png")
+        self._jobs: dict[str, FrameExtractionJob] = {}
+        self._lock = threading.RLock()
+        self._publish_lock = threading.Lock()
+
+    def _read_encoders(self) -> set[str]:
+        try:
+            completed = subprocess.run(
+                [self.ffmpeg, "-hide_banner", "-encoders"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise MediaError(f"Could not inspect FFmpeg encoders: {exc}") from exc
+        if completed.returncode != 0:
+            raise MediaError("Could not inspect FFmpeg encoders")
+        encoders: set[str] = set()
+        for line in completed.stdout.splitlines():
+            match = re.match(r"^\s*[A-Z.]{6}\s+(\S+)", line)
+            if match:
+                encoders.add(match.group(1))
+        return encoders
+
+    @staticmethod
+    def _image_profile(source: VideoSource) -> tuple[str, str, list[str]]:
+        metadata = source.metadata
+        source_format = str(metadata.get("pix_fmt") or "").lower()
+        source_depth = _positive_int(metadata.get("video_bit_depth")) or 8
+        components = _positive_int(metadata.get("pixel_components"))
+        has_alpha = bool(metadata.get("has_alpha"))
+        is_palette = bool(metadata.get("is_palette"))
+        is_float = any(token in source_format for token in ("f16", "f32", "f64"))
+
+        if is_float or source_depth > 16:
+            if has_alpha:
+                pixel_format = "gbrapf32le"
+            elif components <= 2:
+                pixel_format = "grayf32le"
+            else:
+                pixel_format = "gbrpf32le"
+            return (
+                ".exr",
+                "exr",
+                [
+                    "-c:v",
+                    "exr",
+                    "-pix_fmt",
+                    pixel_format,
+                    "-compression",
+                    "zip16",
+                    "-format",
+                    "float",
+                ],
+            )
+
+        if is_palette:
+            pixel_format = "rgba"
+        elif source_depth > 8:
+            if has_alpha and components <= 2:
+                pixel_format = "ya16be"
+            elif has_alpha:
+                pixel_format = "rgba64be"
+            elif components <= 2:
+                pixel_format = "gray16be"
+            else:
+                pixel_format = "rgb48be"
+        elif has_alpha and components <= 2:
+            pixel_format = "ya8"
+        elif has_alpha:
+            pixel_format = "rgba"
+        elif components <= 2:
+            pixel_format = "gray"
+        else:
+            pixel_format = "rgb24"
+        return (
+            ".png",
+            "png",
+            ["-c:v", "png", "-pix_fmt", pixel_format, "-pred", "mixed"],
+        )
+
+    @staticmethod
+    def _check_output_directory(directory: Path) -> None:
+        if not directory.is_dir():
+            raise MediaError("The output directory does not exist")
+        if not os.access(directory, os.W_OK | os.X_OK):
+            raise MediaError("The output directory is not writable")
+        try:
+            descriptor, probe_name = tempfile.mkstemp(
+                prefix=".video-cut-frame-write-test-", dir=directory
+            )
+            os.close(descriptor)
+            Path(probe_name).unlink(missing_ok=True)
+        except OSError as exc:
+            raise MediaError("The output directory is not writable") from exc
+
+    def create(
+        self,
+        source: VideoSource,
+        *,
+        start: float,
+        end: float,
+        output_directory: Path,
+    ) -> FrameExtractionJob:
+        directory = output_directory.expanduser().resolve()
+        self._check_output_directory(directory)
+        if not source.path.is_file():
+            raise MediaError("The original video was moved or deleted")
+        start, end = validate_frame_range(
+            start,
+            end,
+            duration=float(source.metadata["duration"]),
+            fps=source.metadata.get("fps"),
+        )
+        extension, encoder, _ = self._image_profile(source)
+        if encoder not in self.encoders:
+            raise MediaError(f"Required FFmpeg encoder is not available: {encoder}")
+
+        clip_duration = end - start
+        fps_candidates = [
+            _optional_finite_float(source.metadata.get("fps")),
+            _optional_finite_float(source.metadata.get("max_fps")),
+        ]
+        fps = max((value for value in fps_candidates if value > 0), default=60.0)
+        estimated_frames = max(1, math.ceil(clip_duration * fps) + 2)
+        source_depth = _positive_int(source.metadata.get("video_bit_depth")) or 8
+        if encoder == "exr":
+            bytes_per_pixel = 16 if source.metadata.get("has_alpha") else 12
+        elif source_depth > 8:
+            bytes_per_pixel = 8 if source.metadata.get("has_alpha") else 6
+        else:
+            bytes_per_pixel = 4 if source.metadata.get("has_alpha") else 3
+        raw_size = (
+            int(source.metadata["width"])
+            * int(source.metadata["height"])
+            * bytes_per_pixel
+            * estimated_frames
+        )
+        estimated_size = int(raw_size * 1.15) + 64 * 1024 * 1024
+        if shutil.disk_usage(directory).free < estimated_size:
+            raise MediaError("There is not enough free space in the output directory")
+
+        desired_name = default_frame_directory_name(source.path, start, end)
+        destination = available_output_directory(directory, desired_name)
+        job = FrameExtractionJob(
+            id=uuid.uuid4().hex,
+            source=source,
+            start=start,
+            end=end,
+            output_path=destination,
+            frame_extension=extension,
+        )
+        with self._lock:
+            self._jobs[job.id] = job
+        worker = threading.Thread(target=self._run, args=(job,), daemon=True)
+        job.worker = worker
+        worker.start()
+        return job
+
+    def get(self, job_id: str) -> FrameExtractionJob | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def cancel(self, job_id: str) -> FrameExtractionJob:
+        job = self.get(job_id)
+        if job is None:
+            raise MediaError("Export job was not found")
+        with job.lock:
+            if job.status not in {"queued", "running"}:
+                return job
+            job.cancel_event.set()
+            process = job.process
+            job.message = "正在取消并清理未完成截图"
+        if process is not None and process.poll() is None:
+            ExportManager._request_process_stop(process)
+            threading.Thread(
+                target=ExportManager._escalate_process_stop,
+                args=(process,),
+                daemon=True,
+            ).start()
+        return job
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            if job.snapshot()["status"] in {"queued", "running"}:
+                self.cancel(job.id)
+        deadline = time.monotonic() + 8
+        for job in jobs:
+            worker = job.worker
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    def _command(self, job: FrameExtractionJob, temporary_directory: Path) -> list[str]:
+        clip_duration = job.end - job.start
+        _, _, encoding_options = self._image_profile(job.source)
+        trim_filter = (
+            "setpts=PTS-STARTPTS,"
+            f"trim=start={job.start:.6f}:end={job.end:.6f},"
+            "setpts=PTS-STARTPTS"
+        )
+        return [
+            self.ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            str(job.source.path),
+            "-map",
+            f"0:{job.source.metadata['video_stream_index']}",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            trim_filter,
+            "-t",
+            f"{clip_duration:.6f}",
+            "-fps_mode",
+            "passthrough",
+            *encoding_options,
+            "-start_number",
+            "1",
+            "-progress",
+            "pipe:1",
+            "-stats_period",
+            "0.2",
+            "-nostats",
+            str(temporary_directory / f"frame_%06d{job.frame_extension}"),
+        ]
+
+    @staticmethod
+    def _png_header(path: Path) -> tuple[int, int, int, int]:
+        try:
+            with path.open("rb") as handle:
+                header = handle.read(26)
+        except OSError as exc:
+            raise MediaError("Could not verify an extracted frame") from exc
+        if len(header) < 26 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+            raise MediaError("Output verification detected a damaged frame image")
+        width = int.from_bytes(header[16:20], "big")
+        height = int.from_bytes(header[20:24], "big")
+        return width, height, header[24], header[25]
+
+    def _probe_still(self, path: Path) -> dict[str, Any]:
+        try:
+            completed = subprocess.run(
+                [
+                    self.ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height,pix_fmt",
+                    "-of",
+                    "json",
+                    str(path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise MediaError("Could not verify an extracted frame") from exc
+        try:
+            payload = json.loads(completed.stdout)
+            stream = payload["streams"][0]
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+            raise MediaError("Could not verify an extracted frame") from exc
+        if completed.returncode != 0 or not isinstance(stream, dict):
+            raise MediaError("Could not verify an extracted frame")
+        return stream
+
+    def _verify_frames(self, job: FrameExtractionJob, frames: list[Path]) -> None:
+        if not frames:
+            raise MediaError("No video frames were found in the selected range")
+        expected_names = [
+            f"frame_{number:06d}{job.frame_extension}" for number in range(1, len(frames) + 1)
+        ]
+        if [path.name for path in frames] != expected_names:
+            raise MediaError("Output verification detected missing frame images")
+
+        expected_dimensions = (
+            int(job.source.metadata["width"]),
+            int(job.source.metadata["height"]),
+        )
+        if job.frame_extension == ".png":
+            source_depth = _positive_int(job.source.metadata.get("video_bit_depth")) or 8
+            expected_depth = 16 if source_depth > 8 else 8
+            alpha_types = {4, 6}
+            for path in frames:
+                if job.cancel_event.is_set():
+                    raise InterruptedError
+                width, height, bit_depth, color_type = self._png_header(path)
+                if (width, height) != expected_dimensions:
+                    raise MediaError("Output verification detected an unexpected frame size")
+                if bit_depth < expected_depth:
+                    raise MediaError("Output verification detected reduced frame bit depth")
+                if job.source.metadata.get("has_alpha") and color_type not in alpha_types:
+                    raise MediaError("Output verification detected a missing frame alpha channel")
+        else:
+            _, _, encoding_options = self._image_profile(job.source)
+            expected_pixel_format = encoding_options[encoding_options.index("-pix_fmt") + 1]
+            for path in frames:
+                if job.cancel_event.is_set():
+                    raise InterruptedError
+                stream = self._probe_still(path)
+                dimensions = (
+                    _positive_int(stream.get("width")),
+                    _positive_int(stream.get("height")),
+                )
+                if dimensions != expected_dimensions:
+                    raise MediaError("Output verification detected an unexpected frame size")
+                if str(stream.get("pix_fmt") or "") != expected_pixel_format:
+                    raise MediaError("Output verification detected a reduced frame pixel format")
+
+    @staticmethod
+    def _remove_owned_directory(directory: Path | None) -> None:
+        if directory is None or not directory.exists() or directory.is_symlink():
+            return
+        try:
+            for child in directory.iterdir():
+                if child.is_file() or child.is_symlink():
+                    child.unlink(missing_ok=True)
+            directory.rmdir()
+        except OSError:
+            pass
+
+    def _publish_directory(self, temporary_directory: Path, desired_path: Path) -> Path:
+        with self._publish_lock:
+            for number in range(1, 100_000):
+                destination = _numbered_directory_path(
+                    desired_path.parent,
+                    desired_path.name,
+                    number,
+                )
+                if destination.exists() or destination.is_symlink():
+                    continue
+                try:
+                    temporary_directory.rename(destination)
+                except FileExistsError:
+                    continue
+                except OSError as exc:
+                    raise MediaError(f"Could not finalize the frame directory: {exc}") from exc
+                return destination
+        raise MediaError("Could not allocate a unique output filename")
+
+    def _run(self, job: FrameExtractionJob) -> None:
+        temporary_directory: Path | None = None
+        published_directory: Path | None = None
+        recent_output: deque[str] = deque(maxlen=60)
+        try:
+            if job.cancel_event.is_set():
+                raise InterruptedError
+            temporary_directory = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{job.output_path.name}.partial-{job.id}-",
+                    dir=job.output_path.parent,
+                )
+            )
+            with job.lock:
+                if job.cancel_event.is_set():
+                    raise InterruptedError
+                job.status = "running"
+                job.message = "正在按原始尺寸逐帧保存图片"
+                job.started_at = time.time()
+
+            command = self._command(job, temporary_directory)
+            options: dict[str, Any] = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "bufsize": 1,
+            }
+            with job.lock:
+                if job.cancel_event.is_set():
+                    raise InterruptedError
+                process = subprocess.Popen(command, **options)
+                job.process = process
+            assert process.stdout is not None
+            assert process.stderr is not None
+
+            def drain_stderr() -> None:
+                assert process.stderr is not None
+                for stderr_line in process.stderr:
+                    value = stderr_line.strip()
+                    if value:
+                        recent_output.append(value)
+
+            stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+            stderr_thread.start()
+            clip_duration = max(0.001, job.end - job.start)
+            for raw_line in process.stdout:
+                line = raw_line.strip()
+                if job.cancel_event.is_set() and process.poll() is None:
+                    ExportManager._request_process_stop(process)
+                key, separator, value = line.partition("=")
+                if separator and key == "frame":
+                    try:
+                        frame_count = max(0, int(value))
+                    except ValueError:
+                        continue
+                    with job.lock:
+                        job.frame_count = max(job.frame_count, frame_count)
+                elif separator and key in {"out_time_us", "out_time_ms"}:
+                    try:
+                        processed_seconds = float(value) / 1_000_000
+                    except (ValueError, OverflowError):
+                        continue
+                    with job.lock:
+                        job.progress = min(
+                            99.0,
+                            max(job.progress, processed_seconds / clip_duration * 100),
+                        )
+                elif separator and key == "progress":
+                    continue
+                elif line:
+                    recent_output.append(line)
+
+            return_code = process.wait()
+            stderr_thread.join(timeout=2)
+            with job.lock:
+                job.process = None
+            if job.cancel_event.is_set():
+                raise InterruptedError
+            if return_code != 0:
+                detail = (
+                    recent_output[-1] if recent_output else f"FFmpeg exited with code {return_code}"
+                )
+                raise MediaError(detail)
+
+            frames = sorted(temporary_directory.glob(f"frame_*{job.frame_extension}"))
+            with job.lock:
+                job.message = "正在核对每一张截图"
+                job.frame_count = len(frames)
+            self._verify_frames(job, frames)
+            if job.cancel_event.is_set():
+                raise InterruptedError
+
+            with job.lock:
+                if job.cancel_event.is_set():
+                    raise InterruptedError
+                published_directory = self._publish_directory(temporary_directory, job.output_path)
+                temporary_directory = None
+                job.output_path = published_directory
+                job.status = "completed"
+                job.progress = 100.0
+                job.message = f"截图完成，共保存 {job.frame_count} 张原尺寸图片"
+                job.finished_at = time.time()
+            published_directory = None
+        except InterruptedError:
+            self._remove_owned_directory(temporary_directory)
+            self._remove_owned_directory(published_directory)
+            temporary_directory = None
+            published_directory = None
+            with job.lock:
+                job.status = "cancelled"
+                job.message = "已取消截图并清理未完成图片"
+                job.finished_at = time.time()
+        except BaseException as exc:
+            self._remove_owned_directory(temporary_directory)
+            self._remove_owned_directory(published_directory)
+            temporary_directory = None
+            published_directory = None
+            with job.lock:
+                job.status = "failed"
+                job.error = str(exc) or exc.__class__.__name__
+                job.message = "截图失败，未完成图片已清理"
+                job.finished_at = time.time()
+        finally:
+            self._remove_owned_directory(temporary_directory)
+            self._remove_owned_directory(published_directory)
+            with job.lock:
+                process = job.process
+                job.process = None
+            if process is not None and process.poll() is None:
+                ExportManager._escalate_process_stop(process)

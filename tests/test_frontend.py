@@ -14,6 +14,9 @@ def test_frontend_has_only_two_editable_text_parameters() -> None:
     assert 'id="start-time"' in html
     assert 'id="end-time"' in html
     assert html.count("<input") == 2
+    assert 'id="mode-clip-button"' in html
+    assert 'id="mode-frames-button"' in html
+    assert "逐帧截图一次最多 5 秒" in html
     assert "确定并导出" in html
     assert "仅在本机" in html
 

@@ -9,7 +9,15 @@ from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.main import ApplicationState, create_app
-from app.media import ExportManager, MediaError, VideoSource, probe_video, validate_time_range
+from app.media import (
+    ExportManager,
+    FrameExtractionJob,
+    FrameExtractionManager,
+    MediaError,
+    VideoSource,
+    probe_video,
+    validate_time_range,
+)
 
 
 def _run_ffmpeg(ffmpeg: str, arguments: list[str], *, timeout: float = 45) -> None:
@@ -41,6 +49,27 @@ def _export(
         time.sleep(0.05)
     assert job.snapshot()["status"] == "completed", job.snapshot()
     return source.metadata, probe_video(job.output_path, ffprobe=ffprobe), job.output_path
+
+
+def _extract_frames(
+    source_path: Path,
+    *,
+    ffmpeg: str,
+    ffprobe: str,
+    output_directory: Path,
+    start: float = 0.1,
+    end: float = 0.3,
+):
+    source = VideoSource(
+        "frame-quality-edge", source_path, probe_video(source_path, ffprobe=ffprobe)
+    )
+    manager = FrameExtractionManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    job = manager.create(source, start=start, end=end, output_directory=output_directory)
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline and job.snapshot()["status"] in {"queued", "running"}:
+        time.sleep(0.05)
+    assert job.snapshot()["status"] == "completed", job.snapshot()
+    return source.metadata, job
 
 
 @pytest.mark.parametrize(
@@ -88,6 +117,203 @@ def test_high_depth_and_alpha_formats_are_not_silently_reduced(
     assert result["has_alpha"] == source["has_alpha"]
     assert result["width"] == source["width"]
     assert result["height"] == source["height"]
+
+
+@pytest.mark.parametrize(
+    ("pixel_format", "expected_png_depth", "expected_color_type"),
+    [
+        ("yuv420p10le", 16, 2),
+        ("ya8", 8, 4),
+    ],
+)
+def test_frame_images_keep_source_depth_alpha_and_dimensions(
+    pixel_format: str,
+    expected_png_depth: int,
+    expected_color_type: int,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / f"frame-source-{pixel_format}.mkv"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=25:duration=0.8",
+            "-vf",
+            f"format={pixel_format}",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            str(source_path),
+        ],
+    )
+    source, job = _extract_frames(
+        source_path,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        output_directory=tmp_path,
+    )
+    first_frame = sorted(job.output_path.glob("frame_*.png"))[0]
+    header = first_frame.read_bytes()[:26]
+    assert int.from_bytes(header[16:20], "big") == source["width"] == 160
+    assert int.from_bytes(header[20:24], "big") == source["height"] == 90
+    assert header[24] == expected_png_depth
+    assert header[25] == expected_color_type
+
+
+def _decoded_rgba_md5(path: Path, ffmpeg: str) -> str:
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(path),
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "rgba",
+            "-f",
+            "md5",
+            "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return completed.stdout.strip()
+
+
+def test_palette_frame_images_keep_full_color(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "palette-source.avi"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=160x90:rate=5:duration=1",
+            "-vf",
+            "format=pal8",
+            "-c:v",
+            "rawvideo",
+            "-pix_fmt",
+            "pal8",
+            str(source_path),
+        ],
+    )
+    source, job = _extract_frames(
+        source_path,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        output_directory=tmp_path,
+        start=0,
+        end=0.1,
+    )
+    assert source["is_palette"] is True
+    first_frame = sorted(job.output_path.glob("frame_*.png"))[0]
+    assert first_frame.read_bytes()[25] == 6
+    assert _decoded_rgba_md5(first_frame, ffmpeg) == _decoded_rgba_md5(source_path, ffmpeg)
+
+
+def test_exr_verification_checks_every_frame(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    frame_pattern = tmp_path / "frame_%06d.exr"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x36:rate=3:duration=1",
+            "-vf",
+            "format=gbrpf32le",
+            "-c:v",
+            "exr",
+            "-pix_fmt",
+            "gbrpf32le",
+            str(frame_pattern),
+        ],
+    )
+    frames = sorted(tmp_path.glob("frame_*.exr"))
+    if len(frames) < 3:
+        pytest.skip("This FFmpeg build did not produce enough EXR test frames")
+    frames[1].write_bytes(b"corrupt middle frame")
+    source = VideoSource(
+        "exr-verification",
+        tmp_path / "unused.exr",
+        {
+            "width": 64,
+            "height": 36,
+            "pix_fmt": "gbrpf32le",
+            "video_bit_depth": 32,
+            "pixel_components": 3,
+            "has_alpha": False,
+            "is_palette": False,
+        },
+    )
+    job = FrameExtractionJob(
+        id="exr-verification",
+        source=source,
+        start=0,
+        end=1,
+        output_path=tmp_path,
+        frame_extension=".exr",
+    )
+    manager = FrameExtractionManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        encoders={"png", "exr"},
+    )
+    with pytest.raises(MediaError, match="verification"):
+        manager._verify_frames(job, frames)
+
+
+def test_rotated_frame_images_use_original_display_dimensions(
+    sample_video: Path,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    rotated = tmp_path / "frame-rotation-90.mp4"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-display_rotation",
+            "90",
+            "-i",
+            str(sample_video),
+            "-c",
+            "copy",
+            str(rotated),
+        ],
+    )
+    source, job = _extract_frames(
+        rotated,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        output_directory=tmp_path,
+    )
+    assert (source["width"], source["height"]) == (180, 320)
+    for frame in job.output_path.glob("frame_*.png"):
+        header = frame.read_bytes()[:24]
+        assert (int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")) == (
+            180,
+            320,
+        )
 
 
 def test_odd_subsampled_dimensions_use_lossless_fallback(

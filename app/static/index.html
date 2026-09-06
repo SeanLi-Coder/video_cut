@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f5f7fb">
-    <meta name="description" content="在本机快速预览并剪辑视频片段">
+    <meta name="description" content="在本机快速预览、剪辑视频并逐帧截图">
     <title>本地视频剪辑</title>
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/assets/styles.css">
@@ -39,9 +39,22 @@
       <section class="hero" aria-labelledby="page-title">
         <p class="eyebrow">高保真精准剪辑，不绕弯</p>
         <h1 id="page-title">留下想要的这一段</h1>
-        <p class="hero-copy">选一个视频，填好起点和终点，预览满意后直接保存。原视频始终不会被修改。</p>
+        <p class="hero-copy" id="hero-copy">选一个视频，填好起点和终点，预览满意后直接保存。原视频始终不会被修改。</p>
 
-        <ol class="journey" aria-label="剪辑步骤">
+        <div class="mode-picker">
+          <div class="mode-switch" role="group" aria-label="选择功能">
+            <button class="mode-button" id="mode-clip-button" type="button" aria-pressed="true">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4v4a4 4 0 0 0 4 4h8M16 4v4a4 4 0 0 1-4 4H4"/><circle cx="7" cy="17" r="3"/><circle cx="17" cy="17" r="3"/></svg>
+              <span><strong>剪辑视频</strong><small>保存一段新视频</small></span>
+            </button>
+            <button class="mode-button" id="mode-frames-button" type="button" aria-pressed="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="13" height="11" rx="2"/><path d="M8 3h11a2 2 0 0 1 2 2v9"/></svg>
+              <span><strong>逐帧截图</strong><small>每一帧保存成图片</small></span>
+            </button>
+          </div>
+        </div>
+
+        <ol class="journey" aria-label="操作步骤">
           <li class="journey-item is-active" id="journey-source">
             <span class="journey-number">1</span>
             <span>选择视频</span>
@@ -49,12 +62,12 @@
           <li class="journey-line" aria-hidden="true"></li>
           <li class="journey-item" id="journey-trim">
             <span class="journey-number">2</span>
-            <span>设置片段</span>
+            <span id="journey-range-label">设置片段</span>
           </li>
           <li class="journey-line" aria-hidden="true"></li>
           <li class="journey-item" id="journey-export">
             <span class="journey-number">3</span>
-            <span>确认导出</span>
+            <span id="journey-export-label">确认导出</span>
           </li>
         </ol>
       </section>
@@ -127,10 +140,10 @@
           <span class="step-badge" aria-hidden="true">2</span>
           <div>
             <h2 id="trim-heading">设置剪辑范围</h2>
-            <p>只需填写起始时间和结束时间，预览会自动更新。</p>
+            <p id="trim-description">只需填写起始时间和结束时间，预览会自动更新。</p>
           </div>
           <div class="clip-length" id="clip-length" aria-live="polite">
-            <span>片段时长</span>
+            <span id="duration-label">片段时长</span>
             <strong id="clip-duration">—</strong>
           </div>
         </div>
@@ -166,6 +179,7 @@
             </div>
 
             <p class="time-format-hint" id="time-format-hint">例如 75.5、01:15.500 或 00:01:15.500</p>
+            <p class="frame-limit-hint" id="frame-limit-hint" aria-live="polite" hidden>逐帧截图一次最多 5 秒；图片按视频原尺寸无损保存。</p>
 
             <div class="range-readout" id="range-readout" role="img" aria-label="当前剪辑范围">
               <div class="range-track">
@@ -210,11 +224,11 @@
           <span class="step-badge" aria-hidden="true">3</span>
           <div>
             <h2 id="export-heading">确认并导出</h2>
-            <p>导出为新文件，原视频不会有任何变化。</p>
+            <p id="export-description">导出为新文件，原视频不会有任何变化。</p>
           </div>
-          <span class="quality-chip">
+          <span class="quality-chip" id="quality-chip">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7.5 12 3 3 6-7"/><circle cx="12" cy="12" r="9"/></svg>
-            保持原分辨率与高品质音频
+            <span id="quality-chip-text">保持原分辨率与高品质音频</span>
           </span>
         </div>
 
@@ -234,9 +248,9 @@
           </div>
 
           <div class="filename-preview">
-            <span class="filename-label">文件名</span>
+            <span class="filename-label" id="output-name-label">文件名</span>
             <span class="filename-value" id="suggested-output-name">选择视频后自动生成</span>
-            <span class="filename-note">如遇同名文件会自动添加编号</span>
+            <span class="filename-note" id="output-name-note">如遇同名文件会自动添加编号</span>
           </div>
 
           <div class="export-action-row">
@@ -275,7 +289,7 @@
             <svg viewBox="0 0 32 32"><path d="m9 16 4.5 4.5L23 11"/></svg>
           </div>
           <div class="success-copy">
-            <span>剪辑完成，原视频未被修改</span>
+            <span id="completion-summary">剪辑完成，原视频未被修改</span>
             <strong id="completed-output-name">—</strong>
             <span class="success-path" id="completed-output-path">—</span>
           </div>

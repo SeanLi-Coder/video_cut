@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import time
 from pathlib import Path
 
@@ -26,6 +27,10 @@ def test_local_workflow_and_range_streaming(
         ffprobe=ffprobe,
     )
     with TestClient(create_app(state)) as client:
+        index = client.get("/")
+        assert index.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in index.headers["content-security-policy"]
+        assert index.headers["x-content-type-options"] == "nosniff"
         bootstrap = client.get("/api/bootstrap")
         assert bootstrap.status_code == 200
         token = bootstrap.json()["app_token"]
@@ -101,3 +106,187 @@ def test_cancelled_native_dialog_is_not_an_error(
         response = client.post("/api/videos/select", headers={"X-App-Token": token})
         assert response.status_code == 200
         assert response.json() == {"cancelled": True}
+
+
+def test_frame_export_api_enforces_limit_and_creates_original_size_pngs(
+    monkeypatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    output_directory = tmp_path / "finished frames"
+    output_directory.mkdir()
+    monkeypatch.setattr(main_module, "select_video_file", lambda: sample_video)
+    monkeypatch.setattr(main_module, "select_output_directory", lambda: output_directory)
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    with TestClient(create_app(state)) as client:
+        bootstrap = client.get("/api/bootstrap").json()
+        assert bootstrap["max_frame_seconds"] == 5
+        assert bootstrap["frame_export_ready"] is True
+        headers = {"X-App-Token": bootstrap["app_token"]}
+        video = client.post("/api/videos/select", headers=headers).json()["video"]
+        client.post("/api/output-directory/select", headers=headers)
+
+        unauthorized = client.post(
+            "/api/frame-exports",
+            json={"video_id": video["id"], "start": 0, "end": 0.5},
+        )
+        assert unauthorized.status_code == 403
+
+        too_long_preview = client.post(
+            "/api/preview",
+            headers=headers,
+            json={
+                "video_id": video["id"],
+                "start": 0,
+                "end": 5.001,
+                "operation": "frames",
+            },
+        )
+        assert too_long_preview.status_code == 400
+        assert "最多" in too_long_preview.json()["detail"]
+        too_long_export = client.post(
+            "/api/frame-exports",
+            headers=headers,
+            json={"video_id": video["id"], "start": 0, "end": 5.001},
+        )
+        assert too_long_export.status_code == 400
+        assert "最多" in too_long_export.json()["detail"]
+
+        preview = client.post(
+            "/api/preview",
+            headers=headers,
+            json={
+                "video_id": video["id"],
+                "start": 0.25,
+                "end": 0.75,
+                "operation": "frames",
+            },
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["suggested_output_name"].endswith("_frames_00-00-00_250-00-00-00_750")
+
+        response = client.post(
+            "/api/frame-exports",
+            headers=headers,
+            json={"video_id": video["id"], "start": 0.25, "end": 0.75},
+        )
+        assert response.status_code == 200, response.text
+        job_id = response.json()["job_id"]
+        deadline = time.monotonic() + 60
+        snapshot = {}
+        while time.monotonic() < deadline:
+            status = client.get(f"/api/frame-exports/{job_id}", headers=headers)
+            assert status.status_code == 200
+            snapshot = status.json()
+            if snapshot["status"] not in {"queued", "running"}:
+                break
+            time.sleep(0.05)
+
+        assert snapshot["status"] == "completed", snapshot
+        assert snapshot["operation"] == "frames"
+        assert snapshot["frame_count"] == 15
+        frame_directory = Path(snapshot["output_path"])
+        assert frame_directory.is_dir()
+        frames = sorted(frame_directory.glob("frame_*.png"))
+        assert len(frames) == 15
+        header = frames[0].read_bytes()[:26]
+        assert int.from_bytes(header[16:20], "big") == 320
+        assert int.from_bytes(header[20:24], "big") == 180
+
+
+def test_frame_preview_handles_nonzero_container_start_time(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "nonzero-preview.ts"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=10:duration=1",
+            "-c:v",
+            "mpeg2video",
+            "-f",
+            "mpegts",
+            str(source_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    monkeypatch.setattr(main_module, "select_video_file", lambda: source_path)
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    with TestClient(create_app(state)) as client:
+        token = client.get("/api/bootstrap").json()["app_token"]
+        headers = {"X-App-Token": token}
+        video = client.post("/api/videos/select", headers=headers).json()["video"]
+        preview = client.post(
+            "/api/preview",
+            headers=headers,
+            json={
+                "video_id": video["id"],
+                "start": 0.25,
+                "end": 0.75,
+                "operation": "frames",
+            },
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["mode"] == "original"
+        assert preview.json()["preview_url"] == video["preview_url"]
+        fallback_preview = client.post(
+            "/api/preview",
+            headers=headers,
+            json={
+                "video_id": video["id"],
+                "start": 0.25,
+                "end": 0.75,
+                "operation": "frames",
+                "compatibility": True,
+            },
+        )
+        assert fallback_preview.status_code == 200, fallback_preview.text
+        assert fallback_preview.json()["mode"] == "proxy"
+        preview_stream = client.get(fallback_preview.json()["preview_url"])
+        assert preview_stream.status_code == 200
+
+    preview_path = tmp_path / "preview.mp4"
+    preview_path.write_bytes(preview_stream.content)
+    inspected = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-count_frames",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=nw=1:nk=1",
+            str(preview_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert int(inspected.stdout.strip()) == 5

@@ -14,9 +14,9 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,13 +26,17 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .build_info import APP_ID, APP_NAME, APP_VERSION
 from .dialogs import DialogError, select_output_directory, select_video_file
 from .media import (
+    MAX_FRAME_EXTRACTION_SECONDS,
     ExportManager,
+    FrameExtractionManager,
     MediaError,
     VideoSource,
+    default_frame_directory_name,
     default_output_name,
     executable_path,
     format_timecode,
     probe_video,
+    validate_frame_range,
     validate_time_range,
 )
 from .storage import SettingsStore
@@ -54,6 +58,7 @@ class TimeRangeRequest(BaseModel):
 
 class PreviewRequest(TimeRangeRequest):
     compatibility: bool = False
+    operation: Literal["clip", "frames"] = "clip"
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,7 @@ class PreviewSpec:
     start: float
     end: float
     generation: str
+    operation: Literal["clip", "frames"]
 
 
 def _display_path(path: Path) -> str:
@@ -104,6 +110,10 @@ def _user_media_error(exc: MediaError) -> str:
         "The selected range is shorter than one video frame": (
             "所选范围短于一帧，请把结束时间稍微调晚。"
         ),
+        "Frame extraction range exceeds maximum duration": "逐帧截图一次最多只能选择 5 秒。",
+        "No video frames were found in the selected range": (
+            "所选范围内没有找到可截图的视频帧，请调整起止时间。"
+        ),
         "Required FFmpeg encoders are not available": "当前 FFmpeg 缺少必要的高质量编码器。",
         "Export job was not found": "找不到这次导出任务，请刷新页面后重试。",
     }
@@ -133,14 +143,22 @@ class ApplicationState:
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
         self.exports: ExportManager | None = None
+        self.frame_exports: FrameExtractionManager | None = None
         try:
             resolved_ffmpeg = ffmpeg or executable_path("ffmpeg")
             resolved_ffprobe = ffprobe or executable_path("ffprobe")
             self.ffmpeg = resolved_ffmpeg
             self.ffprobe = resolved_ffprobe
-            self.exports = ExportManager(ffmpeg=resolved_ffmpeg, ffprobe=resolved_ffprobe)
         except MediaError:
-            pass
+            return
+        with contextlib.suppress(MediaError):
+            self.exports = ExportManager(ffmpeg=resolved_ffmpeg, ffprobe=resolved_ffprobe)
+        with contextlib.suppress(MediaError):
+            self.frame_exports = FrameExtractionManager(
+                ffmpeg=resolved_ffmpeg,
+                ffprobe=resolved_ffprobe,
+                encoders=self.exports.encoders if self.exports is not None else None,
+            )
 
     def output_directory(self) -> Path | None:
         value = self.settings.load().get("output_directory")
@@ -185,12 +203,23 @@ class ApplicationState:
         return source
 
     def create_preview(
-        self, source: VideoSource, start: float, end: float
+        self,
+        source: VideoSource,
+        start: float,
+        end: float,
+        *,
+        operation: Literal["clip", "frames"],
     ) -> tuple[str, PreviewSpec]:
         self.stop_active_previews()
         token = secrets.token_urlsafe(24)
         generation = uuid.uuid4().hex
-        spec = PreviewSpec(source=source, start=start, end=end, generation=generation)
+        spec = PreviewSpec(
+            source=source,
+            start=start,
+            end=end,
+            generation=generation,
+            operation=operation,
+        )
         with self._lock:
             self._previews.clear()
             self._preview_order.clear()
@@ -238,6 +267,8 @@ class ApplicationState:
         self.stop_active_previews()
         if self.exports is not None:
             self.exports.cancel_all()
+        if self.frame_exports is not None:
+            self.frame_exports.cancel_all()
 
 
 def _video_payload(source: VideoSource) -> dict[str, Any]:
@@ -313,6 +344,22 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         TrustedHostMiddleware,
         allowed_hosts=["127.0.0.1", "localhost", "testserver"],
     )
+
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; base-uri 'none'; object-src 'none'; "
+            "frame-ancestors 'none'; form-action 'none'; script-src 'self'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "media-src 'self' blob:; connect-src 'self'"
+        )
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        return response
+
     app.mount("/assets", StaticFiles(directory=STATIC_ROOT), name="assets")
 
     def require_app_token(x_app_token: str | None = Header(default=None)) -> None:
@@ -335,6 +382,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "instance_id": os.environ.get("VIDEO_CUT_INSTANCE_ID"),
             "server_pid": os.getpid(),
             "ffmpeg_ready": state.exports is not None,
+            "frame_export_ready": state.frame_exports is not None,
         }
 
     @app.get("/api/bootstrap")
@@ -345,6 +393,8 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "version": APP_VERSION,
             "app_token": state.app_token,
             "ffmpeg_ready": state.exports is not None,
+            "frame_export_ready": state.frame_exports is not None,
+            "max_frame_seconds": MAX_FRAME_EXTRACTION_SECONDS,
             "output_directory": _display_path(directory) if directory else None,
         }
 
@@ -400,7 +450,10 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
     def create_preview(request: PreviewRequest) -> dict[str, Any]:
         try:
             source = state.video(request.video_id)
-            start, end = validate_time_range(
+            validator = (
+                validate_frame_range if request.operation == "frames" else validate_time_range
+            )
+            start, end = validator(
                 request.start,
                 request.end,
                 duration=source.metadata["duration"],
@@ -408,13 +461,18 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             )
         except MediaError as exc:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
-        suggested_output_name = default_output_name(
-            source.path,
-            start,
-            end,
-            suffix=ExportManager.output_suffix(source),
-        )
-        if source.metadata.get("is_hdr") and not request.compatibility:
+        if request.operation == "frames":
+            suggested_output_name = default_frame_directory_name(source.path, start, end)
+        else:
+            suggested_output_name = default_output_name(
+                source.path,
+                start,
+                end,
+                suffix=ExportManager.output_suffix(source),
+            )
+        if (
+            request.operation == "frames" or source.metadata.get("is_hdr")
+        ) and not request.compatibility:
             state.stop_active_previews()
             return {
                 "preview_url": f"/api/videos/{source.id}/content",
@@ -422,7 +480,12 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
                 "generation": "",
                 "suggested_output_name": suggested_output_name,
             }
-        token, spec = state.create_preview(source, start, end)
+        token, spec = state.create_preview(
+            source,
+            start,
+            end,
+            operation=request.operation,
+        )
         return {
             "preview_url": f"/api/previews/{token}.mp4",
             "mode": "proxy",
@@ -444,22 +507,32 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "-loglevel",
             "error",
             "-nostdin",
-            "-ss",
-            f"{spec.start:.6f}",
-            "-i",
-            str(spec.source.path),
-            "-t",
-            f"{spec.end - spec.start:.6f}",
-            "-map",
-            f"0:{spec.source.metadata['video_stream_index']}",
         ]
-        audio_stream_index = spec.source.metadata.get("audio_stream_index")
+        if spec.operation == "clip":
+            command.extend(["-ss", f"{spec.start:.6f}"])
+        command.extend(["-i", str(spec.source.path), "-t", f"{spec.end - spec.start:.6f}"])
+        command.extend(["-map", f"0:{spec.source.metadata['video_stream_index']}"])
+        audio_stream_index = (
+            spec.source.metadata.get("audio_stream_index")
+            if spec.operation == "clip"
+            else None
+        )
         if audio_stream_index is not None:
             command.extend(["-map", f"0:{audio_stream_index}"])
-        preview_filter = (
+        preview_filter_parts = []
+        if spec.operation == "frames":
+            preview_filter_parts.extend(
+                [
+                    "setpts=PTS-STARTPTS",
+                    f"trim=start={spec.start:.6f}:end={spec.end:.6f}",
+                    "setpts=PTS-STARTPTS",
+                ]
+            )
+        preview_filter_parts.append(
             "scale='min(1280,iw)':'min(720,ih)':"
             "force_original_aspect_ratio=decrease:force_divisible_by=2"
         )
+        preview_filter = ",".join(preview_filter_parts)
         command.extend(
             [
                 "-vf",
@@ -528,12 +601,45 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
         return {"job_id": job.id, "output_name": job.output_path.name}
 
+    @app.post("/api/frame-exports", dependencies=[Depends(require_app_token)])
+    def create_frame_export(request: TimeRangeRequest) -> dict[str, Any]:
+        try:
+            if state.frame_exports is None:
+                raise MediaError("ffmpeg was not found")
+            source = state.video(request.video_id)
+            start, end = validate_frame_range(
+                request.start,
+                request.end,
+                duration=source.metadata["duration"],
+                fps=source.metadata.get("fps"),
+            )
+            output_directory = state.output_directory()
+            if output_directory is None:
+                raise MediaError("The output directory does not exist")
+            job = state.frame_exports.create(
+                source,
+                start=start,
+                end=end,
+                output_directory=output_directory,
+            )
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
+        return {"job_id": job.id, "output_name": job.output_path.name}
+
     def export_job(job_id: str):
         if state.exports is None:
             raise HTTPException(status_code=503, detail="FFmpeg 尚未就绪。")
         job = state.exports.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="找不到这次导出任务。")
+        return job
+
+    def frame_export_job(job_id: str):
+        if state.frame_exports is None:
+            raise HTTPException(status_code=503, detail="FFmpeg 尚未就绪。")
+        job = state.frame_exports.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="找不到这次截图任务。")
         return job
 
     @app.get("/api/exports/{job_id}", dependencies=[Depends(require_app_token)])
@@ -564,6 +670,42 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:
             raise HTTPException(status_code=500, detail="无法打开文件所在位置。") from exc
+        return {"ok": True}
+
+    @app.get("/api/frame-exports/{job_id}", dependencies=[Depends(require_app_token)])
+    def frame_export_status(job_id: str) -> dict[str, Any]:
+        return frame_export_job(job_id).snapshot()
+
+    @app.post(
+        "/api/frame-exports/{job_id}/cancel",
+        dependencies=[Depends(require_app_token)],
+    )
+    def cancel_frame_export(job_id: str) -> dict[str, Any]:
+        try:
+            assert state.frame_exports is not None
+            return state.frame_exports.cancel(job_id).snapshot()
+        except (MediaError, AssertionError) as exc:
+            raise HTTPException(status_code=404, detail="找不到这次截图任务。") from exc
+
+    @app.post(
+        "/api/frame-exports/{job_id}/reveal",
+        dependencies=[Depends(require_app_token)],
+    )
+    def reveal_frame_export(job_id: str) -> dict[str, bool]:
+        job = frame_export_job(job_id)
+        snapshot = job.snapshot()
+        if snapshot["status"] != "completed" or not job.output_path.is_dir():
+            raise HTTPException(status_code=409, detail="截图尚未完成。")
+        if sys.platform == "darwin":
+            command = ["/usr/bin/open", "-R", str(job.output_path)]
+        elif sys.platform == "win32":
+            command = ["explorer", "/select,", str(job.output_path)]
+        else:
+            command = ["xdg-open", str(job.output_path)]
+        try:
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="无法打开截图所在文件夹。") from exc
         return {"ok": True}
 
     @app.post("/api/runtime/stop")

@@ -3,11 +3,15 @@
 const PREVIEW_DEBOUNCE_MS = 500;
 const EXPORT_POLL_MS = 650;
 const MEDIA_LOAD_TIMEOUT_MS = 20000;
+const DEFAULT_MAX_FRAME_SECONDS = 5;
 
 const state = {
   appToken: "",
   appReady: false,
   ffmpegReady: false,
+  frameExportReady: false,
+  operation: "clip",
+  maxFrameSeconds: DEFAULT_MAX_FRAME_SECONDS,
   outputDirectory: "",
   video: null,
   selectingVideo: false,
@@ -43,9 +47,15 @@ const elements = {
   systemBannerTitle: byId("system-banner-title"),
   systemBannerMessage: byId("system-banner-message"),
   reloadButton: byId("reload-button"),
+  modeClipButton: byId("mode-clip-button"),
+  modeFramesButton: byId("mode-frames-button"),
+  pageTitle: byId("page-title"),
+  heroCopy: byId("hero-copy"),
   journeySource: byId("journey-source"),
   journeyTrim: byId("journey-trim"),
   journeyExport: byId("journey-export"),
+  journeyRangeLabel: byId("journey-range-label"),
+  journeyExportLabel: byId("journey-export-label"),
   sourceCard: byId("source-card"),
   trimCard: byId("trim-card"),
   exportCard: byId("export-card"),
@@ -59,6 +69,10 @@ const elements = {
   videoResolution: byId("video-resolution"),
   videoFps: byId("video-fps"),
   videoCodecs: byId("video-codecs"),
+  trimHeading: byId("trim-heading"),
+  trimDescription: byId("trim-description"),
+  durationLabel: byId("duration-label"),
+  frameLimitHint: byId("frame-limit-hint"),
   startTime: byId("start-time"),
   endTime: byId("end-time"),
   startTimeError: byId("start-time-error"),
@@ -77,6 +91,12 @@ const elements = {
   outputDirectory: byId("output-directory"),
   selectDirectoryButton: byId("select-directory-button"),
   suggestedOutputName: byId("suggested-output-name"),
+  exportHeading: byId("export-heading"),
+  exportDescription: byId("export-description"),
+  qualityChip: byId("quality-chip"),
+  qualityChipText: byId("quality-chip-text"),
+  outputNameLabel: byId("output-name-label"),
+  outputNameNote: byId("output-name-note"),
   readyNote: byId("ready-note"),
   readyNoteText: byId("ready-note-text"),
   exportButton: byId("export-button"),
@@ -93,6 +113,7 @@ const elements = {
   exportCompletePanel: byId("export-complete-panel"),
   completedOutputName: byId("completed-output-name"),
   completedOutputPath: byId("completed-output-path"),
+  completionSummary: byId("completion-summary"),
   revealOutputButton: byId("reveal-output-button"),
   continueButton: byId("continue-button"),
   toast: byId("toast"),
@@ -295,6 +316,10 @@ function normalizeCodec(codec) {
   return String(codec).replaceAll("_", " ").toUpperCase();
 }
 
+function isFrameMode() {
+  return state.operation === "frames";
+}
+
 function rangeKey(range) {
   return range ? `${range.start.toFixed(3)}:${range.end.toFixed(3)}` : "";
 }
@@ -334,6 +359,14 @@ function readRange(showErrors = true) {
   if (!result.startError && !result.endError && result.start >= result.end) {
     result.endError = "结束时间必须晚于起始时间";
   }
+  if (
+    isFrameMode()
+    && !result.startError
+    && !result.endError
+    && result.end - result.start > state.maxFrameSeconds + 0.000001
+  ) {
+    result.endError = `逐帧截图一次最多 ${state.maxFrameSeconds} 秒`;
+  }
 
   result.valid = !result.startError && !result.endError;
   if (showErrors) renderFieldErrors(result);
@@ -357,7 +390,7 @@ function renderRangeSummary(range) {
     elements.rangeReadout.style.setProperty("--range-width", `${widthPercent}%`);
     elements.rangeReadout.setAttribute(
       "aria-label",
-      `当前剪辑范围从 ${formatTime(range.start)} 到 ${formatTime(range.end)}，片段时长 ${formatTime(range.end - range.start)}`,
+      `当前${isFrameMode() ? "截图" : "剪辑"}范围从 ${formatTime(range.start)} 到 ${formatTime(range.end)}，时长 ${formatTime(range.end - range.start)}`,
     );
   } else {
     elements.clipDuration.textContent = "—";
@@ -376,11 +409,12 @@ function makeSuggestedOutputName(range) {
   const stem = (hasExtension ? original.slice(0, dotIndex) : original)
     .replace(/[<>:"/\\|?*]/g, "_")
     .trim() || "video";
+  const start = formatTime(range.start).replaceAll(":", "-").replace(".", "_");
+  const end = formatTime(range.end).replaceAll(":", "-").replace(".", "_");
+  if (isFrameMode()) return `${stem}_frames_${start}-${end}`;
   const extension = [".mp4", ".mov", ".mkv"].includes(state.video.output_extension)
     ? state.video.output_extension
     : ".mp4";
-  const start = formatTime(range.start).replaceAll(":", "-").replace(".", "_");
-  const end = formatTime(range.end).replaceAll(":", "-").replace(".", "_");
   return `${stem}_clip_${start}-${end}${extension}`;
 }
 
@@ -599,6 +633,7 @@ async function requestPreview(range, options = {}) {
         start: range.start,
         end: range.end,
         compatibility: Boolean(options.fallback),
+        operation: state.operation,
       },
       controller.signal,
     );
@@ -636,6 +671,74 @@ async function requestPreview(range, options = {}) {
     if (requestSerial === state.previewRequestSerial) state.previewController = null;
     renderControls();
   }
+}
+
+function renderModeCopy() {
+  const frames = isFrameMode();
+  elements.modeClipButton.setAttribute("aria-pressed", frames ? "false" : "true");
+  elements.modeFramesButton.setAttribute("aria-pressed", frames ? "true" : "false");
+  elements.pageTitle.textContent = frames ? "把这一小段逐帧保存" : "留下想要的这一段";
+  elements.heroCopy.textContent = frames
+    ? `选好不超过 ${state.maxFrameSeconds} 秒的范围，预览满意后，把其中每一帧按原始尺寸保存成无损图片。`
+    : "选一个视频，填好起点和终点，预览满意后直接保存。原视频始终不会被修改。";
+  elements.journeyRangeLabel.textContent = frames ? "设置范围" : "设置片段";
+  elements.journeyExportLabel.textContent = frames ? "确认截图" : "确认导出";
+  elements.trimHeading.textContent = frames ? "设置截图范围" : "设置剪辑范围";
+  elements.trimDescription.textContent = frames
+    ? "仍然只填起始时间和结束时间；修改后预览会自动更新。"
+    : "只需填写起始时间和结束时间，预览会自动更新。";
+  elements.durationLabel.textContent = frames ? "截图时长" : "片段时长";
+  elements.frameLimitHint.textContent = `逐帧截图一次最多 ${state.maxFrameSeconds} 秒；图片按视频原尺寸无损保存。`;
+  elements.frameLimitHint.hidden = !frames;
+  elements.exportHeading.textContent = frames ? "确认并逐帧截图" : "确认并导出";
+  elements.exportDescription.textContent = frames
+    ? "截图会放进一个独立文件夹，原视频不会有任何变化。"
+    : "导出为新文件，原视频不会有任何变化。";
+  elements.qualityChipText.textContent = frames
+    ? "原始宽高 · 无损图片"
+    : "保持原分辨率与高品质音频";
+  elements.outputNameLabel.textContent = frames ? "文件夹名" : "文件名";
+  elements.outputNameNote.textContent = frames
+    ? "图片按 frame_000001 开始顺序编号"
+    : "如遇同名文件会自动添加编号";
+  if (!state.exportCompleted) {
+    elements.completionSummary.textContent = frames
+      ? "截图完成，原视频未被修改"
+      : "剪辑完成，原视频未被修改";
+  }
+  elements.continueButton.textContent = frames ? "继续截图" : "继续剪辑";
+}
+
+function changeOperation(operation) {
+  if (
+    state.exporting
+    || state.selectingVideo
+    || !["clip", "frames"].includes(operation)
+    || operation === state.operation
+  ) {
+    return;
+  }
+  cancelPendingPreview();
+  stopExportPolling();
+  resetExportResult();
+  state.operation = operation;
+
+  renderModeCopy();
+  const range = readRange(true);
+  renderRangeSummary(range);
+  if (range.valid && state.video) {
+    if (rangeKey(range) === rangeKey(state.activeRange) && state.previewReady) {
+      setPreviewStatus("ready", "预览范围已就绪");
+    } else {
+      releaseGeneratedPreview();
+      schedulePreview(range);
+    }
+  } else if (state.video) {
+    state.previewReady = false;
+    setPreviewStatus("error", "请修正时间后更新预览");
+  }
+  renderControls();
+  showToast(isFrameMode() ? `已切换到逐帧截图，单次最多 ${state.maxFrameSeconds} 秒` : "已切换到视频剪辑");
 }
 
 function resetExportResult() {
@@ -723,7 +826,8 @@ async function selectVideo() {
     const suggestedStart = parseTime(result.suggested_start);
     const suggestedEnd = parseTime(result.suggested_end);
     const start = suggestedStart === null ? 0 : suggestedStart;
-    const end = suggestedEnd === null ? duration : suggestedEnd;
+    let end = suggestedEnd === null ? duration : suggestedEnd;
+    if (isFrameMode()) end = Math.min(end, start + state.maxFrameSeconds, duration);
     elements.startTime.value = formatTime(start);
     elements.endTime.value = formatTime(end);
 
@@ -808,6 +912,10 @@ function normalizeProgress(value) {
   return Math.min(100, Math.max(0, numeric));
 }
 
+function exportApiBase() {
+  return isFrameMode() ? "/api/frame-exports" : "/api/exports";
+}
+
 function setExportProgress(value) {
   const percentage = normalizeProgress(value);
   const rounded = Math.round(percentage);
@@ -823,10 +931,12 @@ function showExportProgress() {
   elements.exportProgressPanel.classList.remove("is-error");
   elements.cancelExportButton.hidden = false;
   elements.cancelExportButton.disabled = false;
-  elements.cancelExportButton.textContent = "取消导出";
+  elements.cancelExportButton.textContent = isFrameMode() ? "取消截图" : "取消导出";
   elements.exportProgressKicker.textContent = "正在准备";
-  elements.exportProgressTitle.textContent = "正在导出视频…";
-  elements.exportProgressMessage.textContent = "正在安全地创建新文件，请不要关闭此页面。";
+  elements.exportProgressTitle.textContent = isFrameMode() ? "正在逐帧截图…" : "正在导出视频…";
+  elements.exportProgressMessage.textContent = isFrameMode()
+    ? "正在准备独立截图文件夹，请不要关闭此页面。"
+    : "正在安全地创建新文件，请不要关闭此页面。";
   elements.exportElapsed.textContent = "";
   setExportProgress(0);
 }
@@ -847,7 +957,7 @@ async function startExport() {
   renderControls();
 
   try {
-    const result = await post("/api/exports", {
+    const result = await post(exportApiBase(), {
       video_id: state.video.id,
       start: range.start,
       end: range.end,
@@ -858,7 +968,7 @@ async function startExport() {
     await pollExport(pollSerial);
   } catch (error) {
     if (pollSerial !== state.exportPollSerial) return;
-    finishExportWithError(error.message || "导出任务启动失败");
+    finishExportWithError(error.message || (isFrameMode() ? "截图任务启动失败" : "导出任务启动失败"));
   }
 }
 
@@ -871,7 +981,7 @@ async function pollExport(pollSerial) {
   if (!state.exportJobId || pollSerial !== state.exportPollSerial) return;
 
   try {
-    const job = await apiRequest(`/api/exports/${encodeURIComponent(state.exportJobId)}`);
+    const job = await apiRequest(`${exportApiBase()}/${encodeURIComponent(state.exportJobId)}`);
     if (pollSerial !== state.exportPollSerial) return;
     state.exportPollFailures = 0;
 
@@ -884,7 +994,7 @@ async function pollExport(pollSerial) {
 
     if (["queued", "pending", "waiting"].includes(status)) {
       elements.exportProgressKicker.textContent = "等待处理";
-      elements.exportProgressTitle.textContent = "正在准备导出…";
+      elements.exportProgressTitle.textContent = isFrameMode() ? "正在准备截图…" : "正在准备导出…";
       elements.exportProgressMessage.textContent = job.message || "正在检查视频和保存位置。";
       scheduleExportPoll(pollSerial, 800);
       return;
@@ -892,8 +1002,10 @@ async function pollExport(pollSerial) {
 
     if (["running", "processing", "exporting"].includes(status)) {
       elements.exportProgressKicker.textContent = "本机处理中";
-      elements.exportProgressTitle.textContent = "正在导出视频…";
-      elements.exportProgressMessage.textContent = job.message || "正在保持原分辨率与高品质音频创建新文件。";
+      elements.exportProgressTitle.textContent = isFrameMode() ? "正在逐帧截图…" : "正在导出视频…";
+      elements.exportProgressMessage.textContent = job.message || (isFrameMode()
+        ? "正在按原始宽高保存无损图片。"
+        : "正在保持原分辨率与高品质音频创建新文件。");
       scheduleExportPoll(pollSerial);
       return;
     }
@@ -909,7 +1021,10 @@ async function pollExport(pollSerial) {
     }
 
     if (["error", "failed", "failure"].includes(status)) {
-      finishExportWithError(job.error || job.message || "导出失败，请重试。", job);
+      finishExportWithError(
+        job.error || job.message || (isFrameMode() ? "截图失败，请重试。" : "导出失败，请重试。"),
+        job,
+      );
       return;
     }
 
@@ -939,7 +1054,7 @@ function finishExportSuccessfully(job) {
   state.cancellingExport = false;
   state.exportCompleted = true;
   state.exportError = "";
-  state.exportOutputName = job.output_name || state.exportOutputName || "剪辑视频";
+  state.exportOutputName = job.output_name || state.exportOutputName || (isFrameMode() ? "逐帧截图" : "剪辑视频");
 
   setExportProgress(100);
   elements.exportProgressPanel.hidden = true;
@@ -948,7 +1063,13 @@ function finishExportSuccessfully(job) {
   elements.completedOutputName.textContent = state.exportOutputName;
   elements.completedOutputPath.textContent = job.output_path || state.outputDirectory;
   elements.completedOutputPath.title = job.output_path || state.outputDirectory;
-  showToast("剪辑完成，已保存为新文件");
+  const frameCount = Number(job.frame_count);
+  elements.completionSummary.textContent = isFrameMode()
+    ? Number.isFinite(frameCount) && frameCount > 0
+      ? `截图完成，共保存 ${frameCount} 张原尺寸图片`
+      : "截图完成，原视频未被修改"
+    : "剪辑完成，原视频未被修改";
+  showToast(isFrameMode() ? "逐帧截图完成，已保存到独立文件夹" : "剪辑完成，已保存为新文件");
   renderControls();
 }
 
@@ -961,7 +1082,7 @@ function finishCancelledExport() {
   state.exportJobId = "";
   elements.exportProgressPanel.hidden = true;
   elements.exportSetup.hidden = false;
-  showToast("已取消导出，原视频未被修改");
+  showToast(isFrameMode() ? "已取消截图，未完成图片已清理" : "已取消导出，原视频未被修改");
   renderControls();
 }
 
@@ -976,8 +1097,8 @@ function finishExportWithError(message, job = null) {
   elements.exportProgressPanel.hidden = false;
   elements.exportProgressPanel.classList.add("is-error");
   elements.cancelExportButton.hidden = true;
-  elements.exportProgressKicker.textContent = "导出未完成";
-  elements.exportProgressTitle.textContent = "导出失败";
+  elements.exportProgressKicker.textContent = isFrameMode() ? "截图未完成" : "导出未完成";
+  elements.exportProgressTitle.textContent = isFrameMode() ? "截图失败" : "导出失败";
   elements.exportProgressMessage.textContent = `${state.exportError} 原视频未被修改。`;
   if (job && Number.isFinite(Number(job.elapsed_seconds))) {
     elements.exportElapsed.textContent = formatElapsed(job.elapsed_seconds);
@@ -991,15 +1112,17 @@ async function cancelExport() {
   state.cancellingExport = true;
   elements.cancelExportButton.disabled = true;
   elements.cancelExportButton.textContent = "正在取消…";
-  elements.exportProgressMessage.textContent = "正在安全停止导出并清理未完成文件…";
+  elements.exportProgressMessage.textContent = isFrameMode()
+    ? "正在安全停止截图并清理未完成图片…"
+    : "正在安全停止导出并清理未完成文件…";
 
   try {
-    await post(`/api/exports/${encodeURIComponent(state.exportJobId)}/cancel`);
+    await post(`${exportApiBase()}/${encodeURIComponent(state.exportJobId)}/cancel`);
     scheduleExportPoll(state.exportPollSerial, 150);
   } catch (error) {
     state.cancellingExport = false;
     elements.cancelExportButton.disabled = false;
-    elements.cancelExportButton.textContent = "取消导出";
+    elements.cancelExportButton.textContent = isFrameMode() ? "取消截图" : "取消导出";
     showToast(error.message || "取消失败，请稍后重试", "error");
   }
 }
@@ -1008,10 +1131,10 @@ async function revealOutput() {
   if (!state.exportJobId) return;
   elements.revealOutputButton.disabled = true;
   try {
-    await post(`/api/exports/${encodeURIComponent(state.exportJobId)}/reveal`);
-    showToast("已在 Finder 中显示导出文件");
+    await post(`${exportApiBase()}/${encodeURIComponent(state.exportJobId)}/reveal`);
+    showToast(isFrameMode() ? "已在 Finder 中显示截图文件夹" : "已在 Finder 中显示导出文件");
   } catch (error) {
-    showToast(error.message || "无法在 Finder 中显示文件", "error");
+    showToast(error.message || (isFrameMode() ? "无法在 Finder 中显示截图文件夹" : "无法在 Finder 中显示文件"), "error");
   } finally {
     elements.revealOutputButton.disabled = false;
   }
@@ -1031,13 +1154,16 @@ function continueEditing() {
 }
 
 function canExport(range = readRange(false)) {
+  const exporterReady = isFrameMode() ? state.frameExportReady : state.ffmpegReady;
   return Boolean(
     state.appReady
-      && state.ffmpegReady
+      && exporterReady
       && state.video
       && range.valid
       && state.previewReady
       && state.outputDirectory
+      && !state.selectingVideo
+      && !state.selectingDirectory
       && !state.exporting,
   );
 }
@@ -1046,23 +1172,31 @@ function renderReadyNote(range) {
   elements.readyNote.classList.remove("is-ready", "is-error");
   if (state.exportError) {
     elements.readyNote.classList.add("is-error");
-    elements.readyNoteText.textContent = "上次导出未完成，检查提示后可重试";
+    elements.readyNoteText.textContent = isFrameMode()
+      ? "上次截图未完成，检查提示后可重试"
+      : "上次导出未完成，检查提示后可重试";
   } else if (!state.appReady) {
     elements.readyNoteText.textContent = "正在连接本地服务…";
   } else if (!state.video) {
-    elements.readyNoteText.textContent = "请先选择视频并设置剪辑范围";
+    elements.readyNoteText.textContent = isFrameMode()
+      ? "请先选择视频并设置截图范围"
+      : "请先选择视频并设置剪辑范围";
   } else if (!range.valid) {
     elements.readyNoteText.textContent = "请先修正起始时间和结束时间";
   } else if (!state.previewReady) {
     elements.readyNoteText.textContent = "请等待新预览准备完成";
   } else if (!state.outputDirectory) {
     elements.readyNoteText.textContent = "请选择一个保存目录";
-  } else if (!state.ffmpegReady) {
+  } else if (!(isFrameMode() ? state.frameExportReady : state.ffmpegReady)) {
     elements.readyNote.classList.add("is-error");
-    elements.readyNoteText.textContent = "未检测到 FFmpeg，暂时无法导出";
+    elements.readyNoteText.textContent = isFrameMode()
+      ? "当前 FFmpeg 缺少逐帧截图所需编码器"
+      : "未检测到 FFmpeg，暂时无法导出";
   } else {
     elements.readyNote.classList.add("is-ready");
-    elements.readyNoteText.textContent = `已就绪，将导出 ${formatTime(range.end - range.start)} 的片段`;
+    elements.readyNoteText.textContent = isFrameMode()
+      ? "已就绪，将按原始尺寸保存所选范围内的每一帧"
+      : `已就绪，将导出 ${formatTime(range.end - range.start)} 的片段`;
   }
 }
 
@@ -1101,16 +1235,26 @@ function renderControls() {
   const range = readRange(false);
   const controlsLocked = state.exporting;
 
+  elements.modeClipButton.disabled = controlsLocked || state.selectingVideo;
+  elements.modeFramesButton.disabled = controlsLocked || state.selectingVideo;
   elements.selectVideoButton.disabled = !state.appReady || state.selectingVideo || controlsLocked;
   elements.replaceVideoButton.disabled = !state.appReady || state.selectingVideo || controlsLocked;
-  elements.startTime.disabled = !state.video || controlsLocked;
-  elements.endTime.disabled = !state.video || controlsLocked;
+  elements.startTime.disabled = !state.video || controlsLocked || state.selectingVideo;
+  elements.endTime.disabled = !state.video || controlsLocked || state.selectingVideo;
   elements.selectDirectoryButton.disabled = !state.appReady || !state.video || state.selectingDirectory || controlsLocked;
   elements.exportButton.disabled = !canExport(range);
   elements.exportButton.setAttribute("aria-busy", state.exporting ? "true" : "false");
 
   const exportLabel = elements.exportButton.querySelector(".button-label");
-  if (exportLabel) exportLabel.textContent = state.exportError ? "重新导出" : "确定并导出";
+  if (exportLabel) {
+    exportLabel.textContent = state.exportError
+      ? isFrameMode()
+        ? "重新截图"
+        : "重新导出"
+      : isFrameMode()
+        ? "确定并截图"
+        : "确定并导出";
+  }
 
   renderReadyNote(range);
   renderJourney(range);
@@ -1126,6 +1270,11 @@ async function bootstrap() {
     state.appToken = result.app_token || "";
     state.appReady = Boolean(state.appToken);
     state.ffmpegReady = Boolean(result.ffmpeg_ready);
+    state.frameExportReady = Boolean(result.frame_export_ready);
+    const maxFrameSeconds = Number(result.max_frame_seconds);
+    state.maxFrameSeconds = Number.isFinite(maxFrameSeconds) && maxFrameSeconds > 0
+      ? maxFrameSeconds
+      : DEFAULT_MAX_FRAME_SECONDS;
     state.outputDirectory = normalizeDirectory(result.output_directory);
 
     const appName = result.app_name || "本地视频剪辑";
@@ -1133,6 +1282,7 @@ async function bootstrap() {
     document.title = appName;
     elements.versionLabel.textContent = result.version ? `${appName} v${result.version}` : appName;
     renderOutputDirectory();
+    renderModeCopy();
 
     if (!state.appToken) {
       showSystemBanner("本地服务响应异常", "请刷新页面；如果仍未恢复，请重新双击 start.command。", "error");
@@ -1152,6 +1302,8 @@ async function bootstrap() {
 
 elements.selectVideoButton.addEventListener("click", selectVideo);
 elements.replaceVideoButton.addEventListener("click", selectVideo);
+elements.modeClipButton.addEventListener("click", () => changeOperation("clip"));
+elements.modeFramesButton.addEventListener("click", () => changeOperation("frames"));
 elements.selectDirectoryButton.addEventListener("click", selectOutputDirectory);
 elements.exportButton.addEventListener("click", startExport);
 elements.cancelExportButton.addEventListener("click", cancelExport);
