@@ -590,6 +590,7 @@ class AIEnhancementManager:
         }
         self.platform_supported = detected if platform_supported is None else platform_supported
         self.encoder_available = inference_runner is not None or self._has_encoder("libx265")
+        self.color_pipeline_error: str | None = None
         self.color_pipeline_available = (
             inference_runner is not None or self._has_color_pipeline()
         )
@@ -647,33 +648,50 @@ class AIEnhancementManager:
 
     def _has_color_pipeline(self) -> bool:
         if not self._has_filter("libplacebo") or not self._has_filter("zscale"):
+            self.color_pipeline_error = "libplacebo or zscale is missing"
             return False
-        try:
-            completed = subprocess.run(
-                [
-                    self.ffmpeg,
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "color=black:size=2x2:rate=1:duration=1",
-                    "-vf",
-                    f"{AI_HDR_COLOR_FILTER_GRAPH},{AI_OUTPUT_COLOR_FILTER_GRAPH}",
-                    "-frames:v",
-                    "1",
-                    "-f",
-                    "null",
-                    "-",
-                ],
-                check=False,
-                capture_output=True,
-                timeout=30,
+        command = [
+            self.ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=black:size=64x64:rate=1:duration=1",
+            "-vf",
+            f"{AI_HDR_COLOR_FILTER_GRAPH},{AI_OUTPUT_COLOR_FILTER_GRAPH}",
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ]
+        for _attempt in range(2):
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+            except subprocess.TimeoutExpired:
+                self.color_pipeline_error = "FFmpeg color-pipeline check timed out"
+                continue
+            except OSError as exc:
+                self.color_pipeline_error = str(exc)
+                continue
+            if completed.returncode == 0:
+                self.color_pipeline_error = None
+                return True
+            lines = completed.stderr.strip().splitlines()
+            self.color_pipeline_error = (
+                " | ".join(lines[-6:])[-1000:]
+                if lines
+                else f"exit code {completed.returncode}"
             )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return completed.returncode == 0
+        return False
 
     def _runtime_fingerprint(self) -> str:
         digest = hashlib.sha256()
@@ -803,10 +821,17 @@ class AIEnhancementManager:
         elif not self.encoder_available:
             message = "当前 FFmpeg 缺少 libx265，无法生成质量优先的 10-bit 成片。"
         elif not self.color_pipeline_available:
-            message = (
-                "当前 FFmpeg 缺少完整色彩组件；请在 Terminal 运行 "
-                "brew reinstall ffmpeg-full 后重新启动。"
-            )
+            detail = str(self.color_pipeline_error or "").lower()
+            if "vulkan" in detail or "vk_error" in detail:
+                message = (
+                    "当前 Mac 无法加载 Vulkan→Metal 驱动；请运行 "
+                    "brew install molten-vk 后重新启动。"
+                )
+            else:
+                message = (
+                    "FFmpeg Full 的 AI 色彩链路检测失败。请重新运行 start.command；"
+                    f"检测详情：{self.color_pipeline_error or 'unknown error'}"
+                )
         elif installed and models_downloaded:
             message = "SeedVR2 3B FP16 与 MPS 运行环境已就绪。"
         elif installed:

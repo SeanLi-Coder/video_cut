@@ -159,8 +159,8 @@ def _user_media_error(exc: MediaError) -> str:
         ),
         "Required FFmpeg encoders are not available": "当前 FFmpeg 缺少必要的高质量编码器。",
         "Required FFmpeg color filters are not available": (
-            "当前 FFmpeg 缺少安全色彩转换组件；请在 Terminal 运行 "
-            "brew reinstall ffmpeg-full 后重新启动。"
+            "当前 Mac 的 AI 色彩链路不可用；请重新运行 start.command。"
+            "如仍失败，请执行 brew install ffmpeg-full molten-vk。"
         ),
         "Export job was not found": "找不到这次导出任务，请刷新页面后重试。",
         "Unsupported AI enhancement target": "请选择 1080p、2K QHD 或 4K UHD。",

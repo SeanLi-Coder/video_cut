@@ -36,6 +36,10 @@ FFMPEG_FULL_PREFIXES = (
     Path("/opt/homebrew/opt/ffmpeg-full"),
     Path("/usr/local/opt/ffmpeg-full"),
 )
+MOLTEN_VK_PREFIXES = (
+    Path("/opt/homebrew/opt/molten-vk"),
+    Path("/usr/local/opt/molten-vk"),
+)
 FFMPEG_FULL_SMOKE_FILTER = (
     "setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:"
     "colorspace=bt2020nc,"
@@ -210,37 +214,89 @@ def _find_ffmpeg_full(brew: str | None) -> tuple[Path, Path] | None:
     return None
 
 
-def _ffmpeg_full_usable(ffmpeg: Path) -> bool:
-    try:
-        completed = subprocess.run(
-            [
-                str(ffmpeg),
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=black:size=64x64:rate=1:duration=1",
-                "-vf",
-                FFMPEG_FULL_SMOKE_FILTER,
-                "-frames:v",
-                "1",
-                "-c:v",
-                "libx265",
-                "-pix_fmt",
-                "yuv420p10le",
-                "-f",
-                "null",
-                "-",
-            ],
-            check=False,
-            capture_output=True,
-            timeout=45,
+def _find_molten_vk_icd(brew: str | None) -> Path | None:
+    prefixes = list(MOLTEN_VK_PREFIXES)
+    if brew:
+        try:
+            completed = subprocess.run(
+                [brew, "--prefix", "molten-vk"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        if completed is not None and completed.returncode == 0:
+            value = completed.stdout.strip()
+            if value:
+                prefixes.insert(0, Path(value))
+    for prefix in prefixes:
+        candidate = prefix / "etc" / "vulkan" / "icd.d" / "MoltenVK_icd.json"
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _configure_molten_vk_environment(icd_path: Path | None) -> None:
+    if icd_path is None:
+        return
+    value = str(icd_path)
+    os.environ["VK_DRIVER_FILES"] = value
+    os.environ["VK_ICD_FILENAMES"] = value
+
+
+def _ffmpeg_full_check(ffmpeg: Path) -> tuple[bool, str]:
+    command = [
+        str(ffmpeg),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=black:size=64x64:rate=1:duration=1",
+        "-vf",
+        FFMPEG_FULL_SMOKE_FILTER,
+        "-frames:v",
+        "1",
+        "-c:v",
+        "libx265",
+        "-pix_fmt",
+        "yuv420p10le",
+        "-f",
+        "null",
+        "-",
+    ]
+    detail = ""
+    for _attempt in range(2):
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+        except subprocess.TimeoutExpired:
+            detail = "FFmpeg color-pipeline check timed out"
+            continue
+        except OSError as exc:
+            detail = str(exc)
+            continue
+        if completed.returncode == 0:
+            return True, ""
+        lines = completed.stderr.strip().splitlines()
+        detail = (
+            " | ".join(lines[-6:])[-1000:]
+            if lines
+            else f"exit code {completed.returncode}"
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return completed.returncode == 0
+    return False, detail
+
+
+def _ffmpeg_full_usable(ffmpeg: Path) -> bool:
+    return _ffmpeg_full_check(ffmpeg)[0]
 
 
 def _media_executables(
@@ -256,27 +312,42 @@ def _media_executables(
 
     if apple_silicon:
         full_paths = _find_ffmpeg_full(brew)
-        if full_paths is not None and _ffmpeg_full_usable(full_paths[0]):
-            return full_paths
-        if brew:
-            action = "reinstall" if full_paths is not None else "install"
-            print(
-                "FFmpeg Full with working color filters is required for AI video. "
-                f"Running Homebrew {action}..."
-            )
+        if full_paths is None and brew:
+            print("FFmpeg Full is required for AI video. Installing it with Homebrew...")
             return_code = _run_owned(
-                [brew, action, "ffmpeg-full"],
+                [brew, "install", "ffmpeg-full"],
                 stop_requested=stop_requested,
                 lock_fd=lock_fd,
             )
             if return_code == 0:
                 full_paths = _find_ffmpeg_full(brew)
-                if full_paths is not None and _ffmpeg_full_usable(full_paths[0]):
-                    return full_paths
+
+        if full_paths is not None:
+            molten_vk_icd = _find_molten_vk_icd(brew)
+            if molten_vk_icd is None and brew:
+                print(
+                    "MoltenVK is required for libplacebo on macOS. "
+                    "Installing it with Homebrew..."
+                )
+                return_code = _run_owned(
+                    [brew, "install", "molten-vk"],
+                    stop_requested=stop_requested,
+                    lock_fd=lock_fd,
+                )
+                if return_code == 0:
+                    molten_vk_icd = _find_molten_vk_icd(brew)
+            _configure_molten_vk_environment(molten_vk_icd)
+            usable, detail = _ffmpeg_full_check(full_paths[0])
+            if not usable:
+                print(
+                    "FFmpeg Full was found, but its AI color-pipeline check failed. "
+                    f"The full binary will still be used. Detail: {detail}"
+                )
+            return full_paths
+
+        if brew:
             print(
-                "FFmpeg Full is unavailable or failed its color-pipeline check. "
-                "Basic video tools will remain available. Run "
-                "'brew reinstall ffmpeg-full' before using AI enhancement."
+                "FFmpeg Full could not be installed. Basic video tools will remain available."
             )
 
     ffmpeg = shutil.which("ffmpeg")

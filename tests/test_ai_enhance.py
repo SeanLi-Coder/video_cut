@@ -465,13 +465,18 @@ def test_download_status_reports_unavailable_color_runtime(
     )
     monkeypatch.setattr(manager, "encoder_available", True)
     monkeypatch.setattr(manager, "color_pipeline_available", False)
+    monkeypatch.setattr(
+        manager,
+        "color_pipeline_error",
+        "Failed creating instance: VK_ERROR_INCOMPATIBLE_DRIVER",
+    )
 
     snapshot = manager.model_download_status()
 
     assert snapshot["status"] == "unavailable"
     assert snapshot["runtime_unavailable"] is True
     assert snapshot["prepared"] is False
-    assert "ffmpeg-full" in snapshot["message"]
+    assert "molten-vk" in snapshot["message"]
 
 
 def test_ai_targets_preserve_aspect_ratio_and_never_downscale(

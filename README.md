@@ -176,12 +176,12 @@ AI 视频从模型输出的 sRGB full-range RGB 显式进行 transfer、matrix�
 
 ## 安装要求与自动处理边界
 
-基础功能需要 macOS、Python 3.10+ 和 FFmpeg。AI 超清额外要求 Apple Silicon（M 系列芯片）、带 `libplacebo` 与 `zscale` 的 FFmpeg Full、足够的统一内存和至少约 12 GB 的模型/环境可用磁盘空间；成片目录还需要单独的输出空间。
+基础功能需要 macOS、Python 3.10+ 和 FFmpeg。AI 超清额外要求 Apple Silicon（M 系列芯片）、带 `libplacebo` 与 `zscale` 的 FFmpeg Full、供 `libplacebo` 使用的 MoltenVK、足够的统一内存和至少约 12 GB 的模型/环境可用磁盘空间；成片目录还需要单独的输出空间。
 
 `start.command` 会优先查找 Apple Silicon Homebrew 的 `/opt/homebrew/bin/python3`、Intel Homebrew 的 `/usr/local/bin/python3`，再检查当前 `PATH` 中的 `python3`。
 
 - 已安装 Homebrew 但缺少合适的 Python 时，启动脚本会尝试执行 `brew install python`。
-- Apple Silicon Mac 缺少 FFmpeg Full 时，启动器会尝试执行 `brew install ffmpeg-full`；基础功能在安装失败时仍会回退到普通 FFmpeg。
+- Apple Silicon Mac 缺少 FFmpeg Full 或 MoltenVK 时，启动器会分别尝试执行 `brew install ffmpeg-full` 和 `brew install molten-vk`；`ffmpeg-full` 是 keg-only，不需要手动 link。基础功能在安装失败时仍可使用。
 - 工具不会自动安装 Homebrew。若 Mac 上没有 Homebrew，请先按照 [Homebrew 官网](https://brew.sh/)安装，再重新双击 `start.command`。
 - 自动安装需要网络连接，并可能要求你在 Terminal 中确认系统提示或输入当前 Mac 账号密码。
 - macOS 自带的旧版 `/usr/bin/python3` 不会被替换或修改。
@@ -189,7 +189,7 @@ AI 视频从模型输出的 sRGB full-range RGB 显式进行 transfer、matrix�
 也可以先手动安装：
 
 ```bash
-brew install python ffmpeg-full
+brew install python ffmpeg-full molten-vk
 ```
 
 然后检查：
@@ -237,7 +237,7 @@ chmod +x start.command stop.command
 先安装 Homebrew，然后执行：
 
 ```bash
-brew install python ffmpeg-full
+brew install python ffmpeg-full molten-vk
 ```
 
 完全关闭旧 Terminal 后重新双击 `start.command`。Apple Silicon Mac 的 Homebrew 通常位于 `/opt/homebrew`。
