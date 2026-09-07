@@ -478,7 +478,7 @@ function selectedAiTarget() {
 function aiSelectionReady() {
   return Boolean(
     !isEnhanceMode()
-      || (state.aiEnhanceReady && !state.video?.is_hdr && selectedAiTarget()?.available),
+      || (state.aiEnhanceReady && selectedAiTarget()?.available),
   );
 }
 
@@ -1095,8 +1095,7 @@ function renderAiTargetOptions(controlsLocked = state.exporting) {
   for (const option of elements.aiTargetOptions) {
     const target = String(option.dataset.target || "").toLowerCase();
     const availability = byTarget.get(target);
-    const hdrBlocked = Boolean(state.video?.is_hdr);
-    const available = Boolean(state.video && state.aiEnhanceReady && !hdrBlocked && availability?.available);
+    const available = Boolean(state.video && state.aiEnhanceReady && availability?.available);
     option.disabled = !available || controlsLocked || state.selectingVideo;
     option.setAttribute("aria-pressed", available && target === state.enhanceTarget ? "true" : "false");
     const reason = availability?.reason
@@ -1104,9 +1103,7 @@ function renderAiTargetOptions(controlsLocked = state.exporting) {
         ? "请先选择视频"
         : !state.aiEnhanceReady
           ? "当前 Mac 无法使用 AI 超清"
-          : hdrBlocked
-            ? "HDR 视频暂不支持安全 AI 超清"
-            : "目标清晰度低于原片，不会降级处理");
+          : "目标清晰度低于原片，不会降级处理");
     option.title = available ? `增强到 ${AI_TARGETS[target].label}` : reason;
     const dimensions = option.querySelector("[data-ai-dimensions]");
     if (dimensions) {
@@ -1122,8 +1119,6 @@ function renderAiTargetOptions(controlsLocked = state.exporting) {
     elements.aiTargetNote.textContent = "选择视频后会自动推荐第一个可用目标清晰度。";
   } else if (!state.aiEnhanceReady) {
     elements.aiTargetNote.textContent = runtimeMessage || "AI 超清仅支持 Apple Silicon Mac，当前运行环境不可用。";
-  } else if (state.video.is_hdr) {
-    elements.aiTargetNote.textContent = "当前是 HDR 视频；为避免破坏亮度、色彩和元数据，AI 超清已停用。";
   } else if (!state.enhanceTarget) {
     elements.aiTargetNote.textContent = unavailable.length
       ? `当前没有可用目标：${unavailable.join("；")}`
@@ -1154,7 +1149,7 @@ function renderModeCopy() {
         ? "把这一小段逐帧保存"
         : "留下想要的这一段";
   elements.heroCopy.textContent = enhance
-    ? "选择 1080p、2K 或 4K，使用 SeedVR2 3B FP16 在这台 Mac 本地逐帧增强。质量优先，耗时可能很长。"
+    ? "选择 1080p、2K 或 4K，使用 SeedVR2 3B FP16 在这台 Mac 本地逐帧增强；非标准色彩会自动转换，HDR 会明确映射为 SDR。"
     : rotate
       ? "选一个视频和旋转角度，确认预览后生成同级新文件。原视频始终不会被修改。"
       : frames
@@ -1190,7 +1185,7 @@ function renderModeCopy() {
         : "保持原分辨率与高品质音频";
   elements.outputNameLabel.textContent = frames ? "文件夹名" : "文件名";
   elements.outputNameNote.textContent = enhance
-    ? "10-bit HEVC；原音频直接复制；同名自动编号"
+    ? "10-bit HEVC · BT.709 SDR；原音频直接复制；同名自动编号"
     : rotate
       ? "如遇同名文件会自动添加编号"
       : frames
@@ -1537,9 +1532,13 @@ function renderModelManager() {
   const stage = String(snapshot.stage || status).toLowerCase();
   const active = modelDownloadIsActive(snapshot);
   const prepared = modelRuntimePrepared(runtime);
+  const platformReady = Boolean(runtime.ready ?? state.aiEnhanceReady);
+  const unavailable = Boolean(snapshot.runtime_unavailable)
+    || status === "unavailable"
+    || !platformReady;
   const failed = status === "failed" || status === "error" || Boolean(state.modelDownloadRequestError);
   const cancelled = status === "cancelled" || status === "canceled";
-  const platformReady = Boolean(runtime.ready ?? state.aiEnhanceReady);
+  const needsSetup = status === "needs_setup" || Boolean(snapshot.requires_runtime_update);
   const checking = !state.appReady;
   const progress = prepared ? 100 : normalizeProgress(snapshot.progress);
   const sizeGb = Number(runtime.first_download_gb);
@@ -1557,9 +1556,10 @@ function renderModelManager() {
   if (checking) badgeText = "正在检查";
   else if (prepared) [badgeStatus, badgeText] = ["ready", "已就绪"];
   else if (active) [badgeStatus, badgeText] = ["running", "准备中"];
+  else if (unavailable) badgeText = "当前不可用";
   else if (failed) [badgeStatus, badgeText] = ["failed", "未完成"];
   else if (cancelled) [badgeStatus, badgeText] = ["cancelled", "已暂停"];
-  else if (!platformReady) badgeText = "当前不可用";
+  else if (needsSetup) badgeText = "需要更新";
   elements.modelStatusBadge.dataset.status = badgeStatus;
   elements.modelStatusBadge.textContent = badgeText;
 
@@ -1569,7 +1569,7 @@ function renderModelManager() {
     elements.runtimeComponentDot,
     elements.runtimeComponentStatus,
     runtime.installed ? "ready" : runtimeBusy ? "running" : "idle",
-    runtime.installed ? "已安装并校验" : runtimeBusy ? "正在安装…" : "尚未安装",
+    runtime.installed ? "已安装并校验" : runtimeBusy ? "正在安装…" : needsSetup ? "需要安装或更新" : "尚未安装",
   );
   setComponentState(
     elements.weightsComponentDot,
@@ -1589,8 +1589,12 @@ function renderModelManager() {
   elements.modelProgressKicker.textContent = prepared ? "准备完成" : failed ? "准备未完成" : stageKicker;
   elements.modelProgressTitle.textContent = prepared
     ? "AI 模型已经可以直接使用"
+    : unavailable
+      ? "当前环境无法准备 AI 模型"
     : failed
       ? "AI 模型下载或安装失败"
+      : needsSetup
+        ? "AI 运行环境需要更新"
       : cancelled
         ? "下载已暂停，可以继续"
         : checking
@@ -1634,8 +1638,12 @@ function renderModelManager() {
   if (buttonLabel) {
     buttonLabel.textContent = prepared
       ? "模型已准备完成"
+      : unavailable
+        ? "当前不可用"
       : busy
         ? "正在准备模型…"
+        : needsSetup
+          ? "更新运行环境"
         : failed || cancelled
           ? "继续下载"
           : runtime.installed
@@ -1652,12 +1660,16 @@ function renderModelManager() {
       ? "可以切回视频处理；下载会继续，已完成部分会保留。"
       : !platformReady && !checking
         ? String(runtime.message || "AI 模型仅支持在 Apple Silicon Mac 上准备。")
+        : needsSetup
+          ? "模型文件无需重下；只会更新本地运行环境。"
         : failed
           ? "检查网络或磁盘空间后点击继续，已下载部分会用于续传。"
           : "下载可以续传；切换页面不会中断。";
 
   elements.aiRuntimeInlineNote.textContent = prepared
     ? "SeedVR2 模型已提前准备完成，开始 AI 超清时可以直接加载。"
+    : unavailable
+      ? String(runtime.message || "当前环境无法使用 AI 超清。")
     : active
       ? `SeedVR2 模型正在后台准备（${Math.round(progress)}%），切换页面不会中断。`
       : "仅支持 Apple Silicon，全程本地处理；可以提前下载约 7.3 GB 模型。";
@@ -1980,6 +1992,7 @@ async function pollExport(pollSerial) {
       || (isEnhanceMode() && ["setup", "installing", "downloading", "inference", "remux", "verify", "verifying"].includes(status))
     ) {
       const aiStageCopy = {
+        inspect: ["检查原片", "正在核对逐帧时间戳…", "正在确认帧数和时间轴连续，避免长视频音画不同步。"],
         setup: ["首次准备", "正在准备 AI 运行环境…", "正在安装本地 AI 运行环境。"],
         installing: ["首次准备", "正在安装 AI 依赖…", "正在安装本地 AI 运行环境。"],
         download: ["下载模型", "正在下载 SeedVR2 模型…", "正在下载并校验约 7.3 GB 的模型文件。"],
@@ -2259,8 +2272,7 @@ function renderReadyNote(range) {
   } else if (isEnhanceMode() && modelDownloadIsActive()) {
     elements.readyNoteText.textContent = "AI 模型正在后台准备，完成后即可开始超清";
   } else if (isEnhanceMode() && !aiSelectionReady()) {
-    if (state.video.is_hdr) elements.readyNoteText.textContent = "HDR 视频暂不支持安全 AI 超清，请改用 SDR 视频";
-    else if (!state.aiEnhanceReady) {
+    if (!state.aiEnhanceReady) {
       elements.readyNote.classList.add("is-error");
       elements.readyNoteText.textContent = String(state.aiRuntime.message || state.aiRuntime.reason || "AI 超清仅支持 Apple Silicon Mac，当前运行环境不可用");
     } else elements.readyNoteText.textContent = "当前视频没有可用目标；AI 超清不会把原片降级到更低分辨率";
@@ -2282,7 +2294,9 @@ function renderReadyNote(range) {
   } else {
     elements.readyNote.classList.add("is-ready");
     elements.readyNoteText.textContent = isEnhanceMode()
-      ? `已就绪，将用 SeedVR2 3B FP16 把整段视频增强到 ${aiTargetLabel()}`
+      ? state.video.is_hdr
+        ? `已就绪；将 HDR 映射为 BT.709 SDR 后，再增强到 ${aiTargetLabel()}；原片不会修改`
+        : `已就绪，将用 SeedVR2 3B FP16 把整段视频增强到 ${aiTargetLabel()}`
       : isRotateMode()
       ? `已就绪，将把整段视频顺时针永久旋转 ${state.rotationDegrees}°`
       : isFrameMode()

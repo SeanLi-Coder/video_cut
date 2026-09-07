@@ -19,6 +19,7 @@ import zipfile
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -37,6 +38,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNTIME_ROOT = PROJECT_ROOT / "data" / "ai"
 AI_REQUIREMENTS_PATH = PROJECT_ROOT / "requirements-ai.txt"
 AI_PATCH_PATH = PROJECT_ROOT / "vendor" / "seedvr2-mps-quality.patch"
+AI_COLOR_PATCH_PATH = PROJECT_ROOT / "vendor" / "seedvr2-color-input.patch"
 
 RUNNER_REVISION = "4490bd1f482e026674543386bb2a4d176da245b9"
 RUNNER_VERSION = "2.5.24"
@@ -45,6 +47,7 @@ RUNNER_ARCHIVE_URL = (
 )
 RUNNER_ARCHIVE_SHA256 = "04c61842bc00fd8673e6bc9a3b1b1935955461f363791070ed14d67d2a2e77fb"
 RUNNER_PATCH_SHA256 = "bd92759faf0523658cf24ab280139a9217064cd21ae9d6b00e7f0992982a8775"
+RUNNER_COLOR_PATCH_SHA256 = "bb6ce72648ed8f175cab10179d1af90645e638b17296ddb2e2ff45e89f79215c"
 
 MODEL_REPOSITORY = "numz/SeedVR2_comfyUI"
 MODEL_DOWNLOAD_URL = (
@@ -67,6 +70,25 @@ FIRST_MODEL_DOWNLOAD_GB = round((MODEL_SIZE_BYTES + VAE_SIZE_BYTES) / 1_000_000_
 MINIMUM_RUNTIME_FREE_BYTES = 12 * 1024**3
 MINIMUM_OUTPUT_FREE_BYTES = 512 * 1024**2
 MAX_ESTIMATED_REMAINING_SECONDS = 30 * 24 * 60 * 60
+AI_SDR_COLOR_FILTER_GRAPH = (
+    "libplacebo="
+    "format=gbrp16le:colorspace=gbr:color_primaries=bt709:"
+    "color_trc=iec61966-2-1:range=full:tonemapping=clip:"
+    "gamut_mode=perceptual:peak_detect=false:contrast_recovery=0:dithering=none"
+)
+AI_HDR_COLOR_FILTER_GRAPH = (
+    "libplacebo="
+    "format=gbrp16le:colorspace=gbr:color_primaries=bt709:"
+    "color_trc=iec61966-2-1:range=full:tonemapping=bt.2446a:"
+    "gamut_mode=perceptual:peak_detect=true:contrast_recovery=0:"
+    "apply_dolbyvision=true:apply_filmgrain=true:dithering=none"
+)
+AI_OUTPUT_COLOR_FILTER_GRAPH = (
+    "setparams=range=full:color_primaries=bt709:"
+    "color_trc=iec61966-2-1:colorspace=gbr,format=gbrp16le,"
+    "zscale=matrix=bt709:range=limited:primaries=bt709:transfer=bt709:"
+    "chromal=left:dither=error_diffusion,format=yuv420p10le"
+)
 
 
 def _estimated_ai_remaining_seconds(
@@ -137,6 +159,129 @@ AI_TARGETS: dict[str, AIResolutionTarget] = {
     "4k": AIResolutionTarget("4k", "4K UHD", 2160, 3840),
 }
 
+
+@dataclass(frozen=True)
+class AIInputColorPlan:
+    mode: str
+    filter_graph: str | None
+    warning: str | None
+
+
+_UNKNOWN_COLOR_TAGS = frozenset({"", "unknown", "unspecified", "reserved"})
+
+
+def _unknown_color_tag(value: object) -> bool:
+    return str(value or "").strip().lower() in _UNKNOWN_COLOR_TAGS
+
+
+def _positive_fraction(value: object) -> Fraction | None:
+    text = str(value or "").strip().replace(":", "/")
+    if not text or text in {"0", "0/0", "N/A"}:
+        return None
+    try:
+        result = Fraction(text)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+    return result if result > 0 else None
+
+
+def _source_frame_rate(metadata: dict[str, Any]) -> Fraction | None:
+    return (
+        _positive_fraction(metadata.get("average_frame_rate"))
+        or _positive_fraction(metadata.get("nominal_frame_rate"))
+        or _positive_fraction(metadata.get("fps"))
+    )
+
+
+def _untagged_sdr_defaults(metadata: dict[str, Any]) -> dict[str, str]:
+    if metadata.get("is_rgb"):
+        return {
+            "range": "pc",
+            "matrix": "gbr",
+            "transfer": "iec61966-2-1",
+            "primaries": "bt709",
+        }
+    width = int(metadata.get("width") or 0)
+    height = int(metadata.get("height") or 0)
+    fps = float(metadata.get("fps") or 0)
+    if width <= 1024 and height <= 576:
+        if height > 500 or 0 < fps <= 26:
+            return {
+                "range": "tv",
+                "matrix": "bt470bg",
+                "transfer": "bt470bg",
+                "primaries": "bt470bg",
+            }
+        return {
+            "range": "tv",
+            "matrix": "smpte170m",
+            "transfer": "smpte170m",
+            "primaries": "smpte170m",
+        }
+    return {
+        "range": "tv",
+        "matrix": "bt709",
+        "transfer": "bt709",
+        "primaries": "bt709",
+    }
+
+
+def ai_input_color_plan(source: VideoSource) -> AIInputColorPlan:
+    """Describe the explicit SDR working-space conversion used before SeedVR2."""
+    metadata = source.metadata
+    is_hdr = bool(
+        metadata.get("is_hdr")
+        or metadata.get("is_dolby_vision")
+        or metadata.get("dynamic_hdr_metadata_types")
+        or metadata.get("static_hdr_metadata")
+    )
+    assumed_values: list[str] = []
+    setparams: list[str] = []
+    sdr_defaults = _untagged_sdr_defaults(metadata)
+    if _unknown_color_tag(metadata.get("color_range")):
+        value = "tv" if is_hdr else sdr_defaults["range"]
+        setparams.append(f"range={value}")
+        assumed_values.append(f"range={value}")
+    if _unknown_color_tag(metadata.get("color_space")):
+        value = "bt2020nc" if is_hdr else sdr_defaults["matrix"]
+        setparams.append(f"colorspace={value}")
+        assumed_values.append(f"matrix={value}")
+    if _unknown_color_tag(metadata.get("color_transfer")):
+        value = "smpte2084" if is_hdr else sdr_defaults["transfer"]
+        setparams.append(f"color_trc={value}")
+        assumed_values.append(f"transfer={value}")
+    if _unknown_color_tag(metadata.get("color_primaries")):
+        value = "bt2020" if is_hdr else sdr_defaults["primaries"]
+        setparams.append(f"color_primaries={value}")
+        assumed_values.append(f"primaries={value}")
+
+    filters: list[str] = []
+    if setparams:
+        filters.append("setparams=" + ":".join(setparams))
+    filters.append(AI_HDR_COLOR_FILTER_GRAPH if is_hdr else AI_SDR_COLOR_FILTER_GRAPH)
+
+    if is_hdr:
+        warning = (
+            "检测到 HDR；开始前会使用 BT.2446 Method A 将画面映射为 BT.709 SDR。"
+            "成片不再是 HDR，峰值亮度、广色域及 Dolby Vision/HDR10+ 动态元数据不会保留"
+        )
+    elif assumed_values:
+        warning = (
+            "原片色彩标签不完整，将按分辨率和帧率推断 "
+            + "、".join(assumed_values)
+            + "，再转换为 BT.709 SDR limited 进行 AI 超清"
+        )
+    else:
+        warning = (
+            "开始前会自动把原片转换为 16-bit sRGB 工作空间，再进行 AI 超清；"
+            "成片为 BT.709 SDR limited"
+        )
+    return AIInputColorPlan(
+        mode="tone_map_hdr" if is_hdr else "normalize_sdr",
+        filter_graph=",".join(filters),
+        warning=warning,
+    )
+
 InferenceRunner = Callable[["AIEnhancementJob", Path], None]
 
 
@@ -177,9 +322,14 @@ def _source_target_error(source: VideoSource, target_value: str) -> str | None:
     return None
 
 
-def ai_target_options(source: VideoSource) -> list[dict[str, Any]]:
+def ai_target_options(
+    source: VideoSource,
+    *,
+    color_pipeline_available: bool = True,
+) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
     color_warning = _ai_color_warning(source)
+    color_plan = ai_input_color_plan(source)
     for target in AI_TARGETS.values():
         width, height = ai_output_dimensions(source, target.id)
         reason = _source_target_error(source, target.id)
@@ -187,15 +337,19 @@ def ai_target_options(source: VideoSource) -> list[dict[str, Any]]:
             try:
                 validate_ai_source(source, target.id)
             except MediaError as exc:
-                if "BT.709" in str(exc) or "Full-range" in str(exc) or "RGB video" in str(exc):
-                    reason = "AI 超清仅安全支持标准 BT.709 limited 的 YUV 视频"
-                elif "AAC transport stream" in str(exc):
+                if "AAC transport stream" in str(exc):
                     reason = "当前 AAC 传输流无法在新容器中保证音频包逐字节不变"
+                elif "HDR transfer characteristics" in str(exc):
+                    reason = "无法确认 HDR 原片使用 PQ 还是 HLG，不能安全做亮度映射"
+                elif "Non-aligned audio and video start" in str(exc):
+                    reason = "原片音轨与画面起点不一致，不能保证 AI 成片同步"
                 else:
                     reason = (
-                        "当前视频格式不适合安全 AI 超清（不支持 HDR、高位深、透明通道、"
-                        "旋转标记、非方形像素、隔行或可变帧率）"
+                        "当前视频格式不适合安全 AI 超清（不支持透明通道、旋转标记、"
+                        "非方形像素、隔行、可变帧率或未知像素格式）"
                     )
+        if reason is None and color_plan.filter_graph and not color_pipeline_available:
+            reason = "需要 FFmpeg Full 的完整色彩组件才能安全转换该视频"
         options.append(
             {
                 "id": target.id,
@@ -209,17 +363,25 @@ def ai_target_options(source: VideoSource) -> list[dict[str, Any]]:
                     source.path,
                     target.id,
                     suffix=ai_output_suffix(source),
+                    tone_mapped=color_plan.mode == "tone_map_hdr",
                 ),
             }
         )
     return options
 
 
-def default_ai_output_name(source: Path, target_value: str, *, suffix: str = ".mp4") -> str:
+def default_ai_output_name(
+    source: Path,
+    target_value: str,
+    *,
+    suffix: str = ".mp4",
+    tone_mapped: bool = False,
+) -> str:
     target = validate_ai_target(target_value)
     stem = safe_output_stem(source.stem)
     label = {"1080p": "1080p", "2k": "2k", "4k": "4k"}[target.id]
-    return f"{stem}_ai_{label}{suffix}"
+    color_suffix = "_sdr" if tone_mapped else ""
+    return f"{stem}_ai_{label}{color_suffix}{suffix}"
 
 
 def ai_output_suffix(source: VideoSource) -> str:
@@ -232,14 +394,7 @@ def ai_output_suffix(source: VideoSource) -> str:
 
 
 def _ai_color_warning(source: VideoSource) -> str | None:
-    metadata = source.metadata
-    values = [
-        str(metadata.get(key) or "").lower()
-        for key in ("color_range", "color_space", "color_transfer", "color_primaries")
-    ]
-    if any(value in {"", "unknown", "unspecified", "reserved"} for value in values):
-        return "原片没有完整色彩标签，将按常见的 BT.709 SDR limited 处理"
-    return None
+    return ai_input_color_plan(source).warning
 
 
 def _parse_ratio(value: object) -> float | None:
@@ -263,32 +418,13 @@ def validate_ai_source(source: VideoSource, target_value: str) -> AIResolutionTa
         raise MediaError("The original video was moved or deleted")
     if metadata.get("rotation") or metadata.get("display_matrix") is not None:
         raise MediaError("AI enhancement requires baked-in video orientation")
-    if metadata.get("is_hdr") or metadata.get("is_dolby_vision"):
-        raise MediaError("HDR video AI enhancement is not supported safely")
-    if metadata.get("dynamic_hdr_metadata_types") or metadata.get("static_hdr_metadata"):
-        raise MediaError("HDR video AI enhancement is not supported safely")
     if metadata.get("has_alpha"):
         raise MediaError("Alpha video AI enhancement is not supported safely")
     bit_depth = int(metadata.get("video_bit_depth") or 0)
-    if bit_depth > 8:
-        raise MediaError("High bit-depth video AI enhancement is not supported safely")
     if not metadata.get("pixel_format_known") or bit_depth <= 0:
         raise MediaError("Unknown pixel format AI enhancement is not supported safely")
-    if metadata.get("is_rgb"):
-        raise MediaError("RGB video AI enhancement is not supported safely")
-    color_range = str(metadata.get("color_range") or "").lower()
-    if color_range not in {"", "unknown", "unspecified", "tv", "mpeg"}:
-        raise MediaError("Full-range video AI enhancement is not supported safely")
-    expected_color_tags = {
-        "color_space": "bt709",
-        "color_transfer": "bt709",
-        "color_primaries": "bt709",
-    }
-    unknown_color_tags = {"", "unknown", "unspecified", "reserved"}
-    for key, expected in expected_color_tags.items():
-        value = str(metadata.get(key) or "").lower()
-        if value not in unknown_color_tags and value != expected:
-            raise MediaError("Non-BT.709 video AI enhancement is not supported safely")
+    if bool(metadata.get("is_hdr")) and _unknown_color_tag(metadata.get("color_transfer")):
+        raise MediaError("HDR transfer characteristics could not be identified safely")
     field_order = str(metadata.get("field_order") or "").lower()
     if field_order not in {"", "unknown", "progressive"}:
         raise MediaError("Interlaced video AI enhancement is not supported")
@@ -303,6 +439,12 @@ def validate_ai_source(source: VideoSource, target_value: str) -> AIResolutionTa
         raise MediaError("The selected video has no usable frame rate")
     if abs(average_fps - nominal_fps) > max(0.1, average_fps * 0.005):
         raise MediaError("Variable frame rate AI enhancement is not supported safely")
+    video_start = metadata.get("video_start_time")
+    audio_start = metadata.get("audio_start_time")
+    if metadata.get("has_audio") and video_start is not None and audio_start is not None:
+        start_tolerance = max(0.05, 2 / average_fps)
+        if abs(float(video_start) - float(audio_start)) > start_tolerance:
+            raise MediaError("Non-aligned audio and video start times are not supported safely")
     if float(metadata.get("duration") or 0) * average_fps < 5:
         raise MediaError("AI enhancement requires at least five video frames")
     format_names = {
@@ -325,6 +467,9 @@ class AIEnhancementJob:
     output_path: Path
     expected_width: int
     expected_height: int
+    input_frame_count: int | None = None
+    input_frame_rate: str | None = None
+    expected_duration: float | None = None
     status: str = "queued"
     stage: str = "queued"
     progress: float = 0.0
@@ -445,6 +590,9 @@ class AIEnhancementManager:
         }
         self.platform_supported = detected if platform_supported is None else platform_supported
         self.encoder_available = inference_runner is not None or self._has_encoder("libx265")
+        self.color_pipeline_available = (
+            inference_runner is not None or self._has_color_pipeline()
+        )
         self._jobs: dict[str, AIEnhancementJob] = {}
         self._model_download_jobs: dict[str, AIModelDownloadJob] = {}
         self._lock = threading.RLock()
@@ -482,10 +630,55 @@ class AIEnhancementManager:
             re.search(rf"^\s*[A-Z.]{{6}}\s+{re.escape(encoder)}\b", completed.stdout, re.MULTILINE)
         )
 
+    def _has_filter(self, name: str) -> bool:
+        try:
+            completed = subprocess.run(
+                [self.ffmpeg, "-hide_banner", "-filters"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return completed.returncode == 0 and bool(
+            re.search(rf"^\s*[TSC.]+\s+{re.escape(name)}\s+", completed.stdout, re.MULTILINE)
+        )
+
+    def _has_color_pipeline(self) -> bool:
+        if not self._has_filter("libplacebo") or not self._has_filter("zscale"):
+            return False
+        try:
+            completed = subprocess.run(
+                [
+                    self.ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=black:size=2x2:rate=1:duration=1",
+                    "-vf",
+                    f"{AI_HDR_COLOR_FILTER_GRAPH},{AI_OUTPUT_COLOR_FILTER_GRAPH}",
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return completed.returncode == 0
+
     def _runtime_fingerprint(self) -> str:
         digest = hashlib.sha256()
         digest.update(RUNNER_REVISION.encode("ascii"))
-        for path in (AI_REQUIREMENTS_PATH, AI_PATCH_PATH):
+        for path in (AI_REQUIREMENTS_PATH, AI_PATCH_PATH, AI_COLOR_PATCH_PATH):
             try:
                 digest.update(path.read_bytes())
             except OSError:
@@ -503,6 +696,7 @@ class AIEnhancementManager:
             marker.get("fingerprint") == self._runtime_fingerprint()
             and marker.get("runner_revision") == RUNNER_REVISION
             and marker.get("patch_sha256") == RUNNER_PATCH_SHA256
+            and marker.get("color_patch_sha256") == RUNNER_COLOR_PATCH_SHA256
         )
 
     @property
@@ -608,6 +802,11 @@ class AIEnhancementManager:
             message = "AI 超清仅支持 Apple Silicon Mac；不会尝试 CUDA 路径。"
         elif not self.encoder_available:
             message = "当前 FFmpeg 缺少 libx265，无法生成质量优先的 10-bit 成片。"
+        elif not self.color_pipeline_available:
+            message = (
+                "当前 FFmpeg 缺少完整色彩组件；请在 Terminal 运行 "
+                "brew reinstall ffmpeg-full 后重新启动。"
+            )
         elif installed and models_downloaded:
             message = "SeedVR2 3B FP16 与 MPS 运行环境已就绪。"
         elif installed:
@@ -620,10 +819,15 @@ class AIEnhancementManager:
             )
         return {
             "supported": self.platform_supported,
-            "ready": self.platform_supported and self.encoder_available,
+            "ready": (
+                self.platform_supported
+                and self.encoder_available
+                and self.color_pipeline_available
+            ),
             "prepared": (
                 self.platform_supported
                 and self.encoder_available
+                and self.color_pipeline_available
                 and installed
                 and models_downloaded
             ),
@@ -634,6 +838,8 @@ class AIEnhancementManager:
             "precision": "FP16",
             "runner_version": RUNNER_VERSION,
             "runner_revision": RUNNER_REVISION,
+            "color_pipeline": "libplacebo + zscale, 16-bit sRGB / BT.2446A to BT.709 SDR",
+            "color_pipeline_available": self.color_pipeline_available,
             "first_download_gb": FIRST_MODEL_DOWNLOAD_GB,
             "memory_gb": round(memory / 1024**3) if memory else None,
             "message": message,
@@ -655,19 +861,35 @@ class AIEnhancementManager:
         runtime = self.runtime_status()
         models_downloaded = bool(runtime["models_downloaded"])
         prepared = bool(runtime["prepared"])
+        runtime_unavailable = not bool(runtime["ready"])
+        requires_runtime_update = bool(
+            not runtime_unavailable
+            and models_downloaded
+            and not bool(runtime["installed"])
+        )
         if snapshot is None:
             downloaded_bytes = (
                 MODEL_DOWNLOAD_SIZE_BYTES
                 if self.inference_runner is not None
                 else self._available_model_bytes()
             )
-            resumable = downloaded_bytes > 0 and not prepared
-            initial_status = "completed" if prepared else "cancelled" if resumable else "idle"
+            resumable = downloaded_bytes > 0 and not models_downloaded
+            initial_status = (
+                "completed"
+                if prepared
+                else "unavailable"
+                if runtime_unavailable
+                else "needs_setup"
+                if requires_runtime_update
+                else "cancelled"
+                if resumable
+                else "idle"
+            )
             snapshot: dict[str, Any] = {
                 "job_id": None,
                 "operation": "ai_model_download",
                 "status": initial_status,
-                "stage": initial_status,
+                "stage": "setup" if requires_runtime_update else initial_status,
                 "progress": (
                     100.0
                     if prepared
@@ -677,12 +899,16 @@ class AIEnhancementManager:
                     "SeedVR2 3B FP16 模型和 MPS 运行环境已经就绪。"
                     if prepared
                     else (
-                        "模型已经校验；点击准备按钮即可安装 MPS 运行环境。"
-                        if models_downloaded
+                        str(runtime["message"])
+                        if runtime_unavailable
                         else (
-                            "检测到可续传的模型文件，点击继续下载即可恢复。"
-                            if resumable
-                            else "可以现在下载 AI 模型，无需先选择视频。"
+                            "模型已经校验；点击按钮即可安装或更新 MPS 运行环境。"
+                            if requires_runtime_update
+                            else (
+                                "检测到可续传的模型文件，点击继续下载即可恢复。"
+                                if resumable
+                                else "可以现在下载 AI 模型，无需先选择视频。"
+                            )
                         )
                     )
                 ),
@@ -696,15 +922,30 @@ class AIEnhancementManager:
             }
         elif snapshot["status"] == "completed" and not prepared:
             downloaded_bytes = self._available_model_bytes()
+            fallback_status = (
+                "unavailable"
+                if runtime_unavailable
+                else "needs_setup"
+                if requires_runtime_update
+                else "cancelled"
+                if downloaded_bytes > 0 and not models_downloaded
+                else "idle"
+            )
             snapshot.update(
                 {
-                    "status": "cancelled" if downloaded_bytes > 0 else "idle",
-                    "stage": "cancelled" if downloaded_bytes > 0 else "idle",
+                    "status": fallback_status,
+                    "stage": "setup" if requires_runtime_update else fallback_status,
                     "progress": round(
                         downloaded_bytes / MODEL_DOWNLOAD_SIZE_BYTES * 98,
                         1,
                     ),
-                    "message": "AI 模型或运行环境发生变化，请重新准备。",
+                    "message": (
+                        str(runtime["message"])
+                        if runtime_unavailable
+                        else "AI 模型或运行环境发生变化，请重新准备。"
+                        if not requires_runtime_update
+                        else "模型仍已校验；本地 AI 运行环境需要更新。"
+                    ),
                     "error": None,
                     "downloaded_bytes": downloaded_bytes,
                     "download_speed_bps": 0,
@@ -717,6 +958,8 @@ class AIEnhancementManager:
                 "installed": runtime["installed"],
                 "models_downloaded": models_downloaded,
                 "prepared": prepared,
+                "requires_runtime_update": requires_runtime_update,
+                "runtime_unavailable": runtime_unavailable,
                 "model_name": runtime["model_name"],
                 "first_download_gb": runtime["first_download_gb"],
                 "runtime": runtime,
@@ -738,6 +981,8 @@ class AIEnhancementManager:
             raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
         if not self.encoder_available:
             raise MediaError("Required FFmpeg encoder is not available: libx265")
+        if not self.color_pipeline_available:
+            raise MediaError("Required FFmpeg color filters are not available")
         with self._lock:
             active = self._active_job_locked()
             if isinstance(active, AIModelDownloadJob):
@@ -802,6 +1047,8 @@ class AIEnhancementManager:
             raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
         if not self.encoder_available:
             raise MediaError("Required FFmpeg encoder is not available: libx265")
+        if not self.color_pipeline_available:
+            raise MediaError("Required FFmpeg color filters are not available")
         validated_target = validate_ai_source(source, target)
         directory = output_directory.expanduser().resolve()
         if not directory.is_dir():
@@ -827,7 +1074,13 @@ class AIEnhancementManager:
             raise MediaError("There is not enough free space in the output directory")
 
         suffix = ai_output_suffix(source)
-        desired_name = default_ai_output_name(source.path, validated_target.id, suffix=suffix)
+        color_plan = ai_input_color_plan(source)
+        desired_name = default_ai_output_name(
+            source.path,
+            validated_target.id,
+            suffix=suffix,
+            tone_mapped=color_plan.mode == "tone_map_hdr",
+        )
         destination = available_output_path(directory, desired_name)
         job = AIEnhancementJob(
             id=uuid.uuid4().hex,
@@ -1526,6 +1779,8 @@ class AIEnhancementManager:
             return "磁盘空间不足，AI 超清未完成。"
         if "nan" in text or "infinite" in text or "not finite" in text:
             return "检测到 MPS 生成了异常画面数值，已停止导出以避免保存损坏视频。"
+        if "color-managed input failed" in text or "libplacebo" in text:
+            return "AI 输入色彩转换失败，已停止以避免生成偏色或亮度错误的视频。"
         if "download" in text or "urlopen" in text or "network" in text:
             return "AI 模型下载失败，请检查网络后重试；已下载部分会保留以便续传。"
         detail = recent[-1] if recent else f"process exited with code {return_code}"
@@ -1543,10 +1798,15 @@ class AIEnhancementManager:
         if runtime_installed:
             return
 
-        if not AI_REQUIREMENTS_PATH.is_file() or not AI_PATCH_PATH.is_file():
+        if not all(
+            path.is_file()
+            for path in (AI_REQUIREMENTS_PATH, AI_PATCH_PATH, AI_COLOR_PATCH_PATH)
+        ):
             raise MediaError("The bundled AI runtime files are missing")
         if self._file_sha256(AI_PATCH_PATH) != RUNNER_PATCH_SHA256:
             raise MediaError("The bundled AI quality patch failed integrity verification")
+        if self._file_sha256(AI_COLOR_PATCH_PATH) != RUNNER_COLOR_PATCH_SHA256:
+            raise MediaError("The bundled AI color patch failed integrity verification")
 
         archive = self.runtime_root / f"runner-{RUNNER_REVISION}.zip"
         if not archive.is_file() or self._file_sha256(archive) != RUNNER_ARCHIVE_SHA256:
@@ -1565,6 +1825,11 @@ class AIEnhancementManager:
             self._run_process(
                 job,
                 ["/usr/bin/patch", "-l", "-p1", "-i", str(AI_PATCH_PATH)],
+                cwd=extracted,
+            )
+            self._run_process(
+                job,
+                ["/usr/bin/patch", "-l", "-p1", "-i", str(AI_COLOR_PATCH_PATH)],
                 cwd=extracted,
             )
             for backup in extracted.rglob("*.orig"):
@@ -1624,6 +1889,7 @@ class AIEnhancementManager:
                         "runner_revision": RUNNER_REVISION,
                         "runner_version": RUNNER_VERSION,
                         "patch_sha256": RUNNER_PATCH_SHA256,
+                        "color_patch_sha256": RUNNER_COLOR_PATCH_SHA256,
                         "model": MODEL_FILENAME,
                     },
                     ensure_ascii=True,
@@ -1655,7 +1921,7 @@ class AIEnhancementManager:
     ) -> list[str]:
         batch_size = self._quality_batch_size()
         chunk_size = batch_size * 8 + 1
-        return [
+        command = [
             str(self.venv_python),
             "-u",
             str(self.code_root / "inference_cli.py"),
@@ -1705,6 +1971,39 @@ class AIEnhancementManager:
             "--tensor_offload_device",
             "cpu",
         ]
+        color_plan = ai_input_color_plan(job.source)
+        if color_plan.filter_graph:
+            metadata = job.source.metadata
+            estimated_frame_count = max(
+                5,
+                math.ceil(float(metadata["duration"]) * float(metadata["fps"])) + 2,
+            )
+            frame_count = (
+                job.input_frame_count
+                or int(metadata.get("video_frame_count") or 0)
+                or estimated_frame_count
+            )
+            frame_rate = _positive_fraction(job.input_frame_rate) or _source_frame_rate(metadata)
+            if frame_rate is None:
+                raise MediaError("The selected video has no usable frame rate")
+            frame_rate_text = f"{frame_rate.numerator}/{frame_rate.denominator}"
+            command.extend(
+                [
+                    "--input_vf",
+                    color_plan.filter_graph,
+                    "--input_video_stream",
+                    str(int(metadata["video_stream_index"])),
+                    "--input_width",
+                    str(int(metadata["width"])),
+                    "--input_height",
+                    str(int(metadata["height"])),
+                    "--input_fps",
+                    frame_rate_text,
+                    "--input_frame_count",
+                    str(frame_count),
+                ]
+            )
+        return command
 
     def _inference_environment(self, python_directory: Path | None = None) -> dict[str, str]:
         env = os.environ.copy()
@@ -1714,6 +2013,7 @@ class AIEnhancementManager:
                 "PYTORCH_ENABLE_MPS_FALLBACK": "1",
                 "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.95",
                 "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.85",
+                "VIDEO_CUT_OUTPUT_VF": AI_OUTPUT_COLOR_FILTER_GRAPH,
             }
         )
         path_entries = [str(Path(self.ffmpeg).parent)]
@@ -1728,12 +2028,17 @@ class AIEnhancementManager:
         input_path: Path,
         output_path: Path,
     ) -> None:
+        color_plan = ai_input_color_plan(job.source)
         if self.inference_runner is not None:
             self._set_job(
                 job,
                 stage="inference",
                 progress=20,
-                message=f"正在用 {MODEL_NAME} 生成 {job.target.label} 画面",
+                message=(
+                    f"正在映射 HDR 色彩并用 {MODEL_NAME} 生成 {job.target.label} 画面"
+                    if color_plan.mode == "tone_map_hdr"
+                    else f"正在用 {MODEL_NAME} 生成 {job.target.label} 画面"
+                ),
             )
             self.inference_runner(job, output_path)
             self._set_job(job, progress=90)
@@ -1781,7 +2086,11 @@ class AIEnhancementManager:
                     job,
                     stage="inference",
                     progress=18 + fraction * 72,
-                    message=f"正在用 {MODEL_NAME} 逐帧生成 {job.target.label} 画面",
+                    message=(
+                        f"正在转换 HDR 色彩并用 {MODEL_NAME} 逐帧生成 {job.target.label} 画面"
+                        if color_plan.mode == "tone_map_hdr"
+                        else f"正在用 {MODEL_NAME} 逐帧生成 {job.target.label} 画面"
+                    ),
                 )
 
         self._finalize_complete_model_partials(job)
@@ -1793,7 +2102,11 @@ class AIEnhancementManager:
             message=(
                 f"首次使用：准备下载并校验约 {FIRST_MODEL_DOWNLOAD_GB:.1f} GB 模型"
                 if not self._models_downloaded()
-                else f"正在加载 {MODEL_NAME}，随后开始生成画面"
+                else (
+                    f"正在加载 {MODEL_NAME}，随后将 HDR 映射为 SDR 并生成画面"
+                    if color_plan.mode == "tone_map_hdr"
+                    else f"正在加载 {MODEL_NAME}，随后开始生成画面"
+                )
             ),
         )
         self._run_process(
@@ -1841,12 +2154,115 @@ class AIEnhancementManager:
                 "bt709",
                 "-color_primaries",
                 "bt709",
+                "-chroma_sample_location",
+                "left",
             ]
         )
         if output.suffix.lower() in {".mp4", ".mov", ".m4v"}:
             command.extend(["-tag:v:0", "hvc1", "-movflags", "+faststart"])
         command.append(str(output))
         return command
+
+    def _audit_frame_timing(self, job: AIEnhancementJob) -> None:
+        metadata = job.source.metadata
+        try:
+            current_size = job.source.path.stat().st_size
+        except OSError as exc:
+            raise MediaError("The original video was moved or deleted") from exc
+        recorded_size = int(metadata.get("size") or 0)
+        if recorded_size > 0 and current_size != recorded_size:
+            raise MediaError("The original video changed after it was selected")
+
+        frame_rate = _source_frame_rate(metadata)
+        time_base = _positive_fraction(metadata.get("video_time_base"))
+        if frame_rate is None or time_base is None:
+            raise MediaError("AI video frame timestamps could not be verified safely")
+
+        packet_pts: list[int] = []
+        missing_pts = False
+        last_progress = -1
+        source_size = max(1, current_size)
+
+        def collect(line: str) -> None:
+            nonlocal missing_pts, last_progress
+            pts_match = re.search(r"(?:^|\|)pts=(-?\d+)(?:\||$)", line)
+            if pts_match is None:
+                if "pts=N/A" in line:
+                    missing_pts = True
+                return
+            packet_pts.append(int(pts_match.group(1)))
+            position_match = re.search(r"(?:^|\|)pos=(\d+)(?:\||$)", line)
+            if position_match is None:
+                return
+            percent = min(99, int(int(position_match.group(1)) / source_size * 100))
+            if percent >= last_progress + 2:
+                last_progress = percent
+                self._set_job(
+                    job,
+                    stage="inspect",
+                    progress=1 + percent * 0.05,
+                    message=f"正在核对原片全部帧时间戳（{percent}%）",
+                )
+
+        self._set_job(
+            job,
+            stage="inspect",
+            progress=1,
+            message="正在核对原片全部帧时间戳，避免长视频音画不同步",
+        )
+        self._run_process(
+            job,
+            [
+                self.ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                str(int(metadata["video_stream_index"])),
+                "-show_packets",
+                "-show_entries",
+                "packet=pts,pos",
+                "-of",
+                "compact=p=0:nk=0",
+                str(job.source.path),
+            ],
+            on_line=collect,
+        )
+        if missing_pts or len(packet_pts) < 5:
+            raise MediaError("AI video frame timestamps could not be verified safely")
+
+        ordered_pts = sorted(packet_pts)
+        if len(set(ordered_pts)) != len(ordered_pts):
+            raise MediaError("Variable frame rate AI enhancement is not supported safely")
+        frame_step = Fraction(1, 1) / (frame_rate * time_base)
+        tolerance = max(Fraction(1, 1), abs(frame_step) / 50)
+        first_pts = Fraction(ordered_pts[0], 1)
+        for index, actual_pts in enumerate(ordered_pts):
+            expected_pts = first_pts + index * frame_step
+            if abs(Fraction(actual_pts, 1) - expected_pts) > tolerance:
+                raise MediaError("Variable frame rate AI enhancement is not supported safely")
+
+        declared_count = int(metadata.get("video_frame_count") or 0)
+        if declared_count > 0 and declared_count != len(ordered_pts):
+            raise MediaError("AI video frame timestamps could not be verified safely")
+
+        expected_duration = float(Fraction(len(ordered_pts), 1) / frame_rate)
+        source_duration = float(metadata.get("duration") or 0)
+        if not math.isclose(
+            source_duration,
+            expected_duration,
+            abs_tol=max(0.12, 2 / float(frame_rate)),
+        ):
+            raise MediaError("AI video frame timestamps could not be verified safely")
+
+        job.input_frame_count = len(ordered_pts)
+        job.input_frame_rate = f"{frame_rate.numerator}/{frame_rate.denominator}"
+        job.expected_duration = expected_duration
+        self._set_job(
+            job,
+            stage="setup",
+            progress=6,
+            message=f"已确认 {len(ordered_pts)} 帧时间戳连续，正在准备 AI 环境",
+        )
 
     def _packet_fingerprint(
         self,
@@ -1883,6 +2299,33 @@ class AIEnhancementManager:
         self._run_process(job, command, on_line=collect)
         return count, digest.hexdigest()
 
+    def _video_packet_count(self, job: AIEnhancementJob, path: Path) -> int:
+        count = 0
+
+        def collect(line: str) -> None:
+            nonlocal count
+            if re.fullmatch(r"-?\d+", line):
+                count += 1
+
+        self._run_process(
+            job,
+            [
+                self.ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_packets",
+                "-show_entries",
+                "packet=pts",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            on_line=collect,
+        )
+        return count
+
     def _verify_video(self, job: AIEnhancementJob, path: Path, *, final: bool) -> None:
         metadata = probe_video(path, ffprobe=self.ffprobe)
         if (metadata["width"], metadata["height"]) != (
@@ -1899,6 +2342,7 @@ class AIEnhancementManager:
             "color_space": "bt709",
             "color_transfer": "bt709",
             "color_primaries": "bt709",
+            "chroma_location": "left",
         }
         if any(
             str(metadata.get(key) or "").lower() != value
@@ -1907,13 +2351,33 @@ class AIEnhancementManager:
             raise MediaError("AI output verification detected unexpected color metadata")
         if metadata.get("rotation") or metadata.get("display_matrix") is not None:
             raise MediaError("AI output verification detected unexpected rotation metadata")
-        source_fps = float(job.source.metadata.get("fps") or 0)
-        result_fps = float(metadata.get("fps") or 0)
-        if source_fps <= 0 or not math.isclose(source_fps, result_fps, abs_tol=0.02):
+        if (
+            metadata.get("is_hdr")
+            or metadata.get("is_dolby_vision")
+            or metadata.get("static_hdr_metadata")
+            or metadata.get("dynamic_hdr_metadata_types")
+        ):
+            raise MediaError("AI output verification detected unexpected HDR metadata")
+        source_rate = _positive_fraction(job.input_frame_rate) or _source_frame_rate(
+            job.source.metadata
+        )
+        result_rate = _source_frame_rate(metadata)
+        if (
+            source_rate is None
+            or result_rate is None
+            or abs(float(source_rate - result_rate)) > max(0.0001, float(source_rate) * 0.00001)
+        ):
             raise MediaError("AI output verification detected a frame rate change")
-        frame_duration = 1 / source_fps
+        if job.input_frame_count is not None:
+            result_frame_count = int(metadata.get("video_frame_count") or 0)
+            if result_frame_count <= 0:
+                result_frame_count = self._video_packet_count(job, path)
+            if result_frame_count != job.input_frame_count:
+                raise MediaError("AI output verification detected a frame count change")
+        frame_duration = 1 / float(source_rate)
+        expected_duration = job.expected_duration or float(job.source.metadata["duration"])
         if not math.isclose(
-            float(job.source.metadata["duration"]),
+            expected_duration,
             float(metadata["duration"]),
             abs_tol=max(0.12, frame_duration * 2),
         ):
@@ -1937,6 +2401,27 @@ class AIEnhancementManager:
                 )
                 if source_fingerprint != output_fingerprint:
                     raise MediaError("AI output verification detected changed audio packets")
+                source_video_start = job.source.metadata.get("video_start_time")
+                source_audio_start = job.source.metadata.get("audio_start_time")
+                result_video_start = metadata.get("video_start_time")
+                result_audio_start = metadata.get("audio_start_time")
+                if all(
+                    value is not None
+                    for value in (
+                        source_video_start,
+                        source_audio_start,
+                        result_video_start,
+                        result_audio_start,
+                    )
+                ):
+                    source_offset = float(source_audio_start) - float(source_video_start)
+                    result_offset = float(result_audio_start) - float(result_video_start)
+                    if not math.isclose(
+                        source_offset,
+                        result_offset,
+                        abs_tol=max(0.05, frame_duration * 2),
+                    ):
+                        raise MediaError("AI output verification detected an audio timing change")
         elif metadata.get("has_audio"):
             raise MediaError("The AI runner unexpectedly added an audio stream")
 
@@ -1956,6 +2441,9 @@ class AIEnhancementManager:
                 job.message = "正在准备质量优先的 MPS AI 环境"
                 job.started_at = started_at
                 job.stage_started_at = started_at
+            self._audit_frame_timing(job)
+            if job.cancel_event.is_set():
+                raise InterruptedError
             self._prepare_runtime(job)
             if job.cancel_event.is_set():
                 raise InterruptedError

@@ -307,8 +307,8 @@ def probe_video(path: Path, *, ffprobe: str | None = None) -> dict[str, Any]:
             "stream=index,codec_type,codec_name,width,height,avg_frame_rate,"
             "r_frame_rate,pix_fmt,sample_aspect_ratio,sample_fmt,sample_rate,channels,channel_layout,"
             "bit_rate,duration,start_time,duration_ts,time_base,profile,bits_per_sample,"
-            "bits_per_raw_sample,field_order,color_range,"
-            "color_space,color_transfer,color_primaries:"
+            "bits_per_raw_sample,nb_frames,field_order,color_range,"
+            "color_space,color_transfer,color_primaries,chroma_location:"
             "stream_disposition=default,attached_pic:"
             "stream_side_data=rotation,side_data_type,displaymatrix"
         ),
@@ -435,6 +435,14 @@ def probe_video(path: Path, *, ffprobe: str | None = None) -> dict[str, Any]:
         video_stream.get("start_time"),
         default=_optional_finite_float(media_format.get("start_time")),
     )
+    audio_start_time = (
+        _optional_finite_float(
+            audio_stream.get("start_time"),
+            default=_optional_finite_float(media_format.get("start_time")),
+        )
+        if audio_stream
+        else None
+    )
 
     pixel_format = str(video_stream.get("pix_fmt") or "unknown")
     pixel_details = _pixel_format_catalog(ffprobe_path).get(pixel_format, {})
@@ -460,7 +468,6 @@ def probe_video(path: Path, *, ffprobe: str | None = None) -> dict[str, Any]:
     is_dolby_vision = any("DOVI" in value for value in side_data_types)
     is_hdr = (
         color_transfer in {"smpte2084", "arib-std-b67"}
-        or (color_primaries == "bt2020" and video_bit_depth > 8)
         or is_dolby_vision
     )
     hdr_metadata_inspected = True
@@ -507,7 +514,12 @@ def probe_video(path: Path, *, ffprobe: str | None = None) -> dict[str, Any]:
         "display_matrix": display_matrix,
         "fps": rate,
         "max_fps": maximum_rate,
+        "average_frame_rate": str(video_stream.get("avg_frame_rate") or ""),
+        "nominal_frame_rate": str(video_stream.get("r_frame_rate") or ""),
+        "video_time_base": str(video_stream.get("time_base") or ""),
+        "video_frame_count": _positive_int(video_stream.get("nb_frames")),
         "video_start_time": video_start_time,
+        "audio_start_time": audio_start_time,
         "video_codec": str(video_stream.get("codec_name") or "unknown"),
         "audio_codec": (
             str(audio_stream.get("codec_name") or "unknown")
@@ -531,6 +543,7 @@ def probe_video(path: Path, *, ffprobe: str | None = None) -> dict[str, Any]:
         "color_space": str(video_stream.get("color_space") or ""),
         "color_transfer": color_transfer,
         "color_primaries": color_primaries,
+        "chroma_location": str(video_stream.get("chroma_location") or ""),
         "is_hdr": is_hdr,
         "is_dolby_vision": is_dolby_vision,
         "hdr_metadata_inspected": hdr_metadata_inspected,

@@ -8,6 +8,7 @@ This directory contains a project-maintained patch for the Apache-2.0 licensed
 - Upstream version: `2.5.24`
 - Source archive SHA-256: `04c61842bc00fd8673e6bc9a3b1b1935955461f363791070ed14d67d2a2e77fb`
 - Patch SHA-256: `bd92759faf0523658cf24ab280139a9217064cd21ae9d6b00e7f0992982a8775`
+- Color-input patch SHA-256: `bb6ce72648ed8f175cab10179d1af90645e638b17296ddb2e2ff45e89f79215c`
 
 The patch changes the upstream runner to:
 
@@ -15,13 +16,23 @@ The patch changes the upstream runner to:
 - move MPS tensor tile/concatenation operations that exceed INT_MAX to CPU;
 - reject non-finite latent and final tensors;
 - preserve ten-bit precision through an RGB48LE pipe;
-- encode explicitly tagged BT.709 limited HEVC with `libx265`, `preset slow`,
+- convert sRGB model output explicitly to BT.709 limited with `zscale` and
+  error-diffusion dithering, then encode it as HEVC with `libx265`, `preset slow`,
   `CRF 10`, and the `hvc1` tag;
 - remove artificial lead-in frames from the single-device streaming path; and
 - cache successful model SHA-256 validation after the first download.
 
+The additional `seedvr2-color-input.patch` adds a streaming FFmpeg reader for
+trusted, application-generated filter graphs. It sends `bgr48le` frames directly
+to the model without a temporary mezzanine file, so the application can normalize
+full-range, non-BT.709, RGB, high-bit-depth, and tone-mapped HDR sources without
+the upstream OpenCV reader first reducing them to 8-bit. The reader runs to FFmpeg
+EOF, preserves exact rational frame rates, and bounds/reaps FFmpeg subprocesses on
+success and failure so a full stderr pipe or stuck child cannot hang the runner.
+
 The application downloads the exact source archive at first use, verifies its
-SHA-256 digest, and applies `seedvr2-mps-quality.patch`. The downloaded source
+SHA-256 digest, and applies `seedvr2-mps-quality.patch` followed by
+`seedvr2-color-input.patch`. The downloaded source
 keeps its original copyright notices and Apache-2.0 license.
 
 SeedVR2 model files are downloaded separately from

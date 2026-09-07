@@ -1,0 +1,599 @@
+--- a/inference_cli.py
++++ b/inference_cli.py
+@@ -50,6 +50,8 @@
+ import time
+ import platform
+ import multiprocessing as mp
++import tempfile
++from fractions import Fraction
+ from typing import Dict, Any, List, Optional, Tuple, Literal, Generator
+ from datetime import datetime
+ from pathlib import Path
+@@ -139,6 +141,73 @@
+ # FFMPEG Class
+ # =============================================================================
+
++
++def _read_process_error(stderr_file, limit: int = 16384) -> str:
++    """Read a bounded stderr tail from a temporary file without pipe deadlocks."""
++    if stderr_file is None:
++        return ""
++    try:
++        stderr_file.flush()
++        stderr_file.seek(0, os.SEEK_END)
++        size = stderr_file.tell()
++        stderr_file.seek(max(0, size - limit))
++        return stderr_file.read().decode('utf-8', errors='replace').strip()
++    except (OSError, ValueError):
++        return ""
++
++
++def _normalize_video_rate(value) -> Tuple[str, float]:
++    """Validate an ffmpeg frame-rate value while preserving an exact rational."""
++    try:
++        rate = Fraction(str(value).strip())
++        fps = float(rate)
++    except (ValueError, ZeroDivisionError, OverflowError) as exc:
++        raise ValueError(f"Invalid input frame rate: {value}") from exc
++    if rate <= 0 or not np.isfinite(fps) or fps > 1000:
++        raise ValueError(f"Invalid input frame rate: {value}")
++    return f'{rate.numerator}/{rate.denominator}', fps
++
++
++def _wait_process_bounded(process, timeout: float, *, terminate_first: bool = False) -> Tuple[int, bool]:
++    """Reap a child process, escalating from terminate to kill after a timeout."""
++    timed_out = False
++    try:
++        if terminate_first and process.poll() is None:
++            try:
++                process.terminate()
++            except (OSError, ProcessLookupError):
++                pass
++        try:
++            return process.wait(timeout=timeout), timed_out
++        except subprocess.TimeoutExpired:
++            timed_out = True
++            if process.poll() is None:
++                try:
++                    process.terminate()
++                except (OSError, ProcessLookupError):
++                    pass
++            try:
++                return process.wait(timeout=5), timed_out
++            except subprocess.TimeoutExpired:
++                if process.poll() is None:
++                    try:
++                        process.kill()
++                    except (OSError, ProcessLookupError):
++                        pass
++                return process.wait(), timed_out
++    except BaseException:
++        if process.poll() is None:
++            try:
++                process.kill()
++            except (OSError, ProcessLookupError):
++                pass
++        try:
++            process.wait(timeout=5)
++        except (subprocess.TimeoutExpired, OSError):
++            pass
++        raise
++
++
+ class FFMPEGVideoWriter:
+     """
+     Video writer using ffmpeg subprocess for encoding with 10-bit support.
+@@ -163,28 +232,43 @@
+         Internally converts to RGB for ffmpeg rawvideo input.
+     """
+
+-    def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False):
++    def __init__(self, path: str, width: int, height: int, fps, use_10bit: bool = False):
++        rate_text, _ = _normalize_video_rate(fps)
+         pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
+         codec = 'libx265' if use_10bit else 'libx264'
+         input_pix_fmt = 'rgb48le' if use_10bit else 'rgb24'
+         encode_options = (
+-            ['-vf', 'scale=in_range=full:out_range=limited:out_color_matrix=bt709:'
+-             'flags=lanczos+accurate_rnd+full_chroma_int',
++            ['-vf', os.environ.get(
++                'VIDEO_CUT_OUTPUT_VF',
++                'setparams=range=full:color_primaries=bt709:'
++                'color_trc=iec61966-2-1:colorspace=gbr,format=gbrp16le,'
++                'zscale=matrix=bt709:range=limited:primaries=bt709:'
++                'transfer=bt709:chromal=left:dither=error_diffusion,'
++                'format=yuv420p10le'
++             ),
+              '-preset', 'slow', '-crf', '10',
+              '-x265-params', 'colorprim=bt709:transfer=bt709:colormatrix=bt709',
+              '-color_range', 'tv', '-colorspace', 'bt709', '-color_trc', 'bt709',
+-             '-color_primaries', 'bt709', '-tag:v', 'hvc1']
++             '-color_primaries', 'bt709', '-chroma_sample_location', 'left',
++             '-tag:v', 'hvc1']
+             if use_10bit
+             else ['-preset', 'medium', '-crf', '12']
+         )
+         self.use_10bit = use_10bit
+
+-        self.proc = subprocess.Popen(
+-            ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', input_pix_fmt,
+-             '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
+-             '-c:v', codec, '-pix_fmt', pix_fmt, *encode_options, path],
+-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+-        )
++        self.stderr_file = tempfile.TemporaryFile()
++        try:
++            self.proc = subprocess.Popen(
++                ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
++                 '-f', 'rawvideo', '-pix_fmt', input_pix_fmt,
++                 '-s', f'{width}x{height}', '-r', rate_text, '-i', '-',
++                 '-c:v', codec, '-pix_fmt', pix_fmt, *encode_options, path],
++                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.stderr_file
++            )
++        except BaseException:
++            self.stderr_file.close()
++            self.stderr_file = None
++            raise
+
+     def write(self, frame_bgr: np.ndarray):
+         if not self.isOpened():
+@@ -198,7 +282,7 @@
+         try:
+             self.proc.stdin.write(frame_rgb.tobytes())
+             self.proc.stdin.flush()  # Critical: prevent buffering issues
+-        except BrokenPipeError:
++        except (BrokenPipeError, OSError):
+             raise RuntimeError(
+                 "FFMPEGVideoWriter: ffmpeg process terminated unexpectedly. "
+                 "Check video path, codec support, and disk space."
+@@ -208,23 +292,164 @@
+         return self.proc is not None and self.proc.poll() is None
+
+     def release(self):
+-        if self.proc:
+-            try:
+-                self.proc.stdin.close()
+-            except Exception:
+-                pass  # Ignore errors on close
+-
+-            self.proc.wait()
+-
+-            if self.proc.returncode != 0:
+-                debug.log(
+-                    f"ffmpeg exited with code {self.proc.returncode}. "
+-                    "Check output file for corruption.",
+-                    level="WARNING", force=True, category="file"
+-                )
++        process = self.proc
++        stderr_file = self.stderr_file
++        if process is None:
++            if stderr_file is not None:
++                stderr_file.close()
++                self.stderr_file = None
++            return
++        try:
++            if process.stdin:
++                process.stdin.close()
++        except (BrokenPipeError, OSError, ValueError):
++            pass
++        try:
++            returncode, timed_out = _wait_process_bounded(process, 120)
++        finally:
++            detail = _read_process_error(stderr_file)
++            if stderr_file is not None:
++                stderr_file.close()
+             self.proc = None
++            self.stderr_file = None
++        if timed_out:
++            tail = detail.splitlines()[-1] if detail else 'no ffmpeg error output'
++            raise RuntimeError(f'FFMPEGVideoWriter: ffmpeg timed out while finalizing: {tail}')
++        if returncode != 0:
++            tail = detail.splitlines()[-1] if detail else f'exit code {returncode}'
++            raise RuntimeError(f'FFMPEGVideoWriter: ffmpeg encoding failed: {tail}')
+
+
++class FFMPEGFilteredVideoCapture:
++    """Stream color-managed 16-bit RGB frames from ffmpeg without an intermediate file."""
++
++    def __init__(self, path: str, video_filter: str, stream_index: int,
++                 width: int, height: int, fps, total_frames: int):
++        self.width = int(width)
++        self.height = int(height)
++        self.ffmpeg_fps, self.fps = _normalize_video_rate(fps)
++        self.total_frames = max(0, int(total_frames))
++        self.read_until_eof = True
++        self._opened = (
++            os.path.isfile(path) and self.width > 0 and self.height > 0
++            and self.fps > 0
++        )
++        self.path = path
++        self.video_filter = video_filter
++        self.stream_index = max(0, int(stream_index))
++        self.start_frame = 0
++        self.proc = None
++        self.stderr_file = None
++        self.eof = False
++        self.frame_bytes = self.width * self.height * 3 * 2
++
++    def isOpened(self) -> bool:
++        return self._opened and (self.proc is None or self.proc.poll() is None)
++
++    def get(self, prop: int) -> float:
++        values = {
++            cv2.CAP_PROP_FPS: self.fps,
++            cv2.CAP_PROP_FRAME_COUNT: self.total_frames,
++            cv2.CAP_PROP_FRAME_WIDTH: self.width,
++            cv2.CAP_PROP_FRAME_HEIGHT: self.height,
++            cv2.CAP_PROP_POS_FRAMES: self.start_frame,
++        }
++        return float(values.get(prop, 0.0))
++
++    def set(self, prop: int, value: float) -> bool:
++        if prop != cv2.CAP_PROP_POS_FRAMES or self.proc is not None:
++            return False
++        self.start_frame = max(0, int(value))
++        return True
++
++    def _start(self) -> None:
++        filters = []
++        if self.start_frame:
++            filters.append(f'trim=start_frame={self.start_frame}')
++        filters.append(self.video_filter)
++        stderr_file = tempfile.TemporaryFile()
++        try:
++            self.proc = subprocess.Popen(
++                [
++                    'ffmpeg', '-hide_banner', '-loglevel', 'error', '-xerror', '-nostdin',
++                    '-noautorotate', '-i', self.path, '-map', f'0:{self.stream_index}',
++                    '-an', '-sn', '-dn', '-vf', ','.join(filters), '-fps_mode', 'passthrough',
++                    '-f', 'rawvideo', '-pix_fmt', 'bgr48le', 'pipe:1'
++                ],
++                stdin=subprocess.DEVNULL,
++                stdout=subprocess.PIPE,
++                stderr=stderr_file,
++            )
++        except BaseException:
++            stderr_file.close()
++            raise
++        self.stderr_file = stderr_file
++
++    def _read_exactly(self, size: int) -> bytes:
++        chunks = bytearray()
++        while len(chunks) < size:
++            chunk = self.proc.stdout.read(size - len(chunks))
++            if not chunk:
++                break
++            chunks.extend(chunk)
++        return bytes(chunks)
++
++    def read(self):
++        if not self._opened or self.eof:
++            return False, None
++        if self.proc is None:
++            self._start()
++        raw = self._read_exactly(self.frame_bytes)
++        if len(raw) == self.frame_bytes:
++            frame = np.frombuffer(raw, dtype=np.dtype('<u2')).reshape(
++                self.height, self.width, 3
++            )
++            return True, frame
++        process = self.proc
++        stderr_file = self.stderr_file
++        try:
++            if process.stdout:
++                process.stdout.close()
++            returncode, timed_out = _wait_process_bounded(process, 30)
++        finally:
++            stderr = _read_process_error(stderr_file)
++            if stderr_file is not None:
++                stderr_file.close()
++            self.proc = None
++            self.stderr_file = None
++            self.eof = True
++        if timed_out:
++            detail = stderr.splitlines()[-1] if stderr else 'no ffmpeg error output'
++            raise RuntimeError(f'ffmpeg color-managed input timed out at EOF: {detail}')
++        if raw:
++            raise RuntimeError('ffmpeg returned a truncated color-managed frame')
++        if returncode != 0:
++            detail = stderr.splitlines()[-1] if stderr else f'exit code {returncode}'
++            raise RuntimeError(f'ffmpeg color-managed input failed: {detail}')
++        return False, None
++
++    def release(self) -> None:
++        process = self.proc
++        stderr_file = self.stderr_file
++        self.proc = None
++        self.stderr_file = None
++        self._opened = False
++        if process is None:
++            if stderr_file is not None:
++                stderr_file.close()
++            return
++        if process.stdout:
++            try:
++                process.stdout.close()
++            except (OSError, ValueError):
++                pass
++        try:
++            _wait_process_bounded(process, 5, terminate_first=True)
++        finally:
++            if stderr_file is not None:
++                stderr_file.close()
++
++
+ # =============================================================================
+ # Device Management Helpers
+ # =============================================================================
+@@ -482,11 +707,20 @@
+         if not os.path.exists(input_path):
+             raise FileNotFoundError(f"Video file not found: {input_path}")
+
+-        cap = cv2.VideoCapture(input_path)
++        cap = (
++            FFMPEGFilteredVideoCapture(
++                input_path, args.input_vf, args.input_video_stream,
++                args.input_width, args.input_height, args.input_fps,
++                args.input_frame_count
++            )
++            if args.input_vf
++            else cv2.VideoCapture(input_path)
++        )
+         if not cap.isOpened():
+             raise ValueError(f"Cannot open video file: {input_path}")
+
+         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
++        output_fps = getattr(cap, 'ffmpeg_fps', fps)
+         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+@@ -498,22 +732,25 @@
+             debug.log(f"Skipping first {args.skip_first_frames} frames", category="info")
+             cap.set(cv2.CAP_PROP_POS_FRAMES, args.skip_first_frames)
+
+-        # Calculate frames to process (apply load_cap if set)
+-        frames_to_process = total_frames - args.skip_first_frames
+-        if args.load_cap > 0:
+-            frames_to_process = min(frames_to_process, args.load_cap)
++        # The FFmpeg reader uses the frame count only as a progress estimate.
++        # EOF is authoritative unless the user explicitly supplies --load_cap.
++        read_until_eof = bool(getattr(cap, 'read_until_eof', False)) and args.load_cap <= 0
++        if getattr(cap, 'read_until_eof', False) and args.load_cap > 0:
++            frames_to_process = args.load_cap
++        else:
++            frames_to_process = max(0, total_frames - args.skip_first_frames)
+
+         # Early exit for empty/exhausted video
+-        if frames_to_process <= 0:
++        if frames_to_process <= 0 and not read_until_eof:
+             debug.log(f"No frames to process after skipping {args.skip_first_frames} of {total_frames}",
+                      level="WARNING", category="file", force=True)
+             cap.release()
+             return 0
+
+         # Streaming mode: process in chunks
+-        chunk_size = args.chunk_size if args.chunk_size > 0 else frames_to_process
+-        streaming = args.chunk_size > 0
+-        total_chunks = (frames_to_process + chunk_size - 1) // chunk_size  # ceiling division
++        chunk_size = args.chunk_size if args.chunk_size > 0 else max(1, frames_to_process)
++        streaming = args.chunk_size > 0 or read_until_eof
++        total_chunks = max(1, (frames_to_process + chunk_size - 1) // chunk_size)
+
+         if streaming:
+             debug.log(f"Streaming mode: chunks of {chunk_size} frames, overlap={args.temporal_overlap}",
+@@ -528,57 +765,69 @@
+
+         # Multi-GPU: workers stream their own segments
+         if len(device_list) > 1:
++            if args.input_vf:
++                cap.release()
++                raise ValueError("Color-managed video input only supports a single device")
+             cap.release()  # Workers will reopen
+             video_info = {
+                 'video_path': input_path,
+                 'start_frame': args.skip_first_frames,
+                 'frames_to_process': frames_to_process,
+             }
+-            result = _gpu_processing(None, device_list, args, video_info=video_info)
+-
+-            # Save result
+-            if is_png:
+-                save_frames_to_image(result, output_path, base_name)
+-            else:
+-                video_writer = save_frames_to_video(result, output_path, fps,
+-                    video_backend=args.video_backend, use_10bit=args.use_10bit)
++            try:
++                result = _gpu_processing(None, device_list, args, video_info=video_info)
++
++                # Save result
++                if is_png:
++                    save_frames_to_image(result, output_path, base_name)
++                else:
++                    video_writer = save_frames_to_video(result, output_path, output_fps,
++                        video_backend=args.video_backend, use_10bit=args.use_10bit)
++
++                frames_written = result.shape[0]
++            finally:
+                 if video_writer is not None:
+                     video_writer.release()
+-
+-            frames_written = result.shape[0]
+
+         # Single GPU: stream in main process
+         else:
+             chunk_count = 0
+-            for result in _stream_video_chunks(
+-                cap=cap,
+-                frames_to_process=frames_to_process,
+-                chunk_size=chunk_size,
+-                overlap=overlap,
+-                args=args,
+-                device_id=device_list[0],
+-                debug=debug,
+-                runner_cache=runner_cache,
+-                log_progress=streaming,
+-                total_chunks=total_chunks,
+-                cleanup_timer_name="chunk_cleanup"
+-            ):
+-                chunk_count += 1
++            try:
++                for result in _stream_video_chunks(
++                    cap=cap,
++                    frames_to_process=frames_to_process,
++                    chunk_size=chunk_size,
++                    overlap=overlap,
++                    args=args,
++                    device_id=device_list[0],
++                    debug=debug,
++                    runner_cache=runner_cache,
++                    log_progress=streaming,
++                    total_chunks=total_chunks,
++                    cleanup_timer_name="chunk_cleanup",
++                    read_until_eof=read_until_eof
++                ):
++                    chunk_count += 1
++
++                    # Save output
++                    if is_png:
++                        save_frames_to_image(result, output_path, base_name, start_index=frames_written)
++                    else:
++                        video_writer = save_frames_to_video(
++                            result, output_path, output_fps, writer=video_writer,
++                            video_backend=args.video_backend, use_10bit=args.use_10bit
++                        )
++
++                    frames_written += result.shape[0]
++                    del result
+
+-                # Save output
+-                if is_png:
+-                    save_frames_to_image(result, output_path, base_name, start_index=frames_written)
+-                else:
+-                    video_writer = save_frames_to_video(result, output_path, fps, writer=video_writer,
+-                        video_backend=args.video_backend, use_10bit=args.use_10bit)
+-
+-                frames_written += result.shape[0]
+-                del result
+-
+-            chunk_idx = chunk_count
+-            cap.release()
+-            if video_writer is not None:
+-                video_writer.release()
++                chunk_idx = chunk_count
++            finally:
++                try:
++                    cap.release()
++                finally:
++                    if video_writer is not None:
++                        video_writer.release()
+
+         if streaming:
+             debug.log("", category="none", force=True)
+@@ -626,7 +875,8 @@
+         ret, frame = cap.read()
+         if not ret:
+             break
+-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
++        maximum = 65535.0 if frame.dtype == np.uint16 else 255.0
++        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / maximum
+         frames.append(frame)
+
+     if not frames:
+@@ -646,7 +896,8 @@
+     log_progress: bool = False,
+     total_chunks: int = 0,
+     cleanup_timer_name: Optional[str] = None,
+-    log_prefix: str = ""
++    log_prefix: str = "",
++    read_until_eof: bool = False
+ ) -> Generator[torch.Tensor, None, None]:
+     """
+     Generator that streams and processes video chunks.
+@@ -668,6 +919,7 @@
+         total_chunks: Total chunks for progress display (used if log_progress=True)
+         cleanup_timer_name: Optional timer name for memory cleanup logging
+         log_prefix: Optional prefix for log messages (e.g., "[GPU 0] " for worker identification)
++        read_until_eof: If True, ignore frames_to_process as a stopping condition
+
+     Yields:
+         Processed frames tensor [T, H, W, C] for each chunk, context frames removed
+@@ -676,10 +928,12 @@
+     frames_read = 0
+     prev_raw_tail = None
+     chunk_idx = 0
+-    streaming = chunk_size < frames_to_process
++    streaming = read_until_eof or chunk_size < frames_to_process
+
+-    while frames_read < frames_to_process:
+-        read_count = min(chunk_size, frames_to_process - frames_read)
++    while read_until_eof or frames_read < frames_to_process:
++        read_count = chunk_size if read_until_eof else min(
++            chunk_size, frames_to_process - frames_read
++        )
+         new_frames = _read_frames_from_cap(cap, read_count)
+         if new_frames is None:
+             break
+@@ -788,22 +1042,29 @@
+         frames_np = np.rint(frames_float.numpy() * 255.0).astype(np.uint8)
+     T, H, W, C = frames_np.shape
+
+-    if writer is None:
+-        debug.log(f"Saving {T} frames to video: {output_path} (backend={video_backend})", category="file")
+-        os.makedirs(Path(output_path).parent, exist_ok=True)
+-        if video_backend == "ffmpeg":
+-            writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit)
+-        else:
+-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+-            writer = cv2.VideoWriter(output_path, fourcc, fps, (W, H))
+-        if not writer.isOpened():
+-            raise ValueError(f"Cannot create video writer for: {output_path}")
+-
+-    for i, frame in enumerate(frames_np):
+-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+-        writer.write(frame_bgr)
+-        if debug.enabled and (i + 1) % 100 == 0:
+-            debug.log(f"Written {i + 1}/{T} frames", category="file")
++    owns_writer = writer is None
++    try:
++        if writer is None:
++            debug.log(f"Saving {T} frames to video: {output_path} (backend={video_backend})", category="file")
++            os.makedirs(Path(output_path).parent, exist_ok=True)
++            if video_backend == "ffmpeg":
++                writer = FFMPEGVideoWriter(output_path, W, H, fps, use_10bit)
++            else:
++                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
++                _, opencv_fps = _normalize_video_rate(fps)
++                writer = cv2.VideoWriter(output_path, fourcc, opencv_fps, (W, H))
++            if not writer.isOpened():
++                raise ValueError(f"Cannot create video writer for: {output_path}")
++
++        for i, frame in enumerate(frames_np):
++            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
++            writer.write(frame_bgr)
++            if debug.enabled and (i + 1) % 100 == 0:
++                debug.log(f"Written {i + 1}/{T} frames", category="file")
++    except BaseException:
++        if owns_writer and writer is not None:
++            writer.release()
++        raise
+
+     return writer  # Caller always closes
+
+@@ -1383,6 +1644,18 @@
+     io_group.add_argument("--10bit", dest="use_10bit", action="store_true",
+                         help="Save 10-bit video with x265 codec (reduces banding). Without this flag, "
+                          "ffmpeg uses x264 for maximum compatibility. Requires --video_backend ffmpeg")
++    io_group.add_argument("--input_vf", type=str, default=None,
++                        help="Trusted ffmpeg filter graph used for color-managed video input")
++    io_group.add_argument("--input_video_stream", type=int, default=0,
++                        help="Absolute input video stream index used with --input_vf")
++    io_group.add_argument("--input_width", type=int, default=0,
++                        help="Input display width used with --input_vf")
++    io_group.add_argument("--input_height", type=int, default=0,
++                        help="Input display height used with --input_vf")
++    io_group.add_argument("--input_fps", type=str, default="0",
++                        help="Exact constant input frame rate used with --input_vf (for example 30000/1001)")
++    io_group.add_argument("--input_frame_count", type=int, default=0,
++                        help="Estimated input frame count used only for progress with --input_vf")
+     io_group.add_argument("--model_dir", type=str, default=None,
+                         help=f"Model directory (default: ./models/{SEEDVR2_FOLDER_NAME})")

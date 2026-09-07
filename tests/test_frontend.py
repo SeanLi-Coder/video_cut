@@ -85,7 +85,10 @@ def test_frontend_ai_mode_uses_local_quality_first_workflow() -> None:
     assert "10-bit HEVC" in javascript
     assert "data-ai-dimensions" in html
     assert "AI 任务可能仍在后台运行" in javascript
-    assert "!state.video?.is_hdr" in javascript
+    assert "!state.video?.is_hdr" not in javascript
+    assert "HDR 视频暂不支持安全 AI 超清" not in javascript
+    assert "HDR 会明确映射为 SDR" in javascript
+    assert "将 HDR 映射为 BT.709 SDR 后" in javascript
 
 
 def test_frontend_has_independent_ai_model_download_manager() -> None:
@@ -105,6 +108,10 @@ def test_frontend_has_independent_ai_model_download_manager() -> None:
     assert "function setProgressAriaValue" in javascript
     assert "预计还需：正在估算" in javascript
     assert "预计还需：正在收尾" in javascript
+    assert "needs_setup" in javascript
+    assert "runtime_unavailable" in javascript
+    assert 'String(runtime.message || "当前环境无法使用 AI 超清。")' in javascript
+    assert "模型文件无需重下；只会更新本地运行环境" in javascript
     assert "本地服务连接已更新，请刷新页面后继续查看模型任务" in javascript
     assert '["#ai-model", "#video"].includes(window.location.hash)' in javascript
     assert 'role="tablist"' in html

@@ -135,16 +135,18 @@ AI 模式只在 Apple Silicon Mac 上开放，使用 PyTorch MPS，不安装也�
 
 1. 在 `data/ai/` 创建与主程序隔离的 Python 环境；
 2. 下载固定 commit 的 SeedVR2 Mac 运行器并校验 SHA-256；
-3. 应用本项目固定的 MPS 稳定性与真正 10-bit 输出补丁；
+3. 应用本项目固定的 MPS 稳定性、16-bit 色彩输入与真正 10-bit 输出补丁；
 4. 下载并校验约 7.3 GB 的 3B FP16 与 VAE 权重。
 
 模型管理页支持查看实时百分比、下载容量、速度、耗时和预计剩余时间。中途取消会停止下载或安装进程；已完整下载的模型会保留，`.download` 临时权重也会保留以便下次续传。AI 视频任务中途取消时会停止整个 AI/FFmpeg 进程组并删除未完成成片。以后双击 `start.command` 不会重复安装或下载。
 
 M4 Max 有不同统一内存容量。程序会根据内存只调整同一个 FP16 模型的时序 batch，不会降低模型精度；1080p、2K、4K 的内存需求相差很大，4K 仍可能因可用统一内存不足而明确失败。4K 是本工具的输出尺寸档位，不代表论文对任意素材都给出了 4K 质量保证。关闭占用大量内存的软件后重试，或选择较低目标档位。SeedVR2 是研究原型，重度退化、大幅运动可能恢复失败，原本已经很清晰的素材也可能被过度生成或锐化；AI 生成的细节不是原片中可证明存在的真实细节。
 
-当前 AI 链路只接受方向已固化、方形像素、逐行扫描、恒定帧率、8-bit BT.709 SDR YUV 且无透明通道的素材；缺少色彩标签时按常见 BT.709 SDR 解释。HDR/PQ/HLG、Dolby Vision、HDR10+、10/12-bit SDR、明确标记为其他色域或 full-range、RGB、alpha、隔行、VFR 或未知像素格式会明确停止，避免静默改变色彩、位深或音画同步。带旋转标记的视频请先用本工具的“永久旋转”处理；AAC 的 ADTS/MPEG-TS 输入也会停止，因为换容器时无法保证音频包逐字节不变。
+AI 输入不再限定为 BT.709 limited YUV。所有输入都会由 FFmpeg Full 的 `libplacebo` 在内存中逐帧转换为 BT.709 primaries、sRGB transfer、full-range 的 16-bit RGB 工作画面，再直接送入 SeedVR2，不会生成占用巨大空间的中间视频。full-range、BT.601/P3/BT.2020 SDR、RGB 以及 10/12-bit 素材都走同一条受控管线；普通 SDR 缺少色彩标签时，会按 RGB/HD/NTSC SD/PAL SD 的分辨率与帧率规则推断，并在开始前显示具体假设。原文件不会修改。
 
-AI 视频从模型输出的 full-range RGB 显式转换为 BT.709 limited，使用 CPU `libx265`、10-bit HEVC、`preset slow`、`CRF 10`，不使用 VideoToolbox 快速硬编；这一步也可能很慢。主音轨从原片 bit-for-bit stream copy，不重新压缩，并在完成前逐包计算 SHA-256 指纹核对。AI 会重建视频画面，因此“超清”不可能是原视频码流无损。
+HDR/PQ/HLG、Dolby Vision 和 HDR10+ 也可以处理，但 SeedVR2 的当前工作空间是 SDR：程序会使用 `libplacebo` 的 BT.2446 Method A tone mapping 与感知式 gamut mapping 转为 16-bit sRGB 工作空间后再增强。最终文件名会带 `_sdr`，并且成片不再是 HDR；原 HDR 峰值亮度、广色域和动态元数据无法保留。若 HDR 的 transfer 标签缺失、无法确定是 PQ 还是 HLG，程序会停止而不盲猜。方向未固化、透明通道、非方形像素、隔行、VFR 或未知像素格式仍会明确停止。带旋转标记的视频请先用本工具的“永久旋转”处理；AAC 的 ADTS/MPEG-TS 输入也会停止，因为换容器时无法保证音频包逐字节不变。
+
+AI 视频从模型输出的 sRGB full-range RGB 显式进行 transfer、matrix、range 和色度采样转换，生成 BT.709 limited 成片；编码使用 CPU `libx265`、10-bit HEVC、`preset slow`、`CRF 10`，不使用 VideoToolbox 快速硬编。这一步也可能很慢。主音轨从原片 bit-for-bit stream copy，不重新压缩，并在完成前逐包计算 SHA-256 指纹核对。AI 会重建视频画面，因此“超清”不可能是原视频码流无损。
 
 ## 画质与音质说明
 
@@ -162,7 +164,7 @@ AI 视频从模型输出的 full-range RGB 显式转换为 BT.709 limited，使�
 这里的“保持清晰程度”不等于逐字节复制。除适合逐帧切分的 ProRes 外，多数视频会重新编码，因此不是 bit-identical，也不是数学意义上的视频无损。对常见长 GOP 视频，任意切点的精确剪辑与完全不重编码不能同时保证：单纯使用 stream copy 虽然不重编码，但起点通常只能落在关键帧附近。本工具优先保证你输入的剪辑范围准确，并使用高质量或无损编码避免可察觉的降质。
 
 高质量重编码可能比原视频片段更大，导出速度也取决于视频时长、分辨率和 Mac 性能。
-HDR 片段会优先直接播放原片；如果浏览器无法解码，才生成一份 8-bit 兼容定位预览，此时颜色只用于定位，最终成片仍走原 HDR 色彩信息的导出路径。Dolby Vision、动态 HDR 元数据、多音轨、字幕或沉浸式音频等专业素材不保证完整保留；这类文件请先备份，并抽查一小段成片。本工具默认保留主视频流和主音轨。
+剪辑模式下，HDR 片段会优先直接播放原片；如果浏览器无法解码，才生成一份 8-bit 兼容定位预览，此时颜色只用于定位，剪辑成片仍走原 HDR 色彩信息的导出路径。Dolby Vision、动态 HDR 元数据、多音轨、字幕或沉浸式音频等专业素材不保证完整保留；这类文件请先备份，并抽查一小段成片。本工具默认保留主视频流和主音轨。
 
 永久旋转会把方向真正烘焙到每一帧中，因此视频画面必须解码后重新编码，无法同时做到视频码流逐字节不变。工具会优先保留源编码家族、帧率、位深、像素格式、色彩标记、静态 HDR 信息和画面清晰度；FFV1 继续使用 FFV1，H.264/HEVC 使用高质量编码，无法安全映射的专业格式改用无损 FFV1。90° 与 270° 必然交换宽高，180° 与 360° 保持宽高。原音频直接 stream copy，不进行二次音频编码。
 
@@ -174,12 +176,12 @@ HDR 片段会优先直接播放原片；如果浏览器无法解码，才生成�
 
 ## 安装要求与自动处理边界
 
-基础功能需要 macOS、Python 3.10+ 和 FFmpeg。AI 超清额外要求 Apple Silicon（M 系列芯片）、足够的统一内存和至少约 12 GB 的模型/环境可用磁盘空间；成片目录还需要单独的输出空间。
+基础功能需要 macOS、Python 3.10+ 和 FFmpeg。AI 超清额外要求 Apple Silicon（M 系列芯片）、带 `libplacebo` 与 `zscale` 的 FFmpeg Full、足够的统一内存和至少约 12 GB 的模型/环境可用磁盘空间；成片目录还需要单独的输出空间。
 
 `start.command` 会优先查找 Apple Silicon Homebrew 的 `/opt/homebrew/bin/python3`、Intel Homebrew 的 `/usr/local/bin/python3`，再检查当前 `PATH` 中的 `python3`。
 
 - 已安装 Homebrew 但缺少合适的 Python 时，启动脚本会尝试执行 `brew install python`。
-- 已安装 Homebrew 但缺少 FFmpeg 时，启动器会尝试执行 `brew install ffmpeg`。
+- Apple Silicon Mac 缺少 FFmpeg Full 时，启动器会尝试执行 `brew install ffmpeg-full`；基础功能在安装失败时仍会回退到普通 FFmpeg。
 - 工具不会自动安装 Homebrew。若 Mac 上没有 Homebrew，请先按照 [Homebrew 官网](https://brew.sh/)安装，再重新双击 `start.command`。
 - 自动安装需要网络连接，并可能要求你在 Terminal 中确认系统提示或输入当前 Mac 账号密码。
 - macOS 自带的旧版 `/usr/bin/python3` 不会被替换或修改。
@@ -187,15 +189,15 @@ HDR 片段会优先直接播放原片；如果浏览器无法解码，才生成�
 也可以先手动安装：
 
 ```bash
-brew install python ffmpeg
+brew install python ffmpeg-full
 ```
 
 然后检查：
 
 ```bash
 python3 --version
-ffmpeg -version
-ffprobe -version
+/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg -version
+/opt/homebrew/opt/ffmpeg-full/bin/ffprobe -version
 ```
 
 ## 停止工具
@@ -235,7 +237,7 @@ chmod +x start.command stop.command
 先安装 Homebrew，然后执行：
 
 ```bash
-brew install python ffmpeg
+brew install python ffmpeg-full
 ```
 
 完全关闭旧 Terminal 后重新双击 `start.command`。Apple Silicon Mac 的 Homebrew 通常位于 `/opt/homebrew`。

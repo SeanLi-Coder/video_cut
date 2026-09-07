@@ -278,6 +278,47 @@ def test_rotation_preserves_hdr_color_metadata_and_ten_bit_precision(
     assert result["fps"] == source["fps"]
 
 
+def test_bt2020_ten_bit_sdr_is_not_misclassified_as_hdr(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "bt2020-sdr.mp4"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=10:duration=1",
+            "-vf",
+            "format=yuv420p10le",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-x265-params",
+            "log-level=error:colorprim=bt2020:transfer=bt2020-10:colormatrix=bt2020nc",
+            "-color_range",
+            "tv",
+            "-color_primaries",
+            "bt2020",
+            "-color_trc",
+            "bt2020-10",
+            "-colorspace",
+            "bt2020nc",
+            str(source_path),
+        ],
+    )
+
+    metadata = probe_video(source_path, ffprobe=ffprobe)
+
+    assert metadata["video_bit_depth"] == 10
+    assert metadata["color_primaries"] == "bt2020"
+    assert metadata["color_transfer"] == "bt2020-10"
+    assert metadata["is_hdr"] is False
+
+
 @pytest.mark.parametrize(
     ("metadata", "message"),
     [

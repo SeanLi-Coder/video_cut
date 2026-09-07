@@ -16,14 +16,17 @@ from fastapi.testclient import TestClient
 import app.ai_enhance as ai_module
 import app.main as main_module
 from app.ai_enhance import (
+    AI_COLOR_PATCH_PATH,
     AI_PATCH_PATH,
     MODEL_FILENAME,
     MODEL_NAME,
+    RUNNER_COLOR_PATCH_SHA256,
     RUNNER_PATCH_SHA256,
     AIEnhancementJob,
     AIEnhancementManager,
     AIModelDownloadJob,
     AIResolutionTarget,
+    ai_input_color_plan,
     ai_output_dimensions,
     ai_target_options,
     default_ai_output_name,
@@ -37,8 +40,39 @@ def _source(path: Path, metadata: dict) -> VideoSource:
     return VideoSource(id="source", path=path, metadata=metadata)
 
 
+def _available_color_ffmpeg(
+    tmp_path: Path,
+    *,
+    ffmpeg: str,
+    ffprobe: str,
+) -> Path | None:
+    candidates = [
+        Path(ffmpeg),
+        Path("/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg"),
+        Path("/usr/local/opt/ffmpeg-full/bin/ffmpeg"),
+    ]
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.is_file()
+            and AIEnhancementManager(
+                ffmpeg=str(candidate),
+                ffprobe=ffprobe,
+                runtime_root=tmp_path / "runtime-check",
+                platform_supported=True,
+            ).color_pipeline_available
+        ),
+        None,
+    )
+
+
 def test_bundled_ai_patch_matches_integrity_pin() -> None:
     assert AIEnhancementManager._file_sha256(AI_PATCH_PATH) == RUNNER_PATCH_SHA256
+    assert (
+        AIEnhancementManager._file_sha256(AI_COLOR_PATCH_PATH)
+        == RUNNER_COLOR_PATCH_SHA256
+    )
 
 
 def test_model_download_eta_uses_remaining_bytes_and_current_speed() -> None:
@@ -368,6 +402,8 @@ def test_runtime_space_check_accounts_for_resumable_model_bytes(
         runtime_root=tmp_path / "runtime",
         platform_supported=True,
     )
+    monkeypatch.setattr(manager, "encoder_available", True)
+    monkeypatch.setattr(manager, "color_pipeline_available", True)
     manager.model_root.mkdir(parents=True)
     (manager.model_root / "model.safetensors.download").write_bytes(b"x" * 800)
     monkeypatch.setattr(manager, "_runtime_installed", lambda: True)
@@ -381,6 +417,61 @@ def test_runtime_space_check_accounts_for_resumable_model_bytes(
     assert resumable["status"] == "cancelled"
     assert resumable["downloaded_bytes"] == 800
     manager._prepare_runtime(AIModelDownloadJob(id="download", total_bytes=1_000))
+
+
+def test_download_status_distinguishes_runtime_update_from_paused_weights(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+    )
+    monkeypatch.setattr(manager, "encoder_available", True)
+    monkeypatch.setattr(manager, "color_pipeline_available", True)
+    monkeypatch.setattr(manager, "_runtime_installed", lambda: False)
+    monkeypatch.setattr(manager, "_models_downloaded", lambda: True)
+    monkeypatch.setattr(
+        manager,
+        "_available_model_bytes",
+        lambda: ai_module.MODEL_DOWNLOAD_SIZE_BYTES,
+    )
+
+    snapshot = manager.model_download_status()
+
+    assert snapshot["status"] == "needs_setup"
+    assert snapshot["stage"] == "setup"
+    assert snapshot["models_downloaded"] is True
+    assert snapshot["installed"] is False
+    assert snapshot["requires_runtime_update"] is True
+    assert "安装或更新" in snapshot["message"]
+
+
+def test_download_status_reports_unavailable_color_runtime(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+    )
+    monkeypatch.setattr(manager, "encoder_available", True)
+    monkeypatch.setattr(manager, "color_pipeline_available", False)
+
+    snapshot = manager.model_download_status()
+
+    assert snapshot["status"] == "unavailable"
+    assert snapshot["runtime_unavailable"] is True
+    assert snapshot["prepared"] is False
+    assert "ffmpeg-full" in snapshot["message"]
 
 
 def test_ai_targets_preserve_aspect_ratio_and_never_downscale(
@@ -410,18 +501,46 @@ def test_ai_targets_preserve_aspect_ratio_and_never_downscale(
 
 
 @pytest.mark.parametrize(
+    "changes",
+    [
+        {
+            "is_hdr": True,
+            "color_space": "bt2020nc",
+            "color_transfer": "smpte2084",
+            "color_primaries": "bt2020",
+            "video_bit_depth": 10,
+        },
+        {"video_bit_depth": 10},
+        {"video_bit_depth": 12},
+        {"color_range": "pc"},
+        {"color_space": "bt470bg", "color_transfer": "smpte170m", "color_primaries": "smpte170m"},
+        {"is_rgb": True, "color_range": "pc", "color_space": "gbr"},
+    ],
+)
+def test_ai_source_validation_accepts_color_managed_media(
+    sample_video: Path,
+    ffprobe: str,
+    changes: dict,
+) -> None:
+    metadata = {**probe_video(sample_video, ffprobe=ffprobe), **changes}
+    source = _source(sample_video, metadata)
+    validate_ai_source(source, "4k")
+    plan = ai_input_color_plan(source)
+    assert plan.filter_graph
+    assert "libplacebo=" in plan.filter_graph
+    assert plan.warning
+    assert all(item["available"] for item in ai_target_options(source))
+
+
+@pytest.mark.parametrize(
     ("changes", "expected"),
     [
-        ({"is_hdr": True}, "HDR"),
-        ({"video_bit_depth": 10}, "High bit-depth"),
         ({"has_alpha": True}, "Alpha"),
         ({"field_order": "tt"}, "Interlaced"),
         ({"sample_aspect_ratio": "4:3"}, "Non-square"),
         ({"rotation": 90}, "orientation"),
         ({"fps": 24.0, "max_fps": 30.0}, "Variable frame rate"),
-        ({"color_range": "pc"}, "Full-range"),
-        ({"color_space": "bt470bg"}, "Non-BT.709"),
-        ({"is_rgb": True}, "RGB video"),
+        ({"pixel_format_known": False}, "Unknown pixel format"),
     ],
 )
 def test_ai_source_validation_fails_closed_for_unsafe_media(
@@ -435,6 +554,224 @@ def test_ai_source_validation_fails_closed_for_unsafe_media(
     with pytest.raises(MediaError, match=expected):
         validate_ai_source(source, "4k")
     assert not any(item["available"] for item in ai_target_options(source))
+
+
+def test_hdr_color_plan_tone_maps_to_sdr_and_marks_output_name(
+    sample_video: Path,
+    ffprobe: str,
+) -> None:
+    metadata = {
+        **probe_video(sample_video, ffprobe=ffprobe),
+        "is_hdr": True,
+        "video_bit_depth": 10,
+        "color_range": "tv",
+        "color_space": "bt2020nc",
+        "color_transfer": "smpte2084",
+        "color_primaries": "bt2020",
+    }
+    source = _source(sample_video, metadata)
+    plan = ai_input_color_plan(source)
+    assert plan.mode == "tone_map_hdr"
+    assert "tonemapping=bt.2446a" in str(plan.filter_graph)
+    assert "color_trc=iec61966-2-1" in str(plan.filter_graph)
+    assert "HDR" in str(plan.warning)
+    assert "成片不再是 HDR" in str(plan.warning)
+    assert "动态元数据不会保留" in str(plan.warning)
+    options = ai_target_options(source)
+    assert all(option["available"] for option in options)
+    assert all("成片不再是 HDR" in str(option["warning"]) for option in options)
+    assert default_ai_output_name(
+        sample_video,
+        "4k",
+        tone_mapped=True,
+    ).endswith("_ai_4k_sdr.mp4")
+
+
+def test_untagged_sdr_color_plan_uses_sd_and_hd_conventions(
+    sample_video: Path,
+    ffprobe: str,
+) -> None:
+    base = {
+        **probe_video(sample_video, ffprobe=ffprobe),
+        "color_range": "unknown",
+        "color_space": "unknown",
+        "color_transfer": "unknown",
+        "color_primaries": "unknown",
+        "is_hdr": False,
+        "is_rgb": False,
+    }
+    ntsc = ai_input_color_plan(
+        _source(sample_video, {**base, "width": 720, "height": 480, "fps": 29.97})
+    )
+    pal = ai_input_color_plan(
+        _source(sample_video, {**base, "width": 720, "height": 576, "fps": 25.0})
+    )
+    hd = ai_input_color_plan(
+        _source(sample_video, {**base, "width": 1920, "height": 1080, "fps": 30.0})
+    )
+
+    assert "colorspace=smpte170m" in str(ntsc.filter_graph)
+    assert "colorspace=bt470bg" in str(pal.filter_graph)
+    assert "colorspace=bt709" in str(hd.filter_graph)
+    assert "matrix=smpte170m" in str(ntsc.warning)
+
+
+def test_hdr_with_unknown_transfer_fails_closed(
+    sample_video: Path,
+    ffprobe: str,
+) -> None:
+    metadata = {
+        **probe_video(sample_video, ffprobe=ffprobe),
+        "is_hdr": True,
+        "color_transfer": "unknown",
+        "color_space": "bt2020nc",
+        "color_primaries": "bt2020",
+    }
+    with pytest.raises(MediaError, match="HDR transfer characteristics"):
+        validate_ai_source(_source(sample_video, metadata), "4k")
+
+
+def test_ai_source_rejects_material_audio_video_start_offset(
+    sample_video: Path,
+    ffprobe: str,
+) -> None:
+    metadata = {
+        **probe_video(sample_video, ffprobe=ffprobe),
+        "video_start_time": 1.0,
+        "audio_start_time": 0.0,
+    }
+    with pytest.raises(MediaError, match="Non-aligned audio and video start"):
+        validate_ai_source(_source(sample_video, metadata), "4k")
+
+
+def test_noncanonical_color_target_requires_libplacebo_capability(
+    sample_video: Path,
+    ffprobe: str,
+) -> None:
+    source = _source(sample_video, probe_video(sample_video, ffprobe=ffprobe))
+    options = ai_target_options(source, color_pipeline_available=False)
+    assert not any(item["available"] for item in options)
+    assert all("FFmpeg Full" in str(item["reason"]) for item in options)
+
+
+@pytest.mark.parametrize("is_hdr", [False, True])
+def test_libplacebo_color_plan_outputs_one_rgb48_frame_when_available(
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+    is_hdr: bool,
+) -> None:
+    color_ffmpeg = _available_color_ffmpeg(
+        tmp_path,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    if color_ffmpeg is None:
+        pytest.skip("libplacebo is not usable on this test host")
+
+    metadata = {
+        **probe_video(sample_video, ffprobe=ffprobe),
+        "is_hdr": is_hdr,
+        "video_bit_depth": 10,
+        "color_range": "unknown",
+        "color_space": "unknown",
+        "color_transfer": "unknown",
+        "color_primaries": "unknown",
+    }
+    plan = ai_input_color_plan(_source(sample_video, metadata))
+    output = tmp_path / f"frame-{is_hdr}.rgb48"
+    completed = subprocess.run(
+        [
+            str(color_ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=16x16:rate=1:duration=1",
+            "-vf",
+            str(plan.filter_graph),
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr48le",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert output.stat().st_size == 16 * 16 * 3 * 2
+
+
+def test_libplacebo_output_filter_writes_complete_sdr_metadata_when_available(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    color_ffmpeg = _available_color_ffmpeg(
+        tmp_path,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    if color_ffmpeg is None:
+        pytest.skip("libplacebo is not usable on this test host")
+
+    output = tmp_path / "color-output.mp4"
+    completed = subprocess.run(
+        [
+            str(color_ffmpeg),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=16x16:rate=2:duration=1",
+            "-vf",
+            f"format=rgb48le,{ai_module.AI_OUTPUT_COLOR_FILTER_GRAPH}",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-x265-params",
+            "log-level=error:colorprim=bt709:transfer=bt709:colormatrix=bt709",
+            "-pix_fmt",
+            "yuv420p10le",
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-chroma_sample_location",
+            "left",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    metadata = probe_video(output, ffprobe=ffprobe)
+    assert metadata["pix_fmt"] == "yuv420p10le"
+    assert metadata["color_range"] == "tv"
+    assert metadata["color_space"] == "bt709"
+    assert metadata["color_transfer"] == "bt709"
+    assert metadata["color_primaries"] == "bt709"
+    assert metadata["chroma_location"] == "left"
+    assert metadata["is_hdr"] is False
+    assert not metadata["static_hdr_metadata"]
+    assert not metadata["dynamic_hdr_metadata_types"]
 
 
 def test_ai_command_is_full_precision_mps_quality_path(
@@ -477,11 +814,151 @@ def test_ai_command_is_full_precision_mps_quality_path(
     assert "--vae_decode_tiled" in command
     assert "--attention_mode sdpa" in joined
     assert "--10bit" in command
+    assert "--input_vf" in command
+    assert "libplacebo=" in command[command.index("--input_vf") + 1]
+    assert "--input_frame_count" in command
     assert not any(token in joined.lower() for token in ("cuda", "fp8", "gguf", "real-esrgan"))
     environment = manager._inference_environment()
     assert environment["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
     assert environment["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.95"
     assert environment["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] != "0.0"
+    assert "zscale=" in environment["VIDEO_CUT_OUTPUT_VF"]
+    assert "transfer=bt709" in environment["VIDEO_CUT_OUTPUT_VF"]
+    assert "chromal=left" in environment["VIDEO_CUT_OUTPUT_VF"]
+
+
+def test_frame_timing_audit_sets_exact_count_duration_and_rational_rate(
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source = _source(sample_video, probe_video(sample_video, ffprobe=ffprobe))
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    job = AIEnhancementJob(
+        id="job",
+        source=source,
+        target=ai_module.AI_TARGETS["4k"],
+        output_path=tmp_path / "output.mp4",
+        expected_width=3840,
+        expected_height=2160,
+    )
+
+    manager._audit_frame_timing(job)
+
+    assert job.input_frame_count == 180
+    assert job.input_frame_rate == "30/1"
+    assert job.expected_duration == pytest.approx(6.0)
+    command = manager.inference_command(job, sample_video, tmp_path / "ai.mp4")
+    assert command[command.index("--input_fps") + 1] == "30/1"
+    assert command[command.index("--input_frame_count") + 1] == "180"
+
+
+def test_frame_timing_audit_rejects_dropped_vfr_timestamp(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "vfr-gap.mp4"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x64:rate=30:duration=1",
+            "-vf",
+            "select=not(eq(n\\,15))",
+            "-fps_mode",
+            "vfr",
+            "-c:v",
+            "libx264",
+            str(source_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    metadata = {
+        **probe_video(source_path, ffprobe=ffprobe),
+        "average_frame_rate": "30/1",
+        "nominal_frame_rate": "30/1",
+        "fps": 30.0,
+        "max_fps": 30.0,
+    }
+    source = _source(source_path, metadata)
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    job = AIEnhancementJob(
+        id="job",
+        source=source,
+        target=ai_module.AI_TARGETS["4k"],
+        output_path=tmp_path / "output.mp4",
+        expected_width=3840,
+        expected_height=2160,
+    )
+
+    with pytest.raises(MediaError, match="Variable frame rate"):
+        manager._audit_frame_timing(job)
+
+
+def test_canonical_bt709_limited_input_uses_color_managed_runner_path(
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    metadata = {
+        **probe_video(sample_video, ffprobe=ffprobe),
+        "video_bit_depth": 8,
+        "is_rgb": False,
+        "color_range": "tv",
+        "color_space": "bt709",
+        "color_transfer": "bt709",
+        "color_primaries": "bt709",
+    }
+    source = _source(sample_video, metadata)
+    assert ai_input_color_plan(source).mode == "normalize_sdr"
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    job = AIEnhancementJob(
+        id="job",
+        source=source,
+        target=ai_module.AI_TARGETS["4k"],
+        output_path=tmp_path / "output.mp4",
+        expected_width=3840,
+        expected_height=2160,
+    )
+    command = manager.inference_command(
+        job,
+        sample_video,
+        tmp_path / "ai.mp4",
+    )
+    assert "--input_vf" in command
+    filter_graph = command[command.index("--input_vf") + 1]
+    assert "tonemapping=clip" in filter_graph
+    assert "format=gbrp16le" in filter_graph
 
 
 def test_runtime_archive_extraction_rejects_traversal(tmp_path: Path) -> None:
@@ -615,6 +1092,7 @@ def test_ai_model_download_api_starts_without_video_and_recovers_progress(
         runtime_root=tmp_path / "runtime",
         platform_supported=True,
     )
+    monkeypatch.setattr(manager, "color_pipeline_available", True)
     state.ai_enhancements = manager
     runtime_ready = False
     download_started = threading.Event()
@@ -719,6 +1197,7 @@ def test_ai_model_download_api_cancels_and_keeps_resumable_state(
         runtime_root=tmp_path / "runtime",
         platform_supported=True,
     )
+    monkeypatch.setattr(manager, "color_pipeline_available", True)
     state.ai_enhancements = manager
     worker_started = threading.Event()
 
@@ -809,6 +1288,8 @@ def test_ai_api_creates_verified_10bit_video_and_copies_audio_packets(
                 "bt709",
                 "-color_primaries",
                 "bt709",
+                "-chroma_sample_location",
+                "left",
                 "-tag:v",
                 "hvc1",
                 str(output_path),
@@ -889,5 +1370,7 @@ def test_ai_api_creates_verified_10bit_video_and_copies_audio_packets(
         assert (result["width"], result["height"]) == (320, 180)
         assert result["video_codec"] == "hevc"
         assert result["video_bit_depth"] == 10
+        assert result["chroma_location"] == "left"
+        assert result["is_hdr"] is False
         assert result["audio_codec"] == "aac"
         assert not list(output_directory.glob("*.partial-*"))

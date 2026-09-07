@@ -158,6 +158,10 @@ def _user_media_error(exc: MediaError) -> str:
             "该视频的 HDR 显示元数据会随画面变化，当前无法原样保留，已安全停止旋转。"
         ),
         "Required FFmpeg encoders are not available": "当前 FFmpeg 缺少必要的高质量编码器。",
+        "Required FFmpeg color filters are not available": (
+            "当前 FFmpeg 缺少安全色彩转换组件；请在 Terminal 运行 "
+            "brew reinstall ffmpeg-full 后重新启动。"
+        ),
         "Export job was not found": "找不到这次导出任务，请刷新页面后重试。",
         "Unsupported AI enhancement target": "请选择 1080p、2K QHD 或 4K UHD。",
         "AI enhancement is only supported on Apple Silicon Mac": (
@@ -168,26 +172,14 @@ def _user_media_error(exc: MediaError) -> str:
         "AI enhancement requires baked-in video orientation": (
             "该视频仍带旋转标记，请先用“永久旋转”固化方向，再进行 AI 超清。"
         ),
-        "HDR video AI enhancement is not supported safely": (
-            "当前模型无法可靠保留 HDR、Dolby Vision 或 HDR10+，已停止以免改变色彩。"
-        ),
         "Alpha video AI enhancement is not supported safely": (
             "当前模型无法可靠保留透明通道，已停止以免丢失画面信息。"
-        ),
-        "High bit-depth video AI enhancement is not supported safely": (
-            "当前模型链路只安全支持 8-bit SDR；不会把高位深素材静默降质。"
         ),
         "Unknown pixel format AI enhancement is not supported safely": (
             "无法确认该视频的像素格式，已停止以避免静默降低画质。"
         ),
-        "RGB video AI enhancement is not supported safely": (
-            "AI 超清暂不支持 RGB 编码的视频，以免色彩空间被静默改变。"
-        ),
-        "Full-range video AI enhancement is not supported safely": (
-            "AI 超清暂不支持 full-range 视频，以免亮度范围被静默改变。"
-        ),
-        "Non-BT.709 video AI enhancement is not supported safely": (
-            "AI 超清目前只安全支持 BT.709 SDR 素材，以免色彩空间被静默改变。"
+        "HDR transfer characteristics could not be identified safely": (
+            "检测到 HDR 信息，但无法判断原片使用 PQ 还是 HLG；已停止以避免映射出错误亮度。"
         ),
         "Interlaced video AI enhancement is not supported": (
             "AI 超清暂不支持隔行扫描视频，请先转换为逐行扫描素材。"
@@ -197,6 +189,15 @@ def _user_media_error(exc: MediaError) -> str:
         ),
         "Variable frame rate AI enhancement is not supported safely": (
             "AI 超清暂不支持可变帧率素材，以免画面与原音频不同步。"
+        ),
+        "Non-aligned audio and video start times are not supported safely": (
+            "原片音轨与画面的起始时间明显不同，当前无法保证 AI 成片同步，已安全停止。"
+        ),
+        "AI video frame timestamps could not be verified safely": (
+            "无法完整确认原片的逐帧时间戳，已停止以避免长视频丢帧或音画不同步。"
+        ),
+        "The original video changed after it was selected": (
+            "原视频在选择后发生了变化，请重新选择后再开始 AI 超清。"
         ),
         "AI enhancement requires at least five video frames": "AI 超清至少需要 5 帧画面。",
         "AAC transport stream audio cannot be preserved packet-for-packet": (
@@ -255,8 +256,14 @@ def _user_media_error(exc: MediaError) -> str:
         "AI output verification detected unexpected rotation metadata": (
             "AI 成片带有异常旋转标记，已停止保存。"
         ),
+        "AI output verification detected unexpected HDR metadata": (
+            "AI 成片仍带有不应保留的 HDR 标记，已停止保存以避免播放器错误显示。"
+        ),
         "AI output verification detected a frame rate change": (
             "AI 成片帧率与原片不一致，已停止保存。"
+        ),
+        "AI output verification detected a frame count change": (
+            "AI 成片帧数与原片不一致，已停止保存以避免音画不同步。"
         ),
         "AI output verification detected a duration change": (
             "AI 成片时长与原片不一致，已停止保存。"
@@ -269,6 +276,9 @@ def _user_media_error(exc: MediaError) -> str:
         ),
         "AI output verification detected changed audio packets": (
             "原音轨逐包校验未通过，已停止保存以避免音质变化。"
+        ),
+        "AI output verification detected an audio timing change": (
+            "AI 成片的音画起始关系发生变化，已停止保存以避免不同步。"
         ),
         "The selected video has no usable frame rate": "无法读取该视频的帧率，请更换视频。",
     }
@@ -440,7 +450,11 @@ class ApplicationState:
             self.ai_enhancements.cancel_all()
 
 
-def _video_payload(source: VideoSource) -> dict[str, Any]:
+def _video_payload(
+    source: VideoSource,
+    *,
+    color_pipeline_available: bool = True,
+) -> dict[str, Any]:
     metadata = source.metadata
     return {
         "id": source.id,
@@ -464,7 +478,10 @@ def _video_payload(source: VideoSource) -> dict[str, Any]:
         "directory_display": _display_path(source.path.parent),
         "preview_url": f"/api/videos/{source.id}/content",
         "preview_mode": "original",
-        "ai_targets": ai_target_options(source),
+        "ai_targets": ai_target_options(
+            source,
+            color_pipeline_available=color_pipeline_available,
+        ),
     }
 
 
@@ -609,7 +626,13 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
         return {
             "cancelled": False,
-            "video": _video_payload(source),
+            "video": _video_payload(
+                source,
+                color_pipeline_available=bool(
+                    state.ai_enhancements
+                    and state.ai_enhancements.color_pipeline_available
+                ),
+            ),
             "suggested_start": format_timecode(0),
             "suggested_end": format_timecode(source.metadata["duration"]),
         }

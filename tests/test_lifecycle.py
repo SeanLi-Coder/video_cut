@@ -49,6 +49,79 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def test_media_executables_prefers_smoke_tested_ffmpeg_full(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    full_ffmpeg = tmp_path / "ffmpeg-full" / "bin" / "ffmpeg"
+    full_ffprobe = tmp_path / "ffmpeg-full" / "bin" / "ffprobe"
+    full_ffmpeg.parent.mkdir(parents=True)
+    full_ffmpeg.touch()
+    full_ffprobe.touch()
+    monkeypatch.setattr(launcher.sys, "platform", "darwin")
+    monkeypatch.setattr(launcher.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/opt/homebrew/bin/brew")
+    monkeypatch.setattr(
+        launcher,
+        "_find_ffmpeg_full",
+        lambda _brew: (full_ffmpeg, full_ffprobe),
+    )
+    monkeypatch.setattr(launcher, "_ffmpeg_full_usable", lambda _path: True)
+
+    result = launcher._media_executables(
+        stop_requested=threading.Event(),
+        lock_fd=-1,
+    )
+
+    assert result == (full_ffmpeg, full_ffprobe)
+
+
+def test_media_executables_reinstalls_broken_ffmpeg_full_then_keeps_basic_tools(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    full_ffmpeg = tmp_path / "ffmpeg-full" / "bin" / "ffmpeg"
+    full_ffprobe = tmp_path / "ffmpeg-full" / "bin" / "ffprobe"
+    basic_ffmpeg = tmp_path / "basic" / "ffmpeg"
+    basic_ffprobe = tmp_path / "basic" / "ffprobe"
+    basic_ffmpeg.parent.mkdir(parents=True)
+    for path in (full_ffmpeg, full_ffprobe, basic_ffmpeg, basic_ffprobe):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    commands: list[list[str]] = []
+    monkeypatch.setattr(launcher.sys, "platform", "darwin")
+    monkeypatch.setattr(launcher.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(
+        launcher.shutil,
+        "which",
+        lambda name: {
+            "brew": "/opt/homebrew/bin/brew",
+            "ffmpeg": str(basic_ffmpeg),
+            "ffprobe": str(basic_ffprobe),
+        }.get(name),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_find_ffmpeg_full",
+        lambda _brew: (full_ffmpeg, full_ffprobe),
+    )
+    monkeypatch.setattr(launcher, "_ffmpeg_full_usable", lambda _path: False)
+
+    def record(command, **_kwargs):
+        commands.append(command)
+        return 1
+
+    monkeypatch.setattr(launcher, "_run_owned", record)
+
+    result = launcher._media_executables(
+        stop_requested=threading.Event(),
+        lock_fd=-1,
+    )
+
+    assert commands == [["/opt/homebrew/bin/brew", "reinstall", "ffmpeg-full"]]
+    assert result == (basic_ffmpeg.resolve(), basic_ffprobe.resolve())
+
+
 def test_reserved_socket_and_parent_pipe_control_backend(
     ffmpeg: str,
     ffprobe: str,

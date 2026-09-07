@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import secrets
 import shutil
 import signal
@@ -31,6 +32,21 @@ PROCESS_GUARD_PATH = PROJECT_ROOT / "process_guard.py"
 APP_ID = "com.seanli.local-video-cutter"
 DEFAULT_PORT = 8777
 MINIMUM_PYTHON = (3, 10)
+FFMPEG_FULL_PREFIXES = (
+    Path("/opt/homebrew/opt/ffmpeg-full"),
+    Path("/usr/local/opt/ffmpeg-full"),
+)
+FFMPEG_FULL_SMOKE_FILTER = (
+    "setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:"
+    "colorspace=bt2020nc,"
+    "libplacebo=format=gbrp16le:colorspace=gbr:color_primaries=bt709:"
+    "color_trc=iec61966-2-1:range=full:tonemapping=bt.2446a:"
+    "gamut_mode=perceptual:peak_detect=true:contrast_recovery=0:dithering=none,"
+    "setparams=range=full:color_primaries=bt709:"
+    "color_trc=iec61966-2-1:colorspace=gbr,format=gbrp16le,"
+    "zscale=matrix=bt709:range=limited:primaries=bt709:transfer=bt709:"
+    "chromal=left:dither=error_diffusion,format=yuv420p10le"
+)
 
 
 class LauncherError(RuntimeError):
@@ -169,16 +185,104 @@ def _prepare_environment(
     return python
 
 
+def _find_ffmpeg_full(brew: str | None) -> tuple[Path, Path] | None:
+    prefixes = list(FFMPEG_FULL_PREFIXES)
+    if brew:
+        try:
+            completed = subprocess.run(
+                [brew, "--prefix", "ffmpeg-full"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        if completed is not None and completed.returncode == 0:
+            value = completed.stdout.strip()
+            if value:
+                prefixes.insert(0, Path(value))
+    for prefix in prefixes:
+        full_ffmpeg = prefix / "bin" / "ffmpeg"
+        full_ffprobe = prefix / "bin" / "ffprobe"
+        if full_ffmpeg.is_file() and full_ffprobe.is_file():
+            return full_ffmpeg.resolve(), full_ffprobe.resolve()
+    return None
+
+
+def _ffmpeg_full_usable(ffmpeg: Path) -> bool:
+    try:
+        completed = subprocess.run(
+            [
+                str(ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:size=64x64:rate=1:duration=1",
+                "-vf",
+                FFMPEG_FULL_SMOKE_FILTER,
+                "-frames:v",
+                "1",
+                "-c:v",
+                "libx265",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-f",
+                "null",
+                "-",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
 def _media_executables(
     *,
     stop_requested: threading.Event,
     lock_fd: int,
 ) -> tuple[Path, Path]:
+    apple_silicon = sys.platform == "darwin" and platform.machine().lower() in {
+        "arm64",
+        "aarch64",
+    }
+    brew = shutil.which("brew")
+
+    if apple_silicon:
+        full_paths = _find_ffmpeg_full(brew)
+        if full_paths is not None and _ffmpeg_full_usable(full_paths[0]):
+            return full_paths
+        if brew:
+            action = "reinstall" if full_paths is not None else "install"
+            print(
+                "FFmpeg Full with working color filters is required for AI video. "
+                f"Running Homebrew {action}..."
+            )
+            return_code = _run_owned(
+                [brew, action, "ffmpeg-full"],
+                stop_requested=stop_requested,
+                lock_fd=lock_fd,
+            )
+            if return_code == 0:
+                full_paths = _find_ffmpeg_full(brew)
+                if full_paths is not None and _ffmpeg_full_usable(full_paths[0]):
+                    return full_paths
+            print(
+                "FFmpeg Full is unavailable or failed its color-pipeline check. "
+                "Basic video tools will remain available. Run "
+                "'brew reinstall ffmpeg-full' before using AI enhancement."
+            )
+
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     if ffmpeg and ffprobe:
         return Path(ffmpeg).resolve(), Path(ffprobe).resolve()
-    brew = shutil.which("brew")
     if brew:
         print("FFmpeg is missing. Installing it with Homebrew...")
         return_code = _run_owned(
