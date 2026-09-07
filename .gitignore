@@ -8,6 +8,7 @@ __pycache__/
 data/settings.json
 data/runtime/*
 !data/runtime/.gitkeep
+data/ai/*
 
 *.partial-*
 *.mp4

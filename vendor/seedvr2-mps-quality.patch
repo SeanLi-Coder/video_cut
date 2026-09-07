@@ -1,0 +1,418 @@
+diff --git a/inference_cli.py b/inference_cli.py
+index 2d4fff1..b167c6d 100644
+--- a/inference_cli.py
++++ b/inference_cli.py
+@@ -166,11 +166,23 @@ class FFMPEGVideoWriter:
+     def __init__(self, path: str, width: int, height: int, fps: float, use_10bit: bool = False):
+         pix_fmt = 'yuv420p10le' if use_10bit else 'yuv420p'
+         codec = 'libx265' if use_10bit else 'libx264'
+-
++        input_pix_fmt = 'rgb48le' if use_10bit else 'rgb24'
++        encode_options = (
++            ['-vf', 'scale=in_range=full:out_range=limited:out_color_matrix=bt709:'
++             'flags=lanczos+accurate_rnd+full_chroma_int',
++             '-preset', 'slow', '-crf', '10',
++             '-x265-params', 'colorprim=bt709:transfer=bt709:colormatrix=bt709',
++             '-color_range', 'tv', '-colorspace', 'bt709', '-color_trc', 'bt709',
++             '-color_primaries', 'bt709', '-tag:v', 'hvc1']
++            if use_10bit
++            else ['-preset', 'medium', '-crf', '12']
++        )
++        self.use_10bit = use_10bit
++
+         self.proc = subprocess.Popen(
+-            ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
++            ['ffmpeg', '-y', '-f', 'rawvideo', '-pix_fmt', input_pix_fmt,
+              '-s', f'{width}x{height}', '-r', str(fps), '-i', '-',
+-             '-c:v', codec, '-pix_fmt', pix_fmt, '-preset', 'medium', '-crf', '12', path],
++             '-c:v', codec, '-pix_fmt', pix_fmt, *encode_options, path],
+             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+         )
+
+@@ -179,8 +186,12 @@ class FFMPEGVideoWriter:
+             raise RuntimeError("FFMPEGVideoWriter: ffmpeg process is not running")
+
+         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
++        if self.use_10bit:
++            frame_rgb = frame_rgb.astype(np.dtype('<u2'), copy=False)
++        else:
++            frame_rgb = frame_rgb.astype(np.uint8, copy=False)
+         try:
+-            self.proc.stdin.write(frame_rgb.astype(np.uint8).tobytes())
++            self.proc.stdin.write(frame_rgb.tobytes())
+             self.proc.stdin.flush()  # Critical: prevent buffering issues
+         except BrokenPipeError:
+             raise RuntimeError(
+@@ -760,7 +771,11 @@ def save_frames_to_video(
+     Raises:
+         ValueError: If video writer cannot be initialized
+     """
+-    frames_np = (frames_tensor.cpu().numpy() * 255.0).astype(np.uint8)
++    frames_float = frames_tensor.detach().to(device="cpu", dtype=torch.float32).clamp(0.0, 1.0)
++    if video_backend == "ffmpeg" and use_10bit:
++        frames_np = np.rint(frames_float.numpy() * 65535.0).astype(np.dtype('<u2'))
++    else:
++        frames_np = np.rint(frames_float.numpy() * 255.0).astype(np.uint8)
+     T, H, W, C = frames_np.shape
+
+     if writer is None:
+@@ -1008,6 +1023,8 @@ def _process_frames_core(
+         result_tensor = result_tensor.cpu()
+     if result_tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+         result_tensor = result_tensor.to(torch.float32)
++    if not torch.isfinite(result_tensor).all().item():
++        raise FloatingPointError("Final output contains NaN or infinite values")
+
+     return result_tensor
+
+@@ -1709,4 +1726,4 @@ def main() -> None:
+         debug.print_footer()
+
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/src/core/generation_phases.py b/src/core/generation_phases.py
+index 3b7e6ea..6070a1a 100644
+--- a/src/core/generation_phases.py
++++ b/src/core/generation_phases.py
+@@ -729,11 +729,17 @@ def upscale_all_batches(
+                         **ctx['text_embeds'],
+                     )
+             debug.end_timer(f"dit_inference_{upscale_idx+1}", f"DiT inference {upscale_idx+1}")
++
++            upscaled_latent = upscaled_latents[0]
++            if not torch.isfinite(upscaled_latent.float()).all().item():
++                raise FloatingPointError(
++                    f"Phase 2 produced NaN or infinite values in batch {upscale_idx+1}"
++                )
+
+             # Offload upscaled latents to avoid VRAM accumulation
+-            if ctx['tensor_offload_device'] is not None and (upscaled_latents[0].is_cuda or upscaled_latents[0].is_mps):
++            if ctx['tensor_offload_device'] is not None and (upscaled_latent.is_cuda or upscaled_latent.is_mps):
+                 ctx['all_upscaled_latents'][upscale_idx] = manage_tensor(
+-                    tensor=upscaled_latents[0],
++                    tensor=upscaled_latent,
+                     target_device=ctx['tensor_offload_device'],
+                     tensor_name=f"upscaled_latent_{upscale_idx+1}",
+                     debug=debug,
+@@ -741,13 +747,13 @@ def upscale_all_batches(
+                     indent_level=1
+                 )
+             else:
+-                ctx['all_upscaled_latents'][upscale_idx] = upscaled_latents[0]
++                ctx['all_upscaled_latents'][upscale_idx] = upscaled_latent
+
+             # Free original latent - release tensor memory first
+             release_tensor_memory(ctx['all_latents'][batch_idx])
+             ctx['all_latents'][batch_idx] = None
+
+-            del noises, aug_noises, latent, conditions, condition, base_noise, upscaled_latents
++            del noises, aug_noises, latent, conditions, condition, base_noise, upscaled_latents, upscaled_latent
+
+             debug.end_timer(f"upscale_batch_{upscale_idx+1}", f"Upscaled batch {upscale_idx+1}")
+
+diff --git a/src/models/dit_3b/attention.py b/src/models/dit_3b/attention.py
+index 03e3c63..5407971 100644
+--- a/src/models/dit_3b/attention.py
++++ b/src/models/dit_3b/attention.py
+@@ -49,12 +49,21 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
+         k_i = k_i.permute(1, 0, 2).unsqueeze(0) # (1, heads, seq_len_k, head_dim)
+         v_i = v_i.permute(1, 0, 2).unsqueeze(0) # (1, heads, seq_len_k, head_dim)
+
++        output_dtype = q_i.dtype
++        use_mps_float32 = q_i.device.type == "mps" and output_dtype != torch.float32
++        if use_mps_float32:
++            q_i = q_i.float()
++            k_i = k_i.float()
++            v_i = v_i.float()
++
+         # Use PyTorch's built-in scaled dot-product attention.
+         output_i = F.scaled_dot_product_attention(
+             q_i, k_i, v_i,
+             dropout_p=dropout_p if not deterministic else 0.0,
+             is_causal=causal
+         )
++        if use_mps_float32:
++            output_i = output_i.to(output_dtype)
+
+         # Reshape the output back to the original format (seq_len, heads, head_dim)
+         output_i = output_i.squeeze(0).permute(1, 0, 2)
+@@ -145,4 +154,4 @@ class FlashAttentionVarlen(nn.Module):
+             return pytorch_varlen_attention(
+                 q, k, v, cu_seqlens_q, cu_seqlens_k,
+                 max_seqlen_q, max_seqlen_k, **kwargs
+-            )
+\ No newline at end of file
++            )
+diff --git a/src/models/dit_3b/normalization.py b/src/models/dit_3b/normalization.py
+index 155c998..0222c8a 100644
+--- a/src/models/dit_3b/normalization.py
++++ b/src/models/dit_3b/normalization.py
+@@ -89,12 +89,22 @@ class CustomRMSNorm(nn.Module):
+         # RMS normalization: x / sqrt(mean(x^2) + eps) * weight
+         dims = tuple(range(-len(self.normalized_shape), 0))
+
++        # MPS can lose enough precision in reduced-precision reductions to
++        # produce non-finite activations. Keep the reduction in float32 and
++        # convert the normalized result back to the pipeline dtype.
++        compute_input = input
++        use_mps_float32 = input.device.type == "mps" and input.dtype != torch.float32
++        if use_mps_float32:
++            compute_input = input.float()
++
+         # Calculate RMS: sqrt(mean(x^2))
+-        variance = input.pow(2).mean(dim=dims, keepdim=True)
++        variance = compute_input.pow(2).mean(dim=dims, keepdim=True)
+         rms = torch.sqrt(variance + self.eps)
+
+         # Normalize
+-        normalized = input / rms
++        normalized = compute_input / rms
++        if use_mps_float32:
++            normalized = normalized.to(input.dtype)
+
+         if self.elementwise_affine:
+             # Convert FP8 weight to match input dtype for arithmetic operations
+@@ -147,4 +157,4 @@ def get_norm_layer(norm_type: Optional[str]) -> norm_layer_type:
+
+         raise NotImplementedError(f"{norm_type} is not supported")
+
+-    return _norm_layer
+\ No newline at end of file
++    return _norm_layer
+diff --git a/src/models/dit_7b/attention.py b/src/models/dit_7b/attention.py
+index 03e3c63..5407971 100644
+--- a/src/models/dit_7b/attention.py
++++ b/src/models/dit_7b/attention.py
+@@ -49,12 +49,21 @@ def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=N
+         k_i = k_i.permute(1, 0, 2).unsqueeze(0) # (1, heads, seq_len_k, head_dim)
+         v_i = v_i.permute(1, 0, 2).unsqueeze(0) # (1, heads, seq_len_k, head_dim)
+
++        output_dtype = q_i.dtype
++        use_mps_float32 = q_i.device.type == "mps" and output_dtype != torch.float32
++        if use_mps_float32:
++            q_i = q_i.float()
++            k_i = k_i.float()
++            v_i = v_i.float()
++
+         # Use PyTorch's built-in scaled dot-product attention.
+         output_i = F.scaled_dot_product_attention(
+             q_i, k_i, v_i,
+             dropout_p=dropout_p if not deterministic else 0.0,
+             is_causal=causal
+         )
++        if use_mps_float32:
++            output_i = output_i.to(output_dtype)
+
+         # Reshape the output back to the original format (seq_len, heads, head_dim)
+         output_i = output_i.squeeze(0).permute(1, 0, 2)
+@@ -145,4 +154,4 @@ class FlashAttentionVarlen(nn.Module):
+             return pytorch_varlen_attention(
+                 q, k, v, cu_seqlens_q, cu_seqlens_k,
+                 max_seqlen_q, max_seqlen_k, **kwargs
+-            )
+\ No newline at end of file
++            )
+diff --git a/src/models/dit_7b/normalization.py b/src/models/dit_7b/normalization.py
+index c34513a..e590f3c 100644
+--- a/src/models/dit_7b/normalization.py
++++ b/src/models/dit_7b/normalization.py
+@@ -78,12 +78,22 @@ class CustomRMSNorm(nn.Module):
+         # RMS normalization: x / sqrt(mean(x^2) + eps) * weight
+         dims = tuple(range(-len(self.normalized_shape), 0))
+
++        # MPS can lose enough precision in reduced-precision reductions to
++        # produce non-finite activations. Keep the reduction in float32 and
++        # convert the normalized result back to the pipeline dtype.
++        compute_input = input
++        use_mps_float32 = input.device.type == "mps" and input.dtype != torch.float32
++        if use_mps_float32:
++            compute_input = input.float()
++
+         # Calculate RMS: sqrt(mean(x^2))
+-        variance = input.pow(2).mean(dim=dims, keepdim=True)
++        variance = compute_input.pow(2).mean(dim=dims, keepdim=True)
+         rms = torch.sqrt(variance + self.eps)
+
+         # Normalize
+-        normalized = input / rms
++        normalized = compute_input / rms
++        if use_mps_float32:
++            normalized = normalized.to(input.dtype)
+
+         if self.elementwise_affine:
+             # Convert FP8 weight to match input dtype for arithmetic operations
+@@ -136,4 +146,4 @@ def get_norm_layer(norm_type: Optional[str]) -> norm_layer_type:
+
+         raise NotImplementedError(f"{norm_type} is not supported")
+
+-    return _norm_layer
+\ No newline at end of file
++    return _norm_layer
+diff --git a/src/models/video_vae_v3/modules/causal_inflation_lib.py b/src/models/video_vae_v3/modules/causal_inflation_lib.py
+index 664f8b9..bdf41c5 100644
+--- a/src/models/video_vae_v3/modules/causal_inflation_lib.py
++++ b/src/models/video_vae_v3/modules/causal_inflation_lib.py
+@@ -29,6 +29,16 @@ from ....common.half_precision_fixes import safe_pad_operation
+ from ....optimization.memory_manager import retry_on_oom
+ from ....optimization.compatibility import NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND
+
++_MPS_MAX_TENSOR_ELEMENTS = 2**31 - 1
++
++
++def _tile_with_mps_fallback(tensor: Tensor, repeats) -> Tensor:
++    output_numel = tensor.numel() * math.prod(int(repeat) for repeat in repeats)
++    if tensor.device.type == "mps" and output_numel > _MPS_MAX_TENSOR_ELEMENTS:
++        return torch.tile(tensor.cpu(), repeats).to(tensor.device)
++    return torch.tile(tensor, repeats)
++
++
+ # Single GPU inference - no distributed processing needed
+ #print("Warning: Using single GPU inference mode - distributed features disabled in causal_inflation_lib")
+
+@@ -201,13 +211,24 @@ class InflatedCausalConv3d(Conv3d):
+             # Update cache.
+             cache = next_cache
+
+-        output = retry_on_oom(
+-            torch.cat,
+-            x,
+-            split_dim,
+-            debug=getattr(self, 'debug', None),
+-            operation_name="InflatedCausalConv3d.concat_splits"
+-        )
++        output_numel = sum(part.numel() for part in x)
++        if x[0].device.type == "mps" and output_numel > _MPS_MAX_TENSOR_ELEMENTS:
++            def concat_splits():
++                return torch.cat([part.cpu() for part in x], dim=split_dim).to(x[0].device)
++
++            output = retry_on_oom(
++                concat_splits,
++                debug=getattr(self, 'debug', None),
++                operation_name="InflatedCausalConv3d.concat_splits_cpu"
++            )
++        else:
++            output = retry_on_oom(
++                torch.cat,
++                x,
++                split_dim,
++                debug=getattr(self, 'debug', None),
++                operation_name="InflatedCausalConv3d.concat_splits"
++            )
+         return output
+
+     def forward(
+@@ -434,7 +455,8 @@ def extend_head(tensor: Tensor, times: int = 2, memory: Optional[Tensor] = None)
+     else:
+         tile_repeat = [1] * tensor.ndim
+         tile_repeat[2] = times
+-        return torch.cat(tensors=(torch.tile(tensor[:, :, :1], tile_repeat), tensor), dim=2)
++        tiled_head = _tile_with_mps_fallback(tensor[:, :, :1], tile_repeat)
++        return torch.cat(tensors=(tiled_head, tensor), dim=2)
+
+
+ def inflate_weight(weight_2d: torch.Tensor, weight_3d: torch.Tensor, inflation_mode: str):
+diff --git a/inference_cli.py b/inference_cli.py
+--- a/inference_cli.py
++++ b/inference_cli.py
+@@ -696,6 +696,11 @@ def _stream_video_chunks(
+             runner_cache=runner_cache
+         )
+
++        # The direct single-device path does not pass through _gpu_processing,
++        # so remove the artificial lead-in frames here for the first chunk.
++        if chunk_idx == 1 and chunk_args.prepend_frames > 0:
++            result = result[chunk_args.prepend_frames:]
++
+         # Remove context frames from output
+         if context_count > 0:
+             result = result[context_count:]
+diff --git a/src/utils/downloads.py b/src/utils/downloads.py
+index 2569514..14c112d 100644
+--- a/src/utils/downloads.py
++++ b/src/utils/downloads.py
+@@ -256,7 +256,7 @@ def download_weight(filename, model_dir, debug=None):
+
+             if download_with_resume(url, filepath, debug):
+                 # Validate downloaded file
+-                if validate_file(filepath, expected_hash):
++                if validate_file(filepath, expected_hash, cache_dir):
+                     if debug:
+                         debug.log(f"Downloaded and validated: {filename}",
+                                  category="success", force=True)
+diff --git a/src/models/video_vae_v3/modules/context_parallel_lib.py b/src/models/video_vae_v3/modules/context_parallel_lib.py
+index 663525e..f63b7eb 100644
+--- a/src/models/video_vae_v3/modules/context_parallel_lib.py
++++ b/src/models/video_vae_v3/modules/context_parallel_lib.py
+@@ -12,6 +12,7 @@
+ # // See the License for the specific language governing permissions and
+ # // limitations under the License.
+
++import math
+ from typing import List
+ import torch
+ import torch.nn.functional as F
+@@ -19,6 +20,16 @@ from torch import Tensor
+
+ from .types import MemoryState
+
++_MPS_MAX_TENSOR_ELEMENTS = 2**31 - 1
++
++
++def _tile_with_mps_fallback(tensor: Tensor, repeats) -> Tensor:
++    output_numel = tensor.numel() * math.prod(int(repeat) for repeat in repeats)
++    if tensor.device.type == "mps" and output_numel > _MPS_MAX_TENSOR_ELEMENTS:
++        return torch.tile(tensor.cpu(), repeats).to(tensor.device)
++    return torch.tile(tensor, repeats)
++
++
+ # Single GPU inference - no distributed processing needed
+ # print("Warning: Using single GPU inference mode - distributed features disabled")
+
+@@ -62,6 +73,6 @@ def cache_send_recv(tensor: List[Tensor], cache_size, times, memory=None):
+     elif times > 0:
+         tile_repeat = [1] * tensor[0].ndim
+         tile_repeat[2] = times
+-        recv_buffer = torch.tile(tensor[0][:, :, :1], tile_repeat)
++        recv_buffer = _tile_with_mps_fallback(tensor[0][:, :, :1], tile_repeat)
+
+     return recv_buffer
+diff --git a/src/models/video_vae_v3/modules/inflated_lib.py b/src/models/video_vae_v3/modules/inflated_lib.py
+index 486c63c..69a3b82 100644
+--- a/src/models/video_vae_v3/modules/inflated_lib.py
++++ b/src/models/video_vae_v3/modules/inflated_lib.py
+@@ -12,6 +12,7 @@
+ # // See the License for the specific language governing permissions and
+ # // limitations under the License.
+
++import math
+ from enum import Enum
+ from typing import Optional
+ import numpy as np
+@@ -24,6 +25,15 @@ from ....common.logger import get_logger
+
+ logger = get_logger(__name__)
+
++_MPS_MAX_TENSOR_ELEMENTS = 2**31 - 1
++
++
++def _tile_with_mps_fallback(tensor: Tensor, repeats) -> Tensor:
++    output_numel = tensor.numel() * math.prod(int(repeat) for repeat in repeats)
++    if tensor.device.type == "mps" and output_numel > _MPS_MAX_TENSOR_ELEMENTS:
++        return torch.tile(tensor.cpu(), repeats).to(tensor.device)
++    return torch.tile(tensor, repeats)
++
+
+ class MemoryState(Enum):
+     """
+@@ -87,7 +97,8 @@ def extend_head(
+     else:
+         tile_repeat = np.ones(tensor.ndim).astype(int)
+         tile_repeat[2] = times
+-        return torch.cat(tensors=(torch.tile(tensor[:, :, :1], list(tile_repeat)), tensor), dim=2)
++        tiled_head = _tile_with_mps_fallback(tensor[:, :, :1], list(tile_repeat))
++        return torch.cat(tensors=(tiled_head, tensor), dim=2)
+
+
+ def inflate_weight(weight_2d: torch.Tensor, weight_3d: torch.Tensor, inflation_mode: str):

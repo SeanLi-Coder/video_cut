@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .ai_enhance import AIEnhancementManager, ai_target_options
 from .build_info import APP_ID, APP_NAME, APP_VERSION
 from .dialogs import DialogError, select_output_directory, select_video_file
 from .media import (
@@ -69,6 +70,13 @@ class RotationRequest(BaseModel):
     degrees: Literal[90, 180, 270, 360]
 
 
+class AIEnhancementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    video_id: str
+    target: Literal["1080p", "2k", "4k"]
+
+
 @dataclass(frozen=True)
 class PreviewSpec:
     source: VideoSource
@@ -88,6 +96,8 @@ def _display_path(path: Path) -> str:
 
 def _user_media_error(exc: MediaError) -> str:
     message = str(exc)
+    if any("\u4e00" <= character <= "\u9fff" for character in message):
+        return message
     translations = {
         "The selected video does not exist or is not a file": "所选视频不存在，请重新选择。",
         "The selected file does not contain a video stream": "所选文件里没有可读取的视频画面。",
@@ -143,9 +153,114 @@ def _user_media_error(exc: MediaError) -> str:
         ),
         "Required FFmpeg encoders are not available": "当前 FFmpeg 缺少必要的高质量编码器。",
         "Export job was not found": "找不到这次导出任务，请刷新页面后重试。",
+        "Unsupported AI enhancement target": "请选择 1080p、2K QHD 或 4K UHD。",
+        "AI enhancement is only supported on Apple Silicon Mac": (
+            "AI 超清只支持 Apple Silicon Mac，当前不会尝试 CUDA 或低质量替代模型。"
+        ),
+        "Another AI enhancement job is already running": "一次只能运行一个 AI 超清任务。",
+        "AI enhancement job was not found": "找不到这次 AI 超清任务，请刷新页面后重试。",
+        "AI enhancement requires baked-in video orientation": (
+            "该视频仍带旋转标记，请先用“永久旋转”固化方向，再进行 AI 超清。"
+        ),
+        "HDR video AI enhancement is not supported safely": (
+            "当前模型无法可靠保留 HDR、Dolby Vision 或 HDR10+，已停止以免改变色彩。"
+        ),
+        "Alpha video AI enhancement is not supported safely": (
+            "当前模型无法可靠保留透明通道，已停止以免丢失画面信息。"
+        ),
+        "High bit-depth video AI enhancement is not supported safely": (
+            "当前模型链路只安全支持 8-bit SDR；不会把高位深素材静默降质。"
+        ),
+        "Unknown pixel format AI enhancement is not supported safely": (
+            "无法确认该视频的像素格式，已停止以避免静默降低画质。"
+        ),
+        "RGB video AI enhancement is not supported safely": (
+            "AI 超清暂不支持 RGB 编码的视频，以免色彩空间被静默改变。"
+        ),
+        "Full-range video AI enhancement is not supported safely": (
+            "AI 超清暂不支持 full-range 视频，以免亮度范围被静默改变。"
+        ),
+        "Non-BT.709 video AI enhancement is not supported safely": (
+            "AI 超清目前只安全支持 BT.709 SDR 素材，以免色彩空间被静默改变。"
+        ),
+        "Interlaced video AI enhancement is not supported": (
+            "AI 超清暂不支持隔行扫描视频，请先转换为逐行扫描素材。"
+        ),
+        "Non-square pixels are not supported for AI enhancement": (
+            "AI 超清暂不支持非方形像素素材，以免画面比例发生变化。"
+        ),
+        "Variable frame rate AI enhancement is not supported safely": (
+            "AI 超清暂不支持可变帧率素材，以免画面与原音频不同步。"
+        ),
+        "AI enhancement requires at least five video frames": "AI 超清至少需要 5 帧画面。",
+        "AAC transport stream audio cannot be preserved packet-for-packet": (
+            "该视频的 AAC 传输流无法在新容器中保持音频包逐字节不变，请先无损重封装后再试。"
+        ),
+        "AI enhancement target would downscale the source": (
+            "原片尺寸已经超过所选档位；AI 超清不会偷偷缩小画面，请选择更高档位。"
+        ),
+        "There is not enough free space for the AI runtime and models": (
+            "AI 环境和模型至少需要约 12 GB 可用空间，请清理项目所在磁盘后重试。"
+        ),
+        "Could not download the pinned AI runtime": (
+            "无法下载固定版本的 AI 运行器，请检查网络后重试。"
+        ),
+        "The downloaded AI runtime failed integrity verification": (
+            "AI 运行器校验失败，已删除异常下载，请重试。"
+        ),
+        "The bundled AI quality patch failed integrity verification": (
+            "内置 MPS 质量补丁校验失败，请重新下载本项目。"
+        ),
+        "The bundled AI runtime files are missing": "AI 运行文件不完整，请重新下载本项目。",
+        "The AI runtime archive contains an unsafe path": (
+            "AI 运行器压缩包包含异常路径，已停止安装。"
+        ),
+        "The AI runtime archive has an unexpected layout": (
+            "AI 运行器压缩包结构异常，已停止安装。"
+        ),
+        "The AI runtime did not pass its installation check": (
+            "AI 运行环境安装后未通过完整检查，请检查网络和磁盘空间后重试。"
+        ),
+        "The AI runner did not create an output video": "AI 没有生成有效成片，请重试。",
+        "The AI runner unexpectedly added an audio stream": (
+            "AI 运行器意外改变了音轨，已停止以避免保存错误成片。"
+        ),
+        "AI output verification detected unexpected dimensions": (
+            "AI 成片尺寸与所选档位不符，已停止保存。"
+        ),
+        "AI output verification detected an unexpected video codec": (
+            "AI 成片没有使用预期的 HEVC 编码，已停止保存。"
+        ),
+        "AI output verification detected reduced video bit depth": (
+            "AI 成片没有达到 10-bit，已停止保存。"
+        ),
+        "AI output verification detected unexpected color metadata": (
+            "AI 成片没有正确写入 BT.709 色彩信息，已停止保存。"
+        ),
+        "AI output verification detected unexpected rotation metadata": (
+            "AI 成片带有异常旋转标记，已停止保存。"
+        ),
+        "AI output verification detected a frame rate change": (
+            "AI 成片帧率与原片不一致，已停止保存。"
+        ),
+        "AI output verification detected a duration change": (
+            "AI 成片时长与原片不一致，已停止保存。"
+        ),
+        "AI output verification detected an audio stream change": (
+            "AI 成片音轨数量异常，已停止保存。"
+        ),
+        "AI output verification detected changed audio parameters": (
+            "AI 成片音频参数与原片不一致，已停止保存。"
+        ),
+        "AI output verification detected changed audio packets": (
+            "原音轨逐包校验未通过，已停止保存以避免音质变化。"
+        ),
+        "The selected video has no usable frame rate": "无法读取该视频的帧率，请更换视频。",
     }
     if message.startswith("Required FFmpeg encoder is not available"):
         return "当前 FFmpeg 缺少处理这类素材所需的编码器。"
+    if message.startswith("Could not start AI process"):
+        return "无法启动本机 AI 进程，请重新运行 start.command 后再试。"
     if message.startswith("The pixel format cannot be preserved safely"):
         return "该视频的专业像素格式暂时无法安全保留，已停止导出以避免静默降质。"
     return translations.get(message, "无法处理该视频，请查看详情或更换文件。")
@@ -172,6 +287,7 @@ class ApplicationState:
         self.exports: ExportManager | None = None
         self.frame_exports: FrameExtractionManager | None = None
         self.rotations: RotationManager | None = None
+        self.ai_enhancements: AIEnhancementManager | None = None
         try:
             resolved_ffmpeg = ffmpeg or executable_path("ffmpeg")
             resolved_ffprobe = ffprobe or executable_path("ffprobe")
@@ -189,6 +305,10 @@ class ApplicationState:
             )
         with contextlib.suppress(MediaError):
             self.rotations = RotationManager(ffmpeg=resolved_ffmpeg, ffprobe=resolved_ffprobe)
+        self.ai_enhancements = AIEnhancementManager(
+            ffmpeg=resolved_ffmpeg,
+            ffprobe=resolved_ffprobe,
+        )
 
     def output_directory(self) -> Path | None:
         value = self.settings.load().get("output_directory")
@@ -301,6 +421,8 @@ class ApplicationState:
             self.frame_exports.cancel_all()
         if self.rotations is not None:
             self.rotations.cancel_all()
+        if self.ai_enhancements is not None:
+            self.ai_enhancements.cancel_all()
 
 
 def _video_payload(source: VideoSource) -> dict[str, Any]:
@@ -327,6 +449,7 @@ def _video_payload(source: VideoSource) -> dict[str, Any]:
         "directory_display": _display_path(source.path.parent),
         "preview_url": f"/api/videos/{source.id}/content",
         "preview_mode": "original",
+        "ai_targets": ai_target_options(source),
     }
 
 
@@ -423,11 +546,27 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "ffmpeg_ready": state.exports is not None,
             "frame_export_ready": state.frame_exports is not None,
             "rotation_ready": state.rotations is not None,
+            "ai_enhance_ready": bool(
+                state.ai_enhancements and state.ai_enhancements.runtime_status()["ready"]
+            ),
         }
 
     @app.get("/api/bootstrap")
     def bootstrap() -> dict[str, Any]:
         directory = state.output_directory()
+        ai_runtime = (
+            state.ai_enhancements.runtime_status()
+            if state.ai_enhancements is not None
+            else {
+                "supported": False,
+                "ready": False,
+                "installed": False,
+                "models_downloaded": False,
+                "model_name": "SeedVR2 3B FP16",
+                "first_download_gb": 7.3,
+                "message": "AI 超清运行器未就绪。",
+            }
+        )
         return {
             "app_name": APP_NAME,
             "version": APP_VERSION,
@@ -435,6 +574,8 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "ffmpeg_ready": state.exports is not None,
             "frame_export_ready": state.frame_exports is not None,
             "rotation_ready": state.rotations is not None,
+            "ai_enhance_ready": bool(ai_runtime["ready"]),
+            "ai_runtime": ai_runtime,
             "max_frame_seconds": MAX_FRAME_EXTRACTION_SECONDS,
             "output_directory": _display_path(directory) if directory else None,
         }
@@ -678,6 +819,24 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
         return {"job_id": job.id, "output_name": job.output_path.name}
 
+    @app.post("/api/ai-enhancements", dependencies=[Depends(require_app_token)])
+    def create_ai_enhancement(request: AIEnhancementRequest) -> dict[str, Any]:
+        try:
+            if state.ai_enhancements is None:
+                raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
+            source = state.video(request.video_id)
+            output_directory = state.output_directory()
+            if output_directory is None:
+                raise MediaError("The output directory does not exist")
+            job = state.ai_enhancements.create(
+                source,
+                target=request.target,
+                output_directory=output_directory,
+            )
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
+        return {"job_id": job.id, "output_name": job.output_path.name}
+
     def export_job(job_id: str):
         if state.exports is None:
             raise HTTPException(status_code=503, detail="FFmpeg 尚未就绪。")
@@ -700,6 +859,14 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         job = state.rotations.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="找不到这次旋转任务。")
+        return job
+
+    def ai_enhancement_job(job_id: str):
+        if state.ai_enhancements is None:
+            raise HTTPException(status_code=503, detail="AI 超清尚未就绪。")
+        job = state.ai_enhancements.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="找不到这次 AI 超清任务。")
         return job
 
     @app.get("/api/exports/{job_id}", dependencies=[Depends(require_app_token)])
@@ -805,6 +972,47 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:
             raise HTTPException(status_code=500, detail="无法打开旋转视频所在位置。") from exc
+        return {"ok": True}
+
+    @app.get(
+        "/api/ai-enhancements/{job_id}",
+        dependencies=[Depends(require_app_token)],
+    )
+    def ai_enhancement_status(job_id: str) -> dict[str, Any]:
+        snapshot = ai_enhancement_job(job_id).snapshot()
+        if snapshot.get("error"):
+            snapshot["error"] = _user_media_error(MediaError(str(snapshot["error"])))
+        return snapshot
+
+    @app.post(
+        "/api/ai-enhancements/{job_id}/cancel",
+        dependencies=[Depends(require_app_token)],
+    )
+    def cancel_ai_enhancement(job_id: str) -> dict[str, Any]:
+        try:
+            assert state.ai_enhancements is not None
+            return state.ai_enhancements.cancel(job_id).snapshot()
+        except (MediaError, AssertionError) as exc:
+            raise HTTPException(status_code=404, detail="找不到这次 AI 超清任务。") from exc
+
+    @app.post(
+        "/api/ai-enhancements/{job_id}/reveal",
+        dependencies=[Depends(require_app_token)],
+    )
+    def reveal_ai_enhancement(job_id: str) -> dict[str, bool]:
+        job = ai_enhancement_job(job_id)
+        snapshot = job.snapshot()
+        if snapshot["status"] != "completed" or not job.output_path.is_file():
+            raise HTTPException(status_code=409, detail="AI 超清尚未完成。")
+        command = (
+            ["/usr/bin/open", "-R", str(job.output_path)]
+            if sys.platform == "darwin"
+            else ["xdg-open", str(job.output_path.parent)]
+        )
+        try:
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="无法打开 AI 成片所在位置。") from exc
         return {"ok": True}
 
     @app.post("/api/runtime/stop")

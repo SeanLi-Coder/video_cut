@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f5f7fb">
-    <meta name="description" content="在本机快速预览、剪辑、逐帧截图并永久旋转视频">
+    <meta name="description" content="在本机快速预览、剪辑、逐帧截图、永久旋转并用 AI 增强视频">
     <title>本地视频剪辑</title>
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/assets/styles.css">
@@ -54,6 +54,10 @@
             <button class="mode-button" id="mode-rotate-button" type="button" aria-pressed="false">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8V4l-2 2a8 8 0 1 0 2.2 8"/><path d="M15 4h4v4"/></svg>
               <span><strong>永久旋转</strong><small>把方向写进新视频</small></span>
+            </button>
+            <button class="mode-button" id="mode-enhance-button" type="button" aria-pressed="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2L12 3Z"/><path d="m18.5 13 .7 2.3 2.3.7-2.3.7-.7 2.3-.7-2.3-2.3-.7 2.3-.7.7-2.3Z"/><path d="M5.5 13 6 14.7l1.7.5-1.7.5-.5 1.8-.5-1.8-1.7-.5 1.7-.5.5-1.7Z"/></svg>
+              <span><strong>AI 超清</strong><small>增强到 1080p / 2K / 4K</small></span>
             </button>
           </div>
         </div>
@@ -220,6 +224,35 @@
               </button>
             </div>
             <p class="rotation-note" id="rotation-note">90° 和 270° 会交换画面宽高；其他视频与音频参数尽量保持不变。</p>
+          </div>
+
+          <div class="ai-panel" id="ai-panel" hidden>
+            <div class="ai-heading">
+              <div>
+                <strong>选择目标清晰度</strong>
+                <span>整段视频都会处理</span>
+              </div>
+              <span class="ai-model-badge">SeedVR2 3B FP16</span>
+            </div>
+            <div class="ai-target-options" role="group" aria-label="选择 AI 超清目标分辨率">
+              <button class="ai-target-option" type="button" data-target="1080p" aria-pressed="false" aria-describedby="ai-target-note">
+                <strong>1080p</strong>
+                <span data-ai-dimensions>1920 × 1080</span>
+              </button>
+              <button class="ai-target-option" type="button" data-target="2k" aria-pressed="false" aria-describedby="ai-target-note">
+                <strong>2K QHD</strong>
+                <span data-ai-dimensions>2560 × 1440</span>
+              </button>
+              <button class="ai-target-option" type="button" data-target="4k" aria-pressed="false" aria-describedby="ai-target-note">
+                <strong>4K UHD</strong>
+                <span data-ai-dimensions>3840 × 2160</span>
+              </button>
+            </div>
+            <p class="ai-target-note" id="ai-target-note" aria-live="polite">选择视频后会自动推荐可用的目标清晰度。</p>
+            <div class="ai-quality-note">
+              <span aria-hidden="true">✦</span>
+              <p><strong>质量优先，预计会很慢</strong><br>仅支持 Apple Silicon，全程本地处理；首次使用会自动准备环境并下载约 7.3 GB 模型。</p>
+            </div>
           </div>
 
           <div class="preview-panel" id="preview-panel">

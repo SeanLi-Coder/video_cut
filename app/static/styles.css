@@ -239,8 +239,8 @@ video {
 
 .mode-switch {
   display: grid;
-  width: min(760px, 100%);
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  width: min(940px, 100%);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
   padding: 6px;
   border: 1px solid rgba(213, 218, 229, 0.9);
@@ -820,6 +820,148 @@ video:focus-visible {
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   background: var(--surface-soft);
+}
+
+.ai-panel {
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface-soft);
+}
+
+.ai-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 15px;
+}
+
+.ai-heading > div > strong,
+.ai-heading > div > span {
+  display: block;
+}
+
+.ai-heading > div > strong {
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.ai-heading > div > span {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.ai-model-badge {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border: 1px solid #d9d6f8;
+  border-radius: 999px;
+  background: var(--accent-pale);
+  color: #5c57b5;
+  font-size: 9px;
+  font-weight: 730;
+  white-space: nowrap;
+}
+
+.ai-target-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ai-target-option {
+  display: flex;
+  min-width: 0;
+  min-height: 68px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  outline: none;
+  background: white;
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease, color 150ms ease, transform 150ms ease;
+}
+
+.ai-target-option:hover:not(:disabled) {
+  border-color: rgba(90, 84, 232, 0.46);
+  transform: translateY(-1px);
+}
+
+.ai-target-option:focus-visible {
+  box-shadow: 0 0 0 3px rgba(90, 84, 232, 0.13);
+}
+
+.ai-target-option[aria-pressed="true"] {
+  border-color: rgba(90, 84, 232, 0.58);
+  background: linear-gradient(135deg, #efefff, #ffffff);
+  box-shadow: 0 7px 18px rgba(73, 68, 190, 0.12);
+  color: var(--accent-deep);
+}
+
+.ai-target-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.ai-target-option strong,
+.ai-target-option span {
+  overflow: hidden;
+  max-width: 100%;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-target-option strong {
+  font-size: 13px;
+}
+
+.ai-target-option span {
+  color: var(--muted);
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ai-target-note {
+  min-height: 31px;
+  margin: 12px 1px 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.ai-quality-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 12px;
+  padding: 10px 11px;
+  border: 1px solid #dcdaf8;
+  border-radius: 9px;
+  background: var(--accent-pale);
+  color: #5c5982;
+}
+
+.ai-quality-note > span {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.ai-quality-note p {
+  margin: 0;
+  font-size: 9px;
+  line-height: 1.55;
+}
+
+.ai-quality-note strong {
+  font-size: 10px;
 }
 
 .rotation-heading {
@@ -1648,6 +1790,29 @@ video:focus-visible {
     grid-column: 1 / -1;
     margin-top: 0;
   }
+
+  .ai-panel {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 12px 20px;
+  }
+
+  .ai-heading {
+    display: block;
+    margin: 0;
+  }
+
+  .ai-model-badge {
+    display: inline-block;
+    margin-top: 7px;
+  }
+
+  .ai-target-note,
+  .ai-quality-note {
+    grid-column: 1 / -1;
+    margin-top: 0;
+  }
 }
 
 @media (max-width: 650px) {
@@ -1687,6 +1852,7 @@ video:focus-visible {
 
   .mode-switch {
     width: 100%;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .journey {
@@ -1757,6 +1923,10 @@ video:focus-visible {
     display: block;
   }
 
+  .ai-panel {
+    display: block;
+  }
+
   .rotation-heading {
     display: flex;
     margin-bottom: 14px;
@@ -1768,6 +1938,20 @@ video:focus-visible {
 
   .rotation-note {
     margin-top: 13px;
+  }
+
+  .ai-heading {
+    display: flex;
+    margin-bottom: 14px;
+  }
+
+  .ai-model-badge {
+    margin-top: 0;
+  }
+
+  .ai-target-note,
+  .ai-quality-note {
+    margin-top: 12px;
   }
 
   .time-connector {
