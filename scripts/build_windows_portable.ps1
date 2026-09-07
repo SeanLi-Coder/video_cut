@@ -93,8 +93,12 @@ try {
 
     Compress-Archive -Path $StageDirectory -DestinationPath $ArchivePath -CompressionLevel Optimal
     $Hash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
-    "$Hash  $([System.IO.Path]::GetFileName($ArchivePath))" |
-        Set-Content -Path $ChecksumPath -Encoding ascii
+    $ChecksumLine = "$Hash  $([System.IO.Path]::GetFileName($ArchivePath))`n"
+    [System.IO.File]::WriteAllText(
+        $ChecksumPath,
+        $ChecksumLine,
+        [System.Text.Encoding]::ASCII
+    )
 
     if ($env:GITHUB_OUTPUT) {
         "version=$Version" | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
