@@ -439,6 +439,19 @@ function rangeKey(range) {
   return range ? `${range.start.toFixed(3)}:${range.end.toFixed(3)}` : "";
 }
 
+function setDefaultFrameEnd(startValue = elements.startTime.value) {
+  if (!isFrameMode() || !state.video) return false;
+
+  const start = parseTime(startValue);
+  const duration = Number(state.video.duration);
+  if (start === null || !Number.isFinite(duration) || duration <= 0 || start > duration) {
+    return false;
+  }
+
+  elements.endTime.value = formatTime(Math.min(start + state.maxFrameSeconds, duration));
+  return true;
+}
+
 function readRange(showErrors = true) {
   const result = {
     valid: false,
@@ -1074,10 +1087,10 @@ function renderModeCopy() {
     : rotate
       ? "不需要填写时间；整段视频都会处理，点击角度后预览立即更新。"
       : frames
-        ? "仍然只填起始时间和结束时间；修改后预览会自动更新。"
+        ? `填写起始时间后，结束时间会自动设为“起点 + ${state.maxFrameSeconds} 秒”；修改后预览会自动更新。`
         : "只需填写起始时间和结束时间，预览会自动更新。";
   elements.durationLabel.textContent = enhance ? "目标清晰度" : rotate ? "旋转角度" : frames ? "截图时长" : "片段时长";
-  elements.frameLimitHint.textContent = `逐帧截图一次最多 ${state.maxFrameSeconds} 秒；图片按视频原尺寸无损保存。`;
+  elements.frameLimitHint.textContent = `修改起点会自动取后 ${state.maxFrameSeconds} 秒（不足则到视频结尾）；图片按视频原尺寸无损保存。`;
   elements.frameLimitHint.hidden = !frames;
   elements.exportHeading.textContent = enhance ? "确认并开始 AI 超清" : rotate ? "确认并永久旋转" : frames ? "确认并逐帧截图" : "确认并导出";
   elements.exportDescription.textContent = enhance
@@ -1141,6 +1154,7 @@ function changeOperation(operation) {
   clearRotationPreview();
   state.operation = operation;
   if (isEnhanceMode()) selectDefaultAiTarget();
+  if (isFrameMode()) setDefaultFrameEnd();
   state.previewReady = false;
   state.activePreviewKey = "";
 
@@ -1183,10 +1197,13 @@ function resetExportResult() {
   setExportProgress(0);
 }
 
-function handleTimeInput() {
+function handleTimeInput(event) {
   if (!state.video || state.exporting || isRotateMode() || isEnhanceMode()) return;
   if (state.exportCompleted || state.exportError) resetExportResult();
   releaseGeneratedPreview();
+  if (isFrameMode() && event.currentTarget === elements.startTime) {
+    setDefaultFrameEnd(event.currentTarget.value);
+  }
 
   const range = readRange(true);
   renderRangeSummary(range);
@@ -1262,10 +1279,10 @@ async function selectVideo() {
     const suggestedStart = parseTime(result.suggested_start);
     const suggestedEnd = parseTime(result.suggested_end);
     const start = suggestedStart === null ? 0 : suggestedStart;
-    let end = suggestedEnd === null ? duration : suggestedEnd;
-    if (isFrameMode()) end = Math.min(end, start + state.maxFrameSeconds, duration);
+    const end = suggestedEnd === null ? duration : suggestedEnd;
     elements.startTime.value = formatTime(start);
     elements.endTime.value = formatTime(end);
+    if (isFrameMode()) setDefaultFrameEnd(start);
 
     renderVideoDetails();
     const range = readRange(true);

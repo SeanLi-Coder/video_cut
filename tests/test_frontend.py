@@ -46,6 +46,15 @@ def test_frontend_javascript_is_valid() -> None:
     assert completed.returncode == 0, completed.stderr
 
 
+def test_frame_mode_defaults_end_to_five_seconds_after_start() -> None:
+    javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function setDefaultFrameEnd" in javascript
+    assert "Math.min(start + state.maxFrameSeconds, duration)" in javascript
+    assert "event.currentTarget === elements.startTime" in javascript
+    assert "if (isFrameMode()) setDefaultFrameEnd();" in javascript
+    assert "if (isFrameMode()) setDefaultFrameEnd(start);" in javascript
+
+
 def test_frontend_rotation_mode_uses_sibling_output_and_rotation_api() -> None:
     javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     assert 'return "/api/rotations"' in javascript
