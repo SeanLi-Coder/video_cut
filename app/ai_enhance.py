@@ -1215,6 +1215,7 @@ class AIEnhancementManager:
             "encoder_available": self.encoder_available,
             "color_pipeline": "libplacebo + zscale, 16-bit sRGB / BT.2446A to BT.709 SDR",
             "color_pipeline_available": self.color_pipeline_available,
+            "color_pipeline_error": self.color_pipeline_error,
             "first_download_gb": FIRST_MODEL_DOWNLOAD_GB,
             "minimum_runtime_free_gb": (
                 MINIMUM_CUDA_RUNTIME_FREE_BYTES

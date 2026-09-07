@@ -936,6 +936,7 @@ def test_ai_command_is_full_precision_rtx_5090_cuda_path(
     assert runtime["device_index"] == 2
     assert runtime["device_memory_gb"] == 32.0
     assert runtime["encoder_available"] is True
+    assert runtime["color_pipeline_error"] is None
 
 
 def test_cuda_runtime_probe_uses_selected_gpu_visibility(

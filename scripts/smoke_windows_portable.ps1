@@ -85,11 +85,23 @@ try {
     $Bootstrap = Invoke-RestMethod `
         -Uri "http://127.0.0.1:$Port/api/bootstrap" `
         -TimeoutSec 10
-    if (-not $Bootstrap.ai_runtime.color_pipeline_available) {
-        throw "FFmpeg Full did not pass the packaged AI color-pipeline check"
-    }
     if (-not $Bootstrap.ai_runtime.encoder_available) {
         throw "FFmpeg Full did not expose the required libx265 encoder"
+    }
+    if (-not $Bootstrap.ai_runtime.color_pipeline_available) {
+        if (
+            $Bootstrap.ai_runtime.hardware_detected -or
+            $Bootstrap.ai_runtime.color_pipeline_error -eq "libplacebo or zscale is missing"
+        ) {
+            throw (
+                "FFmpeg Full did not pass the packaged AI color-pipeline check: " +
+                $Bootstrap.ai_runtime.color_pipeline_error
+            )
+        }
+        Write-Output (
+            "Runtime libplacebo execution requires a GPU and was not asserted on this runner: " +
+            $Bootstrap.ai_runtime.color_pipeline_error
+        )
     }
 
     if (-not (Test-Path $RuntimePath)) {
