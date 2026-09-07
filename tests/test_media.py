@@ -10,11 +10,13 @@ from pathlib import Path
 
 import pytest
 
+import app.media as media_module
 from app.media import (
     ExportJob,
     ExportManager,
     FrameExtractionManager,
     MediaError,
+    RotationJob,
     RotationManager,
     VideoSource,
     available_output_path,
@@ -29,6 +31,66 @@ from app.media import (
     validate_rotation_degrees,
     validate_time_range,
 )
+
+
+@pytest.mark.parametrize(
+    ("status", "progress", "elapsed", "start_progress", "expected"),
+    [
+        ("running", 25.0, 20.0, 0.0, 60.0),
+        ("running", 25.0, 20.0, 5.0, 75.0),
+        ("running", 0.0, 20.0, 0.0, None),
+        ("running", 25.0, 2.0, 0.0, None),
+        ("running", 99.0, 20.0, 0.0, None),
+        ("queued", 25.0, 20.0, 0.0, None),
+        ("cancelled", 25.0, 20.0, 0.0, None),
+        ("failed", 25.0, 20.0, 0.0, None),
+        ("completed", 100.0, 20.0, 0.0, 0.0),
+    ],
+)
+def test_progress_eta_handles_task_lifecycle(
+    status: str,
+    progress: float,
+    elapsed: float,
+    start_progress: float,
+    expected: float | None,
+) -> None:
+    assert media_module._estimated_progress_remaining_seconds(
+        status=status,
+        progress=progress,
+        elapsed_seconds=elapsed,
+        start_progress=start_progress,
+    ) == expected
+
+
+def test_progress_eta_rejects_non_finite_values() -> None:
+    assert (
+        media_module._estimated_progress_remaining_seconds(
+            status="running",
+            progress=float("nan"),
+            elapsed_seconds=20,
+        )
+        is None
+    )
+
+
+def test_rotation_eta_excludes_hdr_scan_time(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(media_module.time, "time", lambda: 100.0)
+    job = RotationJob(
+        id="rotation-eta",
+        source=VideoSource("source", tmp_path / "source.mov", {}),
+        degrees=90,
+        output_path=tmp_path / "output.mov",
+        status="running",
+        progress=25.0,
+        created_at=10.0,
+        started_at=10.0,
+        encoding_started_at=80.0,
+    )
+
+    snapshot = job.snapshot()
+
+    assert snapshot["elapsed_seconds"] == 90.0
+    assert snapshot["estimated_remaining_seconds"] == 75.0
 
 
 @pytest.mark.parametrize(
@@ -176,6 +238,7 @@ def test_precise_export_preserves_dimensions_and_uses_lossless_audio(
     snapshot = job.snapshot()
     assert snapshot["status"] == "completed", snapshot
     assert snapshot["progress"] == 100
+    assert snapshot["estimated_remaining_seconds"] == 0
     assert _sha256(sample_video) == original_digest
     assert job.output_path.is_file()
     result = probe_video(job.output_path, ffprobe=ffprobe)
@@ -356,6 +419,7 @@ def test_permanent_rotation_bakes_each_angle_and_copies_audio_packets(
     assert snapshot["operation"] == "rotate"
     assert snapshot["degrees"] == degrees
     assert snapshot["progress"] == 100
+    assert snapshot["estimated_remaining_seconds"] == 0
     assert job.output_path.parent == source_path.parent
     assert job.output_path != source_path
     assert job.output_path.name == f"orientation source_rotated_{degrees}.mkv"
@@ -519,6 +583,7 @@ def test_frame_extraction_keeps_every_frame_and_original_dimensions(
     assert snapshot["status"] == "completed", snapshot
     assert snapshot["operation"] == "frames"
     assert snapshot["frame_count"] == 5
+    assert snapshot["estimated_remaining_seconds"] == 0
     assert job.output_path.is_dir()
     assert _sha256(source_path) == original_digest
     frames = sorted(job.output_path.glob("frame_*.png"))

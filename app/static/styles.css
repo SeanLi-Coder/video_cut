@@ -748,6 +748,7 @@ video {
   display: flex;
   min-height: 16px;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   color: var(--muted);
   font-size: 10px;
@@ -756,6 +757,12 @@ video {
 
 .model-progress-meta span:first-child {
   flex: 1;
+}
+
+.remaining-time {
+  color: var(--accent-deep);
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .progress-message {
@@ -1979,7 +1986,11 @@ video:focus-visible {
   flex: 1;
 }
 
-#export-elapsed {
+.progress-timing {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
@@ -2459,6 +2470,15 @@ video:focus-visible {
   }
 
   #export-progress-message {
+    flex-basis: 100%;
+  }
+
+  .progress-timing {
+    flex: 1;
+    flex-wrap: wrap;
+  }
+
+  .model-progress-meta span:first-child {
     flex-basis: 100%;
   }
 

@@ -122,6 +122,7 @@ const elements = {
   modelDownloadBytes: byId("model-download-bytes"),
   modelDownloadSpeed: byId("model-download-speed"),
   modelDownloadElapsed: byId("model-download-elapsed"),
+  modelDownloadRemaining: byId("model-download-remaining"),
   modelProgressMessage: byId("model-progress-message"),
   modelActionNote: byId("model-action-note"),
   modelDownloadButton: byId("model-download-button"),
@@ -165,6 +166,7 @@ const elements = {
   exportProgressBar: byId("export-progress-bar"),
   exportProgressMessage: byId("export-progress-message"),
   exportElapsed: byId("export-elapsed"),
+  exportRemaining: byId("export-remaining"),
   cancelExportButton: byId("cancel-export-button"),
   exportCompletePanel: byId("export-complete-panel"),
   completedOutputName: byId("completed-output-name"),
@@ -365,6 +367,51 @@ function formatElapsed(value) {
   const seconds = Math.max(0, Math.floor(Number(value) || 0));
   if (seconds < 60) return `已用 ${seconds} 秒`;
   return `已用 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+}
+
+function formatRemainingTime(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return "预计还需：正在估算…";
+  const seconds = Math.ceil(numeric);
+  if (seconds <= 10) return "预计还需：即将完成";
+  if (seconds < 60) {
+    return `预计还需：约 ${Math.ceil(seconds / 5) * 5} 秒`;
+  }
+  if (seconds < 3600) {
+    return `预计还需：约 ${Math.ceil(seconds / 60)} 分钟`;
+  }
+  if (seconds < 86400) {
+    const totalMinutes = Math.ceil(seconds / 300) * 5;
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes > 0
+      ? `预计还需：约 ${hours} 小时 ${minutes} 分钟`
+      : `预计还需：约 ${hours} 小时`;
+  }
+  const totalHours = Math.ceil(seconds / 3600);
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours > 0
+    ? `预计还需：约 ${days} 天 ${hours} 小时`
+    : `预计还需：约 ${days} 天`;
+}
+
+function remainingTimeText(snapshot, { cancelling = false } = {}) {
+  if (cancelling) return "预计还需：正在停止…";
+  const status = String(snapshot?.status || "").toLowerCase();
+  const stage = String(snapshot?.stage || snapshot?.phase || status).toLowerCase();
+  const active = ["queued", "pending", "waiting", "running", "processing", "exporting"].includes(status);
+  if (!active) return "";
+  if (["verify", "verifying", "remux", "finalize", "finalizing"].includes(stage)
+    || normalizeProgress(snapshot?.progress) >= 99) {
+    return "预计还需：正在收尾…";
+  }
+  const rawEstimate = snapshot?.estimated_remaining_seconds;
+  if (rawEstimate !== null && rawEstimate !== undefined && rawEstimate !== "") {
+    const estimate = Number(rawEstimate);
+    if (Number.isFinite(estimate) && estimate >= 0) return formatRemainingTime(estimate);
+  }
+  return "预计还需：正在估算…";
 }
 
 function normalizeCodec(codec) {
@@ -1439,12 +1486,22 @@ function formatBytes(value) {
   return `${amount.toFixed(digits)} ${unit}`;
 }
 
-function setModelProgress(value) {
+function setProgressAriaValue(track, value, remainingText = "") {
+  const rounded = Math.round(normalizeProgress(value));
+  const conciseRemaining = String(remainingText || "").replace("预计还需：", "预计还需");
+  track.setAttribute(
+    "aria-valuetext",
+    conciseRemaining ? `${rounded}%，${conciseRemaining}` : `${rounded}%`,
+  );
+}
+
+function setModelProgress(value, remainingText = "") {
   const percentage = normalizeProgress(value);
   const rounded = Math.round(percentage);
   elements.modelProgressValue.textContent = `${rounded}%`;
   elements.modelProgressBar.style.width = `${percentage}%`;
   elements.modelProgressTrack.setAttribute("aria-valuenow", String(rounded));
+  setProgressAriaValue(elements.modelProgressTrack, percentage, remainingText);
 }
 
 function modelStageCopy(stage, active) {
@@ -1491,6 +1548,9 @@ function renderModelManager() {
   const downloadedBytes = prepared && totalBytes > 0
     ? totalBytes
     : Math.max(0, Number(snapshot.downloaded_bytes) || 0);
+  const modelRemainingText = remainingTimeText(snapshot, {
+    cancelling: state.modelDownloadCancelling,
+  });
 
   let badgeStatus = "idle";
   let badgeText = "尚未下载";
@@ -1521,7 +1581,7 @@ function renderModelManager() {
   elements.modelSizeValue.textContent = Number.isFinite(sizeGb) && sizeGb > 0
     ? `约 ${sizeGb.toFixed(1)} GB`
     : "约 7.3 GB";
-  setModelProgress(progress);
+  setModelProgress(progress, modelRemainingText);
   elements.modelProgressPanel.classList.toggle("is-ready", prepared);
   elements.modelProgressPanel.classList.toggle("is-error", failed);
 
@@ -1552,6 +1612,7 @@ function renderModelManager() {
     && Number(snapshot.elapsed_seconds) > 0
     ? formatElapsed(snapshot.elapsed_seconds)
     : "";
+  elements.modelDownloadRemaining.textContent = modelRemainingText;
 
   const message = state.modelDownloadRequestError
     || snapshot.error
@@ -1662,7 +1723,26 @@ async function pollModelDownload(pollSerial) {
     }
   } catch (error) {
     if (pollSerial !== state.modelDownloadPollSerial) return;
+    if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+      stopModelDownloadPolling();
+      state.modelDownloadRequestError = "本地服务连接已更新，请刷新页面后继续查看模型任务。";
+      renderModelManager();
+      elements.modelDownloadRemaining.textContent = "预计还需：请先刷新页面";
+      setProgressAriaValue(
+        elements.modelProgressTrack,
+        elements.modelProgressTrack.getAttribute("aria-valuenow"),
+        elements.modelDownloadRemaining.textContent,
+      );
+      showToast(state.modelDownloadRequestError, "error");
+      return;
+    }
     state.modelDownloadPollFailures += 1;
+    elements.modelDownloadRemaining.textContent = "预计还需：等待重新连接…";
+    setProgressAriaValue(
+      elements.modelProgressTrack,
+      elements.modelProgressTrack.getAttribute("aria-valuenow"),
+      elements.modelDownloadRemaining.textContent,
+    );
     elements.modelProgressMessage.textContent = state.modelDownloadPollFailures <= 4
       ? "连接短暂中断，正在重新获取下载进度…"
       : "暂时无法连接本地服务，下载可能仍在后台继续；正在自动重连。";
@@ -1685,6 +1765,12 @@ async function refreshModelDownloadStatus({ reconnect = true } = {}) {
   } catch (error) {
     state.modelDownloadRequestError = error.message || "无法读取 AI 模型状态";
     renderModelManager();
+    elements.modelDownloadRemaining.textContent = "预计还需：暂时无法估算";
+    setProgressAriaValue(
+      elements.modelProgressTrack,
+      elements.modelProgressTrack.getAttribute("aria-valuenow"),
+      elements.modelDownloadRemaining.textContent,
+    );
   }
 }
 
@@ -1779,12 +1865,13 @@ function exportApiBase() {
   return "/api/exports";
 }
 
-function setExportProgress(value) {
+function setExportProgress(value, remainingText = "") {
   const percentage = normalizeProgress(value);
   const rounded = Math.round(percentage);
   elements.exportProgressValue.textContent = `${rounded}%`;
   elements.exportProgressBar.style.width = `${percentage}%`;
   elements.exportProgressTrack.setAttribute("aria-valuenow", String(rounded));
+  setProgressAriaValue(elements.exportProgressTrack, percentage, remainingText);
 }
 
 function showExportProgress() {
@@ -1813,7 +1900,8 @@ function showExportProgress() {
       ? "正在准备独立截图文件夹，请不要关闭此页面。"
       : "正在安全地创建新文件，请不要关闭此页面。";
   elements.exportElapsed.textContent = "";
-  setExportProgress(0);
+  elements.exportRemaining.textContent = "预计还需：正在估算…";
+  setExportProgress(0, elements.exportRemaining.textContent);
 }
 
 async function startExport() {
@@ -1864,10 +1952,14 @@ async function pollExport(pollSerial) {
     const status = String(job.status || "running").toLowerCase();
     const stage = String(job.stage || job.phase || status).toLowerCase();
     const progress = normalizeProgress(job.progress);
-    setExportProgress(progress);
+    const exportRemainingText = remainingTimeText(job, {
+      cancelling: state.cancellingExport,
+    });
+    setExportProgress(progress, exportRemainingText);
     elements.exportElapsed.textContent = Number.isFinite(Number(job.elapsed_seconds))
       ? formatElapsed(job.elapsed_seconds)
       : "";
+    elements.exportRemaining.textContent = exportRemainingText;
 
     if (["queued", "pending", "waiting"].includes(status)) {
       elements.exportProgressKicker.textContent = "等待处理";
@@ -1944,6 +2036,12 @@ async function pollExport(pollSerial) {
       return;
     }
     state.exportPollFailures += 1;
+    elements.exportRemaining.textContent = "预计还需：等待重新连接…";
+    setProgressAriaValue(
+      elements.exportProgressTrack,
+      elements.exportProgressTrack.getAttribute("aria-valuenow"),
+      elements.exportRemaining.textContent,
+    );
     if (state.exportPollFailures <= 4) {
       elements.exportProgressMessage.textContent = "连接短暂中断，正在重新连接本地服务…";
       scheduleExportPoll(pollSerial, Math.min(3000, 700 * state.exportPollFailures));
@@ -2040,6 +2138,11 @@ function finishExportWithError(message, job = null) {
   elements.exportProgressKicker.textContent = `${operationLabel()}未完成`;
   elements.exportProgressTitle.textContent = `${operationLabel()}失败`;
   elements.exportProgressMessage.textContent = `${state.exportError} 原视频未被修改。`;
+  elements.exportRemaining.textContent = "";
+  setProgressAriaValue(
+    elements.exportProgressTrack,
+    elements.exportProgressTrack.getAttribute("aria-valuenow"),
+  );
   if (job && Number.isFinite(Number(job.elapsed_seconds))) {
     elements.exportElapsed.textContent = formatElapsed(job.elapsed_seconds);
   }
@@ -2052,6 +2155,12 @@ async function cancelExport() {
   state.cancellingExport = true;
   elements.cancelExportButton.disabled = true;
   elements.cancelExportButton.textContent = "正在取消…";
+  elements.exportRemaining.textContent = "预计还需：正在停止…";
+  setProgressAriaValue(
+    elements.exportProgressTrack,
+    elements.exportProgressTrack.getAttribute("aria-valuenow"),
+    elements.exportRemaining.textContent,
+  );
   elements.exportProgressMessage.textContent = isEnhanceMode()
     ? "正在停止 AI 计算并清理未完成文件；已下载的模型会保留供下次使用…"
     : isRotateMode()

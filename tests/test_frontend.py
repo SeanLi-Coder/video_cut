@@ -23,6 +23,10 @@ def test_frontend_has_only_two_editable_text_parameters() -> None:
     assert 'role="tabpanel" aria-labelledby="model-workspace-tab"' in html
     assert 'id="model-download-button"' in html
     assert 'id="model-progress-track"' in html
+    assert 'id="model-download-remaining"' in html
+    assert 'id="export-remaining"' in html
+    assert html.count('aria-valuetext="0%') == 2
+    assert 'aria-label="任务处理进度"' in html
     assert html.count('class="rotation-option"') == 4
     assert all(f'data-degrees="{degrees}"' in html for degrees in (90, 180, 270, 360))
     assert 'id="rotation-panel"' in html
@@ -95,6 +99,13 @@ def test_frontend_has_independent_ai_model_download_manager() -> None:
     assert "function switchWorkspace" in javascript
     assert "modelDownloadIsActive()" in javascript
     assert "download_speed_bps" in javascript
+    assert "estimated_remaining_seconds" in javascript
+    assert "function formatRemainingTime" in javascript
+    assert "function remainingTimeText" in javascript
+    assert "function setProgressAriaValue" in javascript
+    assert "预计还需：正在估算" in javascript
+    assert "预计还需：正在收尾" in javascript
+    assert "本地服务连接已更新，请刷新页面后继续查看模型任务" in javascript
     assert '["#ai-model", "#video"].includes(window.location.hash)' in javascript
     assert 'role="tablist"' in html
     assert 'aria-label="AI 模型下载进度"' in html

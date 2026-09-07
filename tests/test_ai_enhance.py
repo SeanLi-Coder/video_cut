@@ -41,6 +41,94 @@ def test_bundled_ai_patch_matches_integrity_pin() -> None:
     assert AIEnhancementManager._file_sha256(AI_PATCH_PATH) == RUNNER_PATCH_SHA256
 
 
+def test_model_download_eta_uses_remaining_bytes_and_current_speed() -> None:
+    assert ai_module._estimated_model_download_remaining_seconds(
+        status="running",
+        stage="download",
+        downloaded_bytes=250,
+        total_bytes=1_000,
+        download_speed_bps=50,
+    ) == 15.0
+    assert ai_module._estimated_model_download_remaining_seconds(
+        status="completed",
+        stage="completed",
+        downloaded_bytes=1_000,
+        total_bytes=1_000,
+        download_speed_bps=0,
+    ) == 0.0
+
+
+@pytest.mark.parametrize("speed", [0.0, -1.0, float("nan"), float("inf")])
+def test_model_download_eta_rejects_unusable_speed(speed: float) -> None:
+    assert (
+        ai_module._estimated_model_download_remaining_seconds(
+            status="running",
+            stage="download",
+            downloaded_bytes=250,
+            total_bytes=1_000,
+            download_speed_bps=speed,
+        )
+        is None
+    )
+
+
+def test_model_download_eta_is_hidden_outside_download_stage() -> None:
+    for stage in ("setup", "verify"):
+        assert (
+            ai_module._estimated_model_download_remaining_seconds(
+                status="running",
+                stage=stage,
+                downloaded_bytes=250,
+                total_bytes=1_000,
+                download_speed_bps=50,
+            )
+            is None
+        )
+    assert (
+        ai_module._estimated_model_download_remaining_seconds(
+            status="running",
+            stage="download",
+            downloaded_bytes=1_100,
+            total_bytes=1_000,
+            download_speed_bps=50,
+        )
+        is None
+    )
+
+
+def test_ai_eta_only_appears_after_inference_has_a_stable_sample() -> None:
+    assert ai_module._estimated_ai_remaining_seconds(
+        status="running",
+        stage="inference",
+        progress=36,
+        stage_elapsed_seconds=20,
+    ) == pytest.approx(60.0)
+    assert (
+        ai_module._estimated_ai_remaining_seconds(
+            status="running",
+            stage="setup",
+            progress=36,
+            stage_elapsed_seconds=20,
+        )
+        is None
+    )
+    assert (
+        ai_module._estimated_ai_remaining_seconds(
+            status="running",
+            stage="inference",
+            progress=36,
+            stage_elapsed_seconds=14,
+        )
+        is None
+    )
+    assert ai_module._estimated_ai_remaining_seconds(
+        status="completed",
+        stage="completed",
+        progress=100,
+        stage_elapsed_seconds=20,
+    ) == 0.0
+
+
 def test_model_ready_requires_exact_validation_cache(
     monkeypatch,
     tmp_path: Path,
@@ -544,6 +632,8 @@ def test_ai_model_download_api_starts_without_video_and_recovers_progress(
         nonlocal download_calls
         download_calls += 1
         manager._set_model_download_bytes(job, len(model_content), network=True)
+        with job.lock:
+            job.download_speed_bps = 1
         download_started.set()
         assert release_download.wait(5)
         manager.model_root.mkdir(parents=True, exist_ok=True)
@@ -568,6 +658,7 @@ def test_ai_model_download_api_starts_without_video_and_recovers_progress(
         idle = client.get("/api/ai-model-download", headers=headers).json()
         assert idle["status"] == "idle"
         assert idle["job_id"] is None
+        assert idle["estimated_remaining_seconds"] is None
 
         started = client.post("/api/ai-model-download", headers=headers)
         assert started.status_code == 200, started.text
@@ -582,6 +673,7 @@ def test_ai_model_download_api_starts_without_video_and_recovers_progress(
         assert progress["total_bytes"] == total_bytes
         assert progress["elapsed_seconds"] >= 0
         assert progress["download_speed_bps"] >= 0
+        assert progress["estimated_remaining_seconds"] == len(vae_content)
 
         duplicate = client.post("/api/ai-model-download", headers=headers).json()
         assert duplicate["job_id"] == job_id
@@ -602,6 +694,7 @@ def test_ai_model_download_api_starts_without_video_and_recovers_progress(
 
         assert completed["status"] == "completed", completed
         assert completed["progress"] == 100
+        assert completed["estimated_remaining_seconds"] == 0
         assert completed["downloaded_bytes"] == total_bytes
         assert completed["models_downloaded"] is True
         assert completed["installed"] is True
@@ -670,6 +763,7 @@ def test_ai_model_download_api_cancels_and_keeps_resumable_state(
             time.sleep(0.01)
         assert cancelled["status"] == "cancelled", cancelled
         assert cancelled["downloaded_bytes"] == 25
+        assert cancelled["estimated_remaining_seconds"] is None
         assert cancelled["models_downloaded"] is False
 
 
@@ -785,6 +879,7 @@ def test_ai_api_creates_verified_10bit_video_and_copies_audio_packets(
 
         assert snapshot["status"] == "completed", snapshot
         assert snapshot["operation"] == "enhance"
+        assert snapshot["estimated_remaining_seconds"] == 0
         assert snapshot["model"] == MODEL_NAME
         assert snapshot["target"] == "1080p"
         output_path = Path(snapshot["output_path"])

@@ -66,6 +66,61 @@ FIRST_MODEL_DOWNLOAD_GB = round((MODEL_SIZE_BYTES + VAE_SIZE_BYTES) / 1_000_000_
 
 MINIMUM_RUNTIME_FREE_BYTES = 12 * 1024**3
 MINIMUM_OUTPUT_FREE_BYTES = 512 * 1024**2
+MAX_ESTIMATED_REMAINING_SECONDS = 30 * 24 * 60 * 60
+
+
+def _estimated_ai_remaining_seconds(
+    *,
+    status: str,
+    stage: str,
+    progress: float,
+    stage_elapsed_seconds: float,
+) -> float | None:
+    normalized_status = str(status).lower()
+    if normalized_status == "completed":
+        return 0.0
+    if normalized_status != "running" or str(stage).lower() != "inference":
+        return None
+    values = (progress, stage_elapsed_seconds)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    if stage_elapsed_seconds < 15 or progress <= 19 or progress >= 90:
+        return None
+    inference_progress = progress - 18.0
+    progress_per_second = inference_progress / stage_elapsed_seconds
+    if progress_per_second <= 0:
+        return None
+    estimate = (90.0 - progress) / progress_per_second
+    if not math.isfinite(estimate) or estimate < 0:
+        return None
+    return round(min(estimate, MAX_ESTIMATED_REMAINING_SECONDS), 1)
+
+
+def _estimated_model_download_remaining_seconds(
+    *,
+    status: str,
+    stage: str,
+    downloaded_bytes: int,
+    total_bytes: int,
+    download_speed_bps: float,
+) -> float | None:
+    normalized_status = str(status).lower()
+    if normalized_status == "completed":
+        return 0.0
+    if normalized_status != "running" or str(stage).lower() != "download":
+        return None
+    values = (float(downloaded_bytes), float(total_bytes), download_speed_bps)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    if total_bytes <= 0 or download_speed_bps <= 0:
+        return None
+    remaining_bytes = max(0, total_bytes - downloaded_bytes)
+    if remaining_bytes <= 0:
+        return None
+    estimate = remaining_bytes / download_speed_bps
+    if not math.isfinite(estimate) or estimate < 0:
+        return None
+    return round(min(estimate, MAX_ESTIMATED_REMAINING_SECONDS), 1)
 
 
 @dataclass(frozen=True)
@@ -277,6 +332,7 @@ class AIEnhancementJob:
     error: str | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
+    stage_started_at: float | None = None
     finished_at: float | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     process: subprocess.Popen[str] | None = field(default=None, repr=False)
@@ -287,6 +343,9 @@ class AIEnhancementJob:
         with self.lock:
             end_time = self.finished_at or time.time()
             start_time = self.started_at or self.created_at
+            elapsed_seconds = max(0.0, end_time - start_time)
+            stage_start_time = self.stage_started_at or start_time
+            stage_elapsed_seconds = max(0.0, end_time - stage_start_time)
             return {
                 "job_id": self.id,
                 "operation": "enhance",
@@ -297,7 +356,13 @@ class AIEnhancementJob:
                 "output_name": self.output_path.name,
                 "output_path": str(self.output_path) if self.status == "completed" else None,
                 "error": self.error,
-                "elapsed_seconds": round(max(0.0, end_time - start_time), 1),
+                "elapsed_seconds": round(elapsed_seconds, 1),
+                "estimated_remaining_seconds": _estimated_ai_remaining_seconds(
+                    status=self.status,
+                    stage=self.stage,
+                    progress=self.progress,
+                    stage_elapsed_seconds=stage_elapsed_seconds,
+                ),
                 "target": self.target.id,
                 "target_label": self.target.label,
                 "target_width": self.expected_width,
@@ -331,6 +396,7 @@ class AIModelDownloadJob:
         with self.lock:
             end_time = self.finished_at or time.time()
             start_time = self.started_at or self.created_at
+            elapsed_seconds = max(0.0, end_time - start_time)
             return {
                 "job_id": self.id,
                 "operation": "ai_model_download",
@@ -342,7 +408,14 @@ class AIModelDownloadJob:
                 "downloaded_bytes": self.downloaded_bytes,
                 "total_bytes": self.total_bytes,
                 "download_speed_bps": round(self.download_speed_bps),
-                "elapsed_seconds": round(max(0.0, end_time - start_time), 1),
+                "elapsed_seconds": round(elapsed_seconds, 1),
+                "estimated_remaining_seconds": _estimated_model_download_remaining_seconds(
+                    status=self.status,
+                    stage=self.stage,
+                    downloaded_bytes=self.downloaded_bytes,
+                    total_bytes=self.total_bytes,
+                    download_speed_bps=self.download_speed_bps,
+                ),
                 "model": MODEL_NAME,
             }
 
@@ -618,6 +691,7 @@ class AIEnhancementManager:
                 "total_bytes": MODEL_DOWNLOAD_SIZE_BYTES,
                 "download_speed_bps": 0,
                 "elapsed_seconds": 0.0,
+                "estimated_remaining_seconds": 0.0 if prepared else None,
                 "model": MODEL_NAME,
             }
         elif snapshot["status"] == "completed" and not prepared:
@@ -634,6 +708,7 @@ class AIEnhancementManager:
                     "error": None,
                     "downloaded_bytes": downloaded_bytes,
                     "download_speed_bps": 0,
+                    "estimated_remaining_seconds": None,
                 }
             )
         snapshot.update(
@@ -857,6 +932,8 @@ class AIEnhancementManager:
     ) -> None:
         with job.lock:
             if stage is not None:
+                if stage != job.stage and isinstance(job, AIEnhancementJob):
+                    job.stage_started_at = time.time()
                 job.stage = stage
             if progress is not None:
                 job.progress = max(job.progress, min(99.0, progress))
@@ -1873,10 +1950,12 @@ class AIEnhancementManager:
             if job.cancel_event.is_set():
                 raise InterruptedError
             with job.lock:
+                started_at = time.time()
                 job.status = "running"
                 job.stage = "setup"
                 job.message = "正在准备质量优先的 MPS AI 环境"
-                job.started_at = time.time()
+                job.started_at = started_at
+                job.stage_started_at = started_at
             self._prepare_runtime(job)
             if job.cancel_event.is_set():
                 raise InterruptedError

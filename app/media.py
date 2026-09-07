@@ -29,6 +29,35 @@ class MediaError(RuntimeError):
 TIME_EPSILON_SECONDS = 0.002
 MAX_FRAME_EXTRACTION_SECONDS = 5.0
 SUPPORTED_ROTATION_DEGREES = frozenset({90, 180, 270, 360})
+MAX_ESTIMATED_REMAINING_SECONDS = 30 * 24 * 60 * 60
+
+
+def _estimated_progress_remaining_seconds(
+    *,
+    status: str,
+    progress: float,
+    elapsed_seconds: float,
+    start_progress: float = 0.0,
+) -> float | None:
+    normalized_status = str(status).lower()
+    if normalized_status == "completed":
+        return 0.0
+    if normalized_status not in {"running", "processing", "exporting"}:
+        return None
+    values = (progress, elapsed_seconds, start_progress)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    if elapsed_seconds < 3 or progress <= start_progress or progress >= 99:
+        return None
+    completed_progress = progress - start_progress
+    total_progress = 100.0 - start_progress
+    completed_fraction = completed_progress / total_progress
+    if completed_fraction < 0.01:
+        return None
+    estimate = elapsed_seconds * (1.0 - completed_fraction) / completed_fraction
+    if not math.isfinite(estimate) or estimate < 0:
+        return None
+    return round(min(estimate, MAX_ESTIMATED_REMAINING_SECONDS), 1)
 
 
 def executable_path(name: str) -> str:
@@ -733,6 +762,7 @@ class ExportJob:
         with self.lock:
             end_time = self.finished_at or time.time()
             start_time = self.started_at or self.created_at
+            elapsed_seconds = max(0.0, end_time - start_time)
             return {
                 "job_id": self.id,
                 "status": self.status,
@@ -741,7 +771,12 @@ class ExportJob:
                 "output_name": self.output_path.name,
                 "output_path": str(self.output_path) if self.status == "completed" else None,
                 "error": self.error,
-                "elapsed_seconds": round(max(0.0, end_time - start_time), 1),
+                "elapsed_seconds": round(elapsed_seconds, 1),
+                "estimated_remaining_seconds": _estimated_progress_remaining_seconds(
+                    status=self.status,
+                    progress=self.progress,
+                    elapsed_seconds=elapsed_seconds,
+                ),
             }
 
 
@@ -1528,6 +1563,7 @@ class RotationJob:
     error: str | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
+    encoding_started_at: float | None = None
     finished_at: float | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     process: subprocess.Popen[str] | None = field(default=None, repr=False)
@@ -1538,6 +1574,12 @@ class RotationJob:
         with self.lock:
             end_time = self.finished_at or time.time()
             start_time = self.started_at or self.created_at
+            elapsed_seconds = max(0.0, end_time - start_time)
+            encoding_elapsed_seconds = (
+                max(0.0, end_time - self.encoding_started_at)
+                if self.encoding_started_at is not None
+                else 0.0
+            )
             return {
                 "job_id": self.id,
                 "operation": "rotate",
@@ -1548,7 +1590,13 @@ class RotationJob:
                 "output_name": self.output_path.name,
                 "output_path": str(self.output_path) if self.status == "completed" else None,
                 "error": self.error,
-                "elapsed_seconds": round(max(0.0, end_time - start_time), 1),
+                "elapsed_seconds": round(elapsed_seconds, 1),
+                "estimated_remaining_seconds": _estimated_progress_remaining_seconds(
+                    status=self.status,
+                    progress=self.progress,
+                    elapsed_seconds=encoding_elapsed_seconds,
+                    start_progress=5.0,
+                ),
             }
 
 
@@ -2070,6 +2118,7 @@ class RotationManager(ExportManager):
                     raise InterruptedError
                 process = subprocess.Popen(command, **options)
                 job.process = process
+                job.encoding_started_at = time.time()
             assert process.stdout is not None
             assert process.stderr is not None
 
@@ -2184,6 +2233,7 @@ class FrameExtractionJob:
         with self.lock:
             end_time = self.finished_at or time.time()
             start_time = self.started_at or self.created_at
+            elapsed_seconds = max(0.0, end_time - start_time)
             return {
                 "job_id": self.id,
                 "operation": "frames",
@@ -2194,7 +2244,12 @@ class FrameExtractionJob:
                 "output_path": str(self.output_path) if self.status == "completed" else None,
                 "error": self.error,
                 "message": self.message,
-                "elapsed_seconds": round(max(0.0, end_time - start_time), 1),
+                "elapsed_seconds": round(elapsed_seconds, 1),
+                "estimated_remaining_seconds": _estimated_progress_remaining_seconds(
+                    status=self.status,
+                    progress=self.progress,
+                    elapsed_seconds=elapsed_seconds,
+                ),
             }
 
 

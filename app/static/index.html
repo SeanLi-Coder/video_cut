@@ -350,12 +350,15 @@
             </div>
             <strong class="progress-percentage" id="export-progress-value">0%</strong>
           </div>
-          <div class="progress-track" id="export-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="progress-track" id="export-progress-track" role="progressbar" aria-label="任务处理进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0%，正在估算">
             <span id="export-progress-bar"></span>
           </div>
           <div class="progress-bottomline">
             <span id="export-progress-message">正在安全地创建新文件，请不要关闭此页面。</span>
-            <span id="export-elapsed"></span>
+            <span class="progress-timing">
+              <span id="export-elapsed"></span>
+              <span class="remaining-time" id="export-remaining"></span>
+            </span>
             <button class="text-button danger-text" id="cancel-export-button" type="button">取消导出</button>
           </div>
         </div>
@@ -423,13 +426,14 @@
               </div>
               <strong class="progress-percentage" id="model-progress-value">0%</strong>
             </div>
-            <div class="progress-track" id="model-progress-track" role="progressbar" aria-label="AI 模型下载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div class="progress-track" id="model-progress-track" role="progressbar" aria-label="AI 模型下载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0%，尚未开始">
               <span id="model-progress-bar"></span>
             </div>
             <div class="model-progress-meta">
               <span id="model-download-bytes">等待开始</span>
               <span id="model-download-speed"></span>
               <span id="model-download-elapsed"></span>
+              <span class="remaining-time" id="model-download-remaining"></span>
             </div>
             <p class="progress-message" id="model-progress-message" aria-live="polite" aria-atomic="true">正在检查 AI 运行环境和模型文件。</p>
           </div>

@@ -1,6 +1,6 @@
 [project]
 name = "local-video-cutter"
-version = "1.4.0"
+version = "1.4.1"
 description = "A one-click local video cutter, frame extractor, rotator, and AI enhancer for macOS"
 requires-python = ">=3.10"
 
