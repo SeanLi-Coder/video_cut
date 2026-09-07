@@ -46,6 +46,10 @@ RUNNER_ARCHIVE_URL = (
 RUNNER_ARCHIVE_SHA256 = "04c61842bc00fd8673e6bc9a3b1b1935955461f363791070ed14d67d2a2e77fb"
 RUNNER_PATCH_SHA256 = "bd92759faf0523658cf24ab280139a9217064cd21ae9d6b00e7f0992982a8775"
 
+MODEL_REPOSITORY = "numz/SeedVR2_comfyUI"
+MODEL_DOWNLOAD_URL = (
+    "https://huggingface.co/{repository}/resolve/main/{filename}"
+)
 MODEL_NAME = "SeedVR2 3B FP16"
 MODEL_FILENAME = "seedvr2_ema_3b_fp16.safetensors"
 MODEL_SHA256 = "2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"
@@ -53,6 +57,11 @@ MODEL_SIZE_BYTES = 6_783_018_808
 VAE_FILENAME = "ema_vae_fp16.safetensors"
 VAE_SHA256 = "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"
 VAE_SIZE_BYTES = 501_324_814
+MODEL_FILES = (
+    (MODEL_FILENAME, MODEL_SIZE_BYTES, MODEL_SHA256),
+    (VAE_FILENAME, VAE_SIZE_BYTES, VAE_SHA256),
+)
+MODEL_DOWNLOAD_SIZE_BYTES = sum(size for _, size, _ in MODEL_FILES)
 FIRST_MODEL_DOWNLOAD_GB = round((MODEL_SIZE_BYTES + VAE_SIZE_BYTES) / 1_000_000_000, 1)
 
 MINIMUM_RUNTIME_FREE_BYTES = 12 * 1024**3
@@ -297,6 +306,50 @@ class AIEnhancementJob:
             }
 
 
+@dataclass
+class AIModelDownloadJob:
+    id: str
+    status: str = "queued"
+    stage: str = "queued"
+    progress: float = 0.0
+    message: str = "等待准备 AI 模型"
+    error: str | None = None
+    downloaded_bytes: int = 0
+    total_bytes: int = field(default_factory=lambda: MODEL_DOWNLOAD_SIZE_BYTES)
+    download_speed_bps: float = 0.0
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    network_started_at: float | None = field(default=None, repr=False)
+    network_start_bytes: int = field(default=0, repr=False)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    process: subprocess.Popen[str] | None = field(default=None, repr=False)
+    worker: threading.Thread | None = field(default=None, repr=False)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            end_time = self.finished_at or time.time()
+            start_time = self.started_at or self.created_at
+            return {
+                "job_id": self.id,
+                "operation": "ai_model_download",
+                "status": self.status,
+                "stage": self.stage,
+                "progress": round(self.progress, 1),
+                "message": self.message,
+                "error": self.error,
+                "downloaded_bytes": self.downloaded_bytes,
+                "total_bytes": self.total_bytes,
+                "download_speed_bps": round(self.download_speed_bps),
+                "elapsed_seconds": round(max(0.0, end_time - start_time), 1),
+                "model": MODEL_NAME,
+            }
+
+
+AIWorkerJob = AIEnhancementJob | AIModelDownloadJob
+
+
 class AIEnhancementManager:
     def __init__(
         self,
@@ -320,8 +373,10 @@ class AIEnhancementManager:
         self.platform_supported = detected if platform_supported is None else platform_supported
         self.encoder_available = inference_runner is not None or self._has_encoder("libx265")
         self._jobs: dict[str, AIEnhancementJob] = {}
+        self._model_download_jobs: dict[str, AIModelDownloadJob] = {}
         self._lock = threading.RLock()
         self._active_job_id: str | None = None
+        self._latest_model_download_job_id: str | None = None
 
     @property
     def code_root(self) -> Path:
@@ -377,25 +432,84 @@ class AIEnhancementManager:
             and marker.get("patch_sha256") == RUNNER_PATCH_SHA256
         )
 
-    def _models_downloaded(self) -> bool:
-        expected = {
-            MODEL_FILENAME: (MODEL_SIZE_BYTES, MODEL_SHA256),
-            VAE_FILENAME: (VAE_SIZE_BYTES, VAE_SHA256),
-        }
+    @property
+    def model_validation_cache_path(self) -> Path:
+        return self.model_root / ".validation_cache.json"
+
+    def _model_validation_cache(self) -> dict[str, Any]:
         try:
-            cache = json.loads(
-                (self.model_root / ".validation_cache.json").read_text(encoding="utf-8")
-            )
+            cache = json.loads(self.model_validation_cache_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            cache = {}
-        for filename, (size, sha256) in expected.items():
+            return {}
+        return cache if isinstance(cache, dict) else {}
+
+    @staticmethod
+    def _model_cache_entry_matches(
+        path: Path,
+        entry: object,
+        *,
+        size: int,
+        sha256: str,
+    ) -> bool:
+        if path.is_symlink() or not path.is_file():
+            return False
+        try:
+            stat = path.stat()
+        except OSError:
+            return False
+        return bool(
+            stat.st_size == size
+            and isinstance(entry, dict)
+            and entry.get("hash") == sha256
+            and entry.get("size") == size
+            and isinstance(entry.get("mtime"), (int, float))
+            and float(entry["mtime"]) == stat.st_mtime
+        )
+
+    def _models_downloaded(self) -> bool:
+        cache = self._model_validation_cache()
+        for filename, size, sha256 in MODEL_FILES:
             path = self.model_root / filename
-            entry = cache.get(filename) if isinstance(cache, dict) else None
-            if not path.is_file() or path.stat().st_size != size:
-                return False
-            if isinstance(entry, dict) and entry.get("hash") not in {None, sha256}:
+            if not self._model_cache_entry_matches(
+                path,
+                cache.get(filename),
+                size=size,
+                sha256=sha256,
+            ):
                 return False
         return True
+
+    def _available_model_bytes(self) -> int:
+        cache = self._model_validation_cache()
+        downloaded = 0
+        for filename, size, sha256 in MODEL_FILES:
+            path = self.model_root / filename
+            if self._model_cache_entry_matches(
+                path,
+                cache.get(filename),
+                size=size,
+                sha256=sha256,
+            ):
+                downloaded += size
+                continue
+            if not path.is_symlink():
+                with contextlib.suppress(OSError):
+                    downloaded += min(size, max(0, path.stat().st_size))
+                    continue
+            partial = path.with_suffix(path.suffix + ".download")
+            if not partial.is_symlink():
+                with contextlib.suppress(OSError):
+                    downloaded += min(size, max(0, partial.stat().st_size))
+        return min(MODEL_DOWNLOAD_SIZE_BYTES, downloaded)
+
+    def _required_runtime_free_bytes(self, *, runtime_installed: bool) -> int:
+        remaining_models = max(0, MODEL_DOWNLOAD_SIZE_BYTES - self._available_model_bytes())
+        runtime_install = (
+            0
+            if runtime_installed
+            else max(0, MINIMUM_RUNTIME_FREE_BYTES - MODEL_DOWNLOAD_SIZE_BYTES)
+        )
+        return max(MINIMUM_OUTPUT_FREE_BYTES, remaining_models + runtime_install)
 
     def _memory_bytes(self) -> int | None:
         if sys.platform != "darwin":
@@ -425,6 +539,8 @@ class AIEnhancementManager:
             message = "SeedVR2 3B FP16 与 MPS 运行环境已就绪。"
         elif installed:
             message = f"首次处理会下载约 {FIRST_MODEL_DOWNLOAD_GB:.1f} GB 的已校验模型。"
+        elif models_downloaded:
+            message = "SeedVR2 3B FP16 已校验，仍需安装固定版本的 MPS 运行环境。"
         else:
             message = (
                 f"首次处理会自动安装独立 AI 环境，并下载约 {FIRST_MODEL_DOWNLOAD_GB:.1f} GB 模型。"
@@ -432,6 +548,12 @@ class AIEnhancementManager:
         return {
             "supported": self.platform_supported,
             "ready": self.platform_supported and self.encoder_available,
+            "prepared": (
+                self.platform_supported
+                and self.encoder_available
+                and installed
+                and models_downloaded
+            ),
             "installed": installed,
             "models_downloaded": models_downloaded,
             "model_name": MODEL_NAME,
@@ -443,6 +565,156 @@ class AIEnhancementManager:
             "memory_gb": round(memory / 1024**3) if memory else None,
             "message": message,
         }
+
+    def _active_job_locked(self) -> AIWorkerJob | None:
+        if self._active_job_id is None:
+            return None
+        active: AIWorkerJob | None = self._jobs.get(self._active_job_id)
+        if active is None:
+            active = self._model_download_jobs.get(self._active_job_id)
+        if active is None or active.snapshot()["status"] not in {"queued", "running"}:
+            self._active_job_id = None
+            return None
+        return active
+
+    def _model_download_snapshot(self, job: AIModelDownloadJob | None) -> dict[str, Any]:
+        snapshot = job.snapshot() if job is not None else None
+        runtime = self.runtime_status()
+        models_downloaded = bool(runtime["models_downloaded"])
+        prepared = bool(runtime["prepared"])
+        if snapshot is None:
+            downloaded_bytes = (
+                MODEL_DOWNLOAD_SIZE_BYTES
+                if self.inference_runner is not None
+                else self._available_model_bytes()
+            )
+            resumable = downloaded_bytes > 0 and not prepared
+            initial_status = "completed" if prepared else "cancelled" if resumable else "idle"
+            snapshot: dict[str, Any] = {
+                "job_id": None,
+                "operation": "ai_model_download",
+                "status": initial_status,
+                "stage": initial_status,
+                "progress": (
+                    100.0
+                    if prepared
+                    else round(downloaded_bytes / MODEL_DOWNLOAD_SIZE_BYTES * 98, 1)
+                ),
+                "message": (
+                    "SeedVR2 3B FP16 模型和 MPS 运行环境已经就绪。"
+                    if prepared
+                    else (
+                        "模型已经校验；点击准备按钮即可安装 MPS 运行环境。"
+                        if models_downloaded
+                        else (
+                            "检测到可续传的模型文件，点击继续下载即可恢复。"
+                            if resumable
+                            else "可以现在下载 AI 模型，无需先选择视频。"
+                        )
+                    )
+                ),
+                "error": None,
+                "downloaded_bytes": downloaded_bytes,
+                "total_bytes": MODEL_DOWNLOAD_SIZE_BYTES,
+                "download_speed_bps": 0,
+                "elapsed_seconds": 0.0,
+                "model": MODEL_NAME,
+            }
+        elif snapshot["status"] == "completed" and not prepared:
+            downloaded_bytes = self._available_model_bytes()
+            snapshot.update(
+                {
+                    "status": "cancelled" if downloaded_bytes > 0 else "idle",
+                    "stage": "cancelled" if downloaded_bytes > 0 else "idle",
+                    "progress": round(
+                        downloaded_bytes / MODEL_DOWNLOAD_SIZE_BYTES * 98,
+                        1,
+                    ),
+                    "message": "AI 模型或运行环境发生变化，请重新准备。",
+                    "error": None,
+                    "downloaded_bytes": downloaded_bytes,
+                    "download_speed_bps": 0,
+                }
+            )
+        snapshot.update(
+            {
+                "supported": runtime["supported"],
+                "installed": runtime["installed"],
+                "models_downloaded": models_downloaded,
+                "prepared": prepared,
+                "model_name": runtime["model_name"],
+                "first_download_gb": runtime["first_download_gb"],
+                "runtime": runtime,
+            }
+        )
+        return snapshot
+
+    def model_download_status(self) -> dict[str, Any]:
+        with self._lock:
+            job = (
+                self._model_download_jobs.get(self._latest_model_download_job_id)
+                if self._latest_model_download_job_id is not None
+                else None
+            )
+        return self._model_download_snapshot(job)
+
+    def start_model_download(self) -> dict[str, Any]:
+        if not self.platform_supported:
+            raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
+        if not self.encoder_available:
+            raise MediaError("Required FFmpeg encoder is not available: libx265")
+        with self._lock:
+            active = self._active_job_locked()
+            if isinstance(active, AIModelDownloadJob):
+                return self._model_download_snapshot(active)
+            if active is not None:
+                raise MediaError("Another AI enhancement job is already running")
+            prepared = self.inference_runner is not None or (
+                self._runtime_installed() and self._models_downloaded()
+            )
+            if prepared:
+                latest = (
+                    self._model_download_jobs.get(self._latest_model_download_job_id)
+                    if self._latest_model_download_job_id is not None
+                    else None
+                )
+                if latest is not None and latest.snapshot()["status"] == "completed":
+                    return self._model_download_snapshot(latest)
+                return self._model_download_snapshot(None)
+            job = AIModelDownloadJob(
+                id=uuid.uuid4().hex,
+                downloaded_bytes=self._available_model_bytes(),
+            )
+            self._model_download_jobs[job.id] = job
+            self._active_job_id = job.id
+            self._latest_model_download_job_id = job.id
+        worker = threading.Thread(target=self._run_model_download, args=(job,), daemon=True)
+        job.worker = worker
+        worker.start()
+        return self._model_download_snapshot(job)
+
+    def cancel_model_download(self, job_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            selected_id = job_id or self._latest_model_download_job_id
+            job = self._model_download_jobs.get(selected_id) if selected_id is not None else None
+        if job_id is not None and job is None:
+            raise MediaError("AI model download job was not found")
+        if job is None:
+            return self._model_download_snapshot(None)
+        with job.lock:
+            if job.status not in {"queued", "running"}:
+                return self._model_download_snapshot(job)
+            job.cancel_event.set()
+            process = job.process
+            job.message = "正在停止 AI 模型下载；已下载部分会保留以便续传"
+        if process is not None and process.poll() is None:
+            self._request_process_stop(process)
+            threading.Thread(
+                target=self._escalate_process_stop,
+                args=(process,),
+                daemon=True,
+            ).start()
+        return self._model_download_snapshot(job)
 
     def create(
         self,
@@ -491,10 +763,8 @@ class AIEnhancementManager:
             expected_height=expected_height,
         )
         with self._lock:
-            if self._active_job_id is not None:
-                active = self._jobs.get(self._active_job_id)
-                if active is not None and active.snapshot()["status"] in {"queued", "running"}:
-                    raise MediaError("Another AI enhancement job is already running")
+            if self._active_job_locked() is not None:
+                raise MediaError("Another AI enhancement job is already running")
             self._jobs[job.id] = job
             self._active_job_id = job.id
         worker = threading.Thread(target=self._run, args=(job,), daemon=True)
@@ -528,11 +798,15 @@ class AIEnhancementManager:
     def cancel_all(self) -> None:
         with self._lock:
             jobs = list(self._jobs.values())
+            model_download_jobs = list(self._model_download_jobs.values())
         for job in jobs:
             if job.snapshot()["status"] in {"queued", "running"}:
                 self.cancel(job.id)
+        for job in model_download_jobs:
+            if job.snapshot()["status"] in {"queued", "running"}:
+                self.cancel_model_download()
         deadline = time.monotonic() + 10
-        for job in jobs:
+        for job in [*jobs, *model_download_jobs]:
             worker = job.worker
             if worker is not None and worker.is_alive():
                 worker.join(timeout=max(0.0, deadline - time.monotonic()))
@@ -575,7 +849,7 @@ class AIEnhancementManager:
 
     def _set_job(
         self,
-        job: AIEnhancementJob,
+        job: AIWorkerJob,
         *,
         stage: str | None = None,
         progress: float | None = None,
@@ -589,43 +863,473 @@ class AIEnhancementManager:
             if message is not None:
                 job.message = message
 
-    def _download_archive(self, job: AIEnhancementJob, destination: Path) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
+    def _set_model_download_bytes(
+        self,
+        job: AIModelDownloadJob,
+        downloaded_bytes: int,
+        *,
+        network: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        with job.lock:
+            job.downloaded_bytes = min(job.total_bytes, max(0, downloaded_bytes))
+            job.progress = max(
+                job.progress,
+                min(97.0, 8 + job.downloaded_bytes / job.total_bytes * 89),
+            )
+            if network:
+                if job.network_started_at is None:
+                    job.network_started_at = now
+                    job.network_start_bytes = job.downloaded_bytes
+                elapsed = max(0.001, now - job.network_started_at)
+                transferred = max(0, job.downloaded_bytes - job.network_start_bytes)
+                job.download_speed_bps = transferred / elapsed
+
+    def _remove_model_cache_entry(self, filename: str) -> None:
+        cache = self._model_validation_cache()
+        if filename not in cache:
+            return
+        cache.pop(filename, None)
+        self._write_model_validation_cache(cache)
+
+    def _write_model_validation_cache(self, cache: dict[str, Any]) -> None:
+        self.model_root.mkdir(parents=True, exist_ok=True)
+        temporary = self.model_validation_cache_path.with_name(
+            f".{self.model_validation_cache_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            temporary.write_text(
+                json.dumps(cache, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.model_validation_cache_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _record_validated_model(self, path: Path, sha256: str) -> None:
+        stat = path.stat()
+        cache = self._model_validation_cache()
+        cache[path.name] = {
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+            "hash": sha256,
+        }
+        self._write_model_validation_cache(cache)
+
+    @staticmethod
+    def _model_file_sha256(job: AIWorkerJob, path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while True:
+                if job.cancel_event.is_set():
+                    raise InterruptedError
+                chunk = handle.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _transfer_model_file(
+        self,
+        job: AIModelDownloadJob,
+        *,
+        filename: str,
+        expected_size: int,
+        completed_bytes: int,
+    ) -> Path:
+        destination = self.model_root / filename
         partial = destination.with_suffix(destination.suffix + ".download")
-        existing = partial.stat().st_size if partial.is_file() else 0
+        try:
+            existing = partial.stat().st_size
+        except OSError:
+            existing = 0
+        if existing > expected_size:
+            partial.unlink(missing_ok=True)
+            existing = 0
+
         request = Request(
-            RUNNER_ARCHIVE_URL,
+            MODEL_DOWNLOAD_URL.format(repository=MODEL_REPOSITORY, filename=filename),
             headers={
-                "User-Agent": "local-video-cutter-ai-runtime",
+                "User-Agent": "local-video-cutter-ai-model",
                 **({"Range": f"bytes={existing}-"} if existing else {}),
             },
         )
+        with urlopen(request, timeout=30) as response:
+            status = int(getattr(response, "status", 200))
+            append = existing > 0 and status == 206
+            if append:
+                content_range = str(response.headers.get("Content-Range") or "")
+                match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", content_range.strip())
+                if (
+                    match is None
+                    or int(match.group(1)) != existing
+                    or int(match.group(3)) != expected_size
+                ):
+                    partial.unlink(missing_ok=True)
+                    raise URLError("invalid model download range response")
+            elif status == 200:
+                existing = 0
+            else:
+                raise URLError(f"unexpected model download response: HTTP {status}")
+
+            mode = "ab" if append else "wb"
+            downloaded = existing
+            self._set_model_download_bytes(
+                job,
+                completed_bytes + downloaded,
+                network=True,
+            )
+            with partial.open(mode) as handle:
+                while True:
+                    if job.cancel_event.is_set():
+                        raise InterruptedError
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded > expected_size:
+                        raise MediaError("The downloaded AI model failed integrity verification")
+                    self._set_model_download_bytes(
+                        job,
+                        completed_bytes + downloaded,
+                        network=True,
+                    )
+        if partial.stat().st_size != expected_size:
+            raise URLError("incomplete model download")
+        return partial
+
+    def _download_model_file(
+        self,
+        job: AIModelDownloadJob,
+        *,
+        filename: str,
+        expected_size: int,
+        expected_sha256: str,
+        completed_bytes: int,
+    ) -> None:
+        destination = self.model_root / filename
+        cache = self._model_validation_cache()
+        if self._model_cache_entry_matches(
+            destination,
+            cache.get(filename),
+            size=expected_size,
+            sha256=expected_sha256,
+        ):
+            self._set_model_download_bytes(job, completed_bytes + expected_size)
+            return
+
+        if destination.is_file() and not destination.is_symlink():
+            self._set_job(
+                job,
+                stage="verify",
+                message=f"正在校验已有模型文件：{filename}",
+            )
+            if (
+                destination.stat().st_size == expected_size
+                and self._model_file_sha256(job, destination) == expected_sha256
+            ):
+                self._record_validated_model(destination, expected_sha256)
+                self._set_model_download_bytes(job, completed_bytes + expected_size)
+                return
+        destination.unlink(missing_ok=True)
+        self._remove_model_cache_entry(filename)
+
+        integrity_failure = False
+        partial = destination.with_suffix(destination.suffix + ".download")
+        if partial.is_symlink():
+            partial.unlink(missing_ok=True)
+        elif partial.is_file() and partial.stat().st_size == expected_size:
+            self._set_job(
+                job,
+                stage="verify",
+                message=f"正在校验已下载模型：{filename}",
+            )
+            self._set_model_download_bytes(job, completed_bytes + expected_size)
+            if self._model_file_sha256(job, partial) == expected_sha256:
+                os.replace(partial, destination)
+                self._record_validated_model(destination, expected_sha256)
+                return
+            integrity_failure = True
+            partial.unlink(missing_ok=True)
+        for attempt in range(3):
+            if job.cancel_event.is_set():
+                raise InterruptedError
+            self._set_job(
+                job,
+                stage="download",
+                message=(
+                    f"正在下载 {MODEL_NAME}：{filename}"
+                    if attempt == 0
+                    else f"正在重试下载 {filename}（第 {attempt + 1} 次）"
+                ),
+            )
+            try:
+                partial = self._transfer_model_file(
+                    job,
+                    filename=filename,
+                    expected_size=expected_size,
+                    completed_bytes=completed_bytes,
+                )
+            except InterruptedError:
+                raise
+            except HTTPError as exc:
+                partial = destination.with_suffix(destination.suffix + ".download")
+                if exc.code == 416:
+                    partial.unlink(missing_ok=True)
+                if job.cancel_event.is_set():
+                    raise InterruptedError from exc
+                if attempt < 2:
+                    if job.cancel_event.wait(2 * (attempt + 1)):
+                        raise InterruptedError from exc
+                    continue
+                raise MediaError("Could not download the pinned AI model") from exc
+            except (OSError, URLError) as exc:
+                if job.cancel_event.is_set():
+                    raise InterruptedError from exc
+                if attempt < 2:
+                    if job.cancel_event.wait(2 * (attempt + 1)):
+                        raise InterruptedError from exc
+                    continue
+                raise MediaError("Could not download the pinned AI model") from exc
+            except MediaError:
+                integrity_failure = True
+                destination.with_suffix(destination.suffix + ".download").unlink(missing_ok=True)
+                if attempt < 2:
+                    continue
+                break
+
+            self._set_job(
+                job,
+                stage="verify",
+                message=f"正在进行完整 SHA-256 校验：{filename}",
+            )
+            if self._model_file_sha256(job, partial) != expected_sha256:
+                integrity_failure = True
+                partial.unlink(missing_ok=True)
+                with job.lock:
+                    job.network_started_at = None
+                    job.download_speed_bps = 0.0
+                if attempt < 2:
+                    continue
+                break
+            os.replace(partial, destination)
+            self._record_validated_model(destination, expected_sha256)
+            self._set_model_download_bytes(job, completed_bytes + expected_size)
+            return
+
+        if job.cancel_event.is_set():
+            raise InterruptedError
+        if integrity_failure:
+            raise MediaError("The downloaded AI model failed integrity verification")
+        raise MediaError("Could not download the pinned AI model")
+
+    def _download_models(self, job: AIModelDownloadJob) -> None:
+        self.model_root.mkdir(parents=True, exist_ok=True)
+        completed_bytes = 0
+        for filename, expected_size, expected_sha256 in MODEL_FILES:
+            self._download_model_file(
+                job,
+                filename=filename,
+                expected_size=expected_size,
+                expected_sha256=expected_sha256,
+                completed_bytes=completed_bytes,
+            )
+            completed_bytes += expected_size
+
+    def _finalize_complete_model_partials(self, job: AIWorkerJob) -> None:
+        self.model_root.mkdir(parents=True, exist_ok=True)
+        for filename, expected_size, expected_sha256 in MODEL_FILES:
+            destination = self.model_root / filename
+            partial = destination.with_suffix(destination.suffix + ".download")
+            if partial.is_symlink():
+                partial.unlink(missing_ok=True)
+                continue
+            try:
+                partial_size = partial.stat().st_size
+            except OSError:
+                continue
+            if partial_size > expected_size:
+                partial.unlink(missing_ok=True)
+                continue
+            if partial_size != expected_size:
+                continue
+            self._set_job(
+                job,
+                stage="download",
+                progress=8,
+                message=f"正在恢复并校验已下载模型：{filename}",
+            )
+            if self._model_file_sha256(job, partial) != expected_sha256:
+                partial.unlink(missing_ok=True)
+                continue
+            os.replace(partial, destination)
+            self._record_validated_model(destination, expected_sha256)
+
+    def _verify_all_models(self, job: AIModelDownloadJob) -> None:
+        for filename, expected_size, expected_sha256 in MODEL_FILES:
+            path = self.model_root / filename
+            self._set_job(
+                job,
+                stage="verify",
+                progress=98,
+                message=f"正在最终校验模型完整性：{filename}",
+            )
+            try:
+                valid = bool(
+                    not path.is_symlink()
+                    and path.is_file()
+                    and path.stat().st_size == expected_size
+                    and self._model_file_sha256(job, path) == expected_sha256
+                )
+            except InterruptedError:
+                raise
+            except OSError:
+                valid = False
+            if not valid:
+                path.unlink(missing_ok=True)
+                self._remove_model_cache_entry(filename)
+                raise MediaError("The downloaded AI model failed integrity verification")
+            self._record_validated_model(path, expected_sha256)
+
+    def _run_model_download(self, job: AIModelDownloadJob) -> None:
         try:
-            with urlopen(request, timeout=30) as response:
-                append = existing > 0 and getattr(response, "status", 200) == 206
-                total_header = int(response.headers.get("Content-Length") or 0)
-                total = (existing if append else 0) + total_header
-                mode = "ab" if append else "wb"
-                downloaded = existing if append else 0
-                with partial.open(mode) as handle:
-                    while True:
-                        if job.cancel_event.is_set():
-                            raise InterruptedError
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        handle.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            self._set_job(
-                                job,
-                                progress=1 + downloaded / total * 2,
-                                message="正在获取固定版本的 SeedVR2 运行器",
-                            )
+            if job.cancel_event.is_set():
+                raise InterruptedError
+            with job.lock:
+                job.status = "running"
+                job.stage = "setup"
+                job.message = "正在准备固定版本的 SeedVR2 MPS 运行环境"
+                job.started_at = time.time()
+            self._prepare_runtime(job)
+            if job.cancel_event.is_set():
+                raise InterruptedError
+            self._set_job(
+                job,
+                stage="download",
+                progress=8,
+                message=f"正在准备下载并校验约 {FIRST_MODEL_DOWNLOAD_GB:.1f} GB 模型",
+            )
+            self._download_models(job)
+            if job.cancel_event.is_set():
+                raise InterruptedError
+            self._set_job(
+                job,
+                stage="verify",
+                progress=98,
+                message="正在确认全部 AI 模型均已通过完整性校验",
+            )
+            self._verify_all_models(job)
+            if not self._models_downloaded():
+                raise MediaError("The downloaded AI model failed integrity verification")
+            with job.lock:
+                if job.cancel_event.is_set():
+                    raise InterruptedError
+                job.status = "completed"
+                job.stage = "completed"
+                job.progress = 100.0
+                job.downloaded_bytes = job.total_bytes
+                job.message = f"{MODEL_NAME} 模型和 MPS 运行环境已就绪"
+                job.finished_at = time.time()
         except InterruptedError:
-            raise
-        except (OSError, HTTPError, URLError) as exc:
-            raise MediaError("Could not download the pinned AI runtime") from exc
+            with job.lock:
+                job.status = "cancelled"
+                job.stage = "cancelled"
+                job.message = "AI 模型下载已取消；已下载部分已保留，可继续下载"
+                job.download_speed_bps = 0.0
+                job.finished_at = time.time()
+        except BaseException as exc:
+            with job.lock:
+                job.status = "failed"
+                job.stage = "failed"
+                job.error = str(exc) or exc.__class__.__name__
+                job.message = "AI 模型准备失败；已下载部分会保留以便重试"
+                job.download_speed_bps = 0.0
+                job.finished_at = time.time()
+        finally:
+            with job.lock:
+                process = job.process
+                job.process = None
+            if process is not None and process.poll() is None:
+                self._escalate_process_stop(process)
+            with self._lock:
+                if self._active_job_id == job.id:
+                    self._active_job_id = None
+
+    def _download_archive(self, job: AIWorkerJob, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_suffix(destination.suffix + ".download")
+        if partial.is_file() and self._file_sha256(partial) == RUNNER_ARCHIVE_SHA256:
+            os.replace(partial, destination)
+            return
+        for attempt in range(2):
+            if job.cancel_event.is_set():
+                raise InterruptedError
+            existing = partial.stat().st_size if partial.is_file() else 0
+            request = Request(
+                RUNNER_ARCHIVE_URL,
+                headers={
+                    "User-Agent": "local-video-cutter-ai-runtime",
+                    **({"Range": f"bytes={existing}-"} if existing else {}),
+                },
+            )
+            try:
+                with urlopen(request, timeout=30) as response:
+                    status = int(getattr(response, "status", 200))
+                    append = existing > 0 and status == 206
+                    if append:
+                        content_range = str(response.headers.get("Content-Range") or "")
+                        match = re.fullmatch(
+                            r"bytes\s+(\d+)-(\d+)/(\d+)", content_range.strip()
+                        )
+                        if match is None or int(match.group(1)) != existing:
+                            partial.unlink(missing_ok=True)
+                            raise URLError("invalid runtime download range response")
+                        total = int(match.group(3))
+                    elif status == 200:
+                        existing = 0
+                        total = int(response.headers.get("Content-Length") or 0)
+                    else:
+                        raise URLError(f"unexpected runtime response: HTTP {status}")
+                    mode = "ab" if append else "wb"
+                    downloaded = existing
+                    with partial.open(mode) as handle:
+                        while True:
+                            if job.cancel_event.is_set():
+                                raise InterruptedError
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                            downloaded += len(chunk)
+                            if total > 0:
+                                self._set_job(
+                                    job,
+                                    progress=1 + downloaded / total * 2,
+                                    message="正在获取固定版本的 SeedVR2 运行器",
+                                )
+                break
+            except InterruptedError:
+                raise
+            except HTTPError as exc:
+                if job.cancel_event.is_set():
+                    raise InterruptedError from exc
+                if exc.code == 416:
+                    if partial.is_file() and self._file_sha256(partial) == RUNNER_ARCHIVE_SHA256:
+                        os.replace(partial, destination)
+                        return
+                    partial.unlink(missing_ok=True)
+                    if attempt == 0:
+                        continue
+                raise MediaError("Could not download the pinned AI runtime") from exc
+            except (OSError, URLError) as exc:
+                if job.cancel_event.is_set():
+                    raise InterruptedError from exc
+                if attempt == 0:
+                    continue
+                raise MediaError("Could not download the pinned AI runtime") from exc
+        if job.cancel_event.is_set():
+            raise InterruptedError
         if self._file_sha256(partial) != RUNNER_ARCHIVE_SHA256:
             partial.unlink(missing_ok=True)
             raise MediaError("The downloaded AI runtime failed integrity verification")
@@ -668,7 +1372,7 @@ class AIEnhancementManager:
 
     def _run_process(
         self,
-        job: AIEnhancementJob,
+        job: AIWorkerJob,
         command: list[str],
         *,
         cwd: Path | None = None,
@@ -751,16 +1455,13 @@ class AIEnhancementManager:
         detail = re.sub(r"\x1b\[[0-9;]*m", "", detail)
         return f"AI 超清进程未完成：{detail[-500:]}"
 
-    def _prepare_runtime(self, job: AIEnhancementJob) -> None:
+    def _prepare_runtime(self, job: AIWorkerJob) -> None:
         if self.inference_runner is not None:
             return
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         runtime_installed = self._runtime_installed()
-        models_downloaded = self._models_downloaded()
-        if (
-            (not runtime_installed or not models_downloaded)
-            and shutil.disk_usage(self.runtime_root).free < MINIMUM_RUNTIME_FREE_BYTES
-        ):
+        required_free = self._required_runtime_free_bytes(runtime_installed=runtime_installed)
+        if shutil.disk_usage(self.runtime_root).free < required_free:
             raise MediaError("There is not enough free space for the AI runtime and models")
         if runtime_installed:
             return
@@ -1006,6 +1707,7 @@ class AIEnhancementManager:
                     message=f"正在用 {MODEL_NAME} 逐帧生成 {job.target.label} 画面",
                 )
 
+        self._finalize_complete_model_partials(job)
         command = self.inference_command(job, input_path, output_path)
         self._set_job(
             job,

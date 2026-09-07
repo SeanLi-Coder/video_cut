@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import io
+import json
+import os
 import subprocess
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -17,6 +22,7 @@ from app.ai_enhance import (
     RUNNER_PATCH_SHA256,
     AIEnhancementJob,
     AIEnhancementManager,
+    AIModelDownloadJob,
     AIResolutionTarget,
     ai_output_dimensions,
     ai_target_options,
@@ -33,6 +39,260 @@ def _source(path: Path, metadata: dict) -> VideoSource:
 
 def test_bundled_ai_patch_matches_integrity_pin() -> None:
     assert AIEnhancementManager._file_sha256(AI_PATCH_PATH) == RUNNER_PATCH_SHA256
+
+
+def test_model_ready_requires_exact_validation_cache(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    model_content = b"model"
+    vae_content = b"vae"
+    files = (
+        ("model.safetensors", len(model_content), hashlib.sha256(model_content).hexdigest()),
+        ("vae.safetensors", len(vae_content), hashlib.sha256(vae_content).hexdigest()),
+    )
+    monkeypatch.setattr(ai_module, "MODEL_FILES", files)
+    monkeypatch.setattr(
+        ai_module,
+        "MODEL_DOWNLOAD_SIZE_BYTES",
+        sum(size for _, size, _ in files),
+    )
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    manager.model_root.mkdir(parents=True)
+    (manager.model_root / files[0][0]).write_bytes(model_content)
+    (manager.model_root / files[1][0]).write_bytes(vae_content)
+
+    assert manager._models_downloaded() is False
+
+    manager.model_validation_cache_path.write_text(
+        json.dumps(
+            {
+                filename: {
+                    "size": size,
+                    "mtime": (manager.model_root / filename).stat().st_mtime,
+                    "hash": None,
+                }
+                for filename, size, _ in files
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert manager._models_downloaded() is False
+
+    for filename, _, sha256 in files:
+        manager._record_validated_model(manager.model_root / filename, sha256)
+    assert manager._models_downloaded() is True
+
+    corrupted = manager.model_root / files[0][0]
+    original_mtime = corrupted.stat().st_mtime
+    corrupted.write_bytes(b"wrong")
+    os.utime(corrupted, (original_mtime + 10, original_mtime + 10))
+    assert corrupted.stat().st_size == files[0][1]
+    assert manager._models_downloaded() is False
+
+
+def test_model_file_download_resumes_and_records_verified_hash(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    content = b"verified-model"
+    filename = "model.safetensors"
+    sha256 = hashlib.sha256(content).hexdigest()
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    manager.model_root.mkdir(parents=True)
+    partial = manager.model_root / f"{filename}.download"
+    partial.write_bytes(content[:4])
+
+    class Response(io.BytesIO):
+        status = 206
+        headers = {"Content-Range": f"bytes 4-{len(content) - 1}/{len(content)}"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    requests = []
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return Response(content[4:])
+
+    monkeypatch.setattr(ai_module, "urlopen", fake_urlopen)
+    job = AIModelDownloadJob(id="download", total_bytes=len(content))
+    manager._download_model_file(
+        job,
+        filename=filename,
+        expected_size=len(content),
+        expected_sha256=sha256,
+        completed_bytes=0,
+    )
+
+    destination = manager.model_root / filename
+    assert destination.read_bytes() == content
+    assert not partial.exists()
+    assert requests[0][0].get_header("Range") == "bytes=4-"
+    assert job.snapshot()["downloaded_bytes"] == len(content)
+    assert job.snapshot()["download_speed_bps"] >= 0
+    cache = json.loads(manager.model_validation_cache_path.read_text(encoding="utf-8"))
+    assert cache[filename]["hash"] == sha256
+
+
+def test_model_file_download_safely_restarts_when_server_ignores_range(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    content = b"complete-model"
+    filename = "model.safetensors"
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    manager.model_root.mkdir(parents=True)
+    partial = manager.model_root / f"{filename}.download"
+    partial.write_bytes(b"stale")
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {"Content-Length": str(len(content))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    monkeypatch.setattr(ai_module, "urlopen", lambda _request, timeout: Response(content))
+    job = AIModelDownloadJob(id="download", total_bytes=len(content))
+    manager._download_model_file(
+        job,
+        filename=filename,
+        expected_size=len(content),
+        expected_sha256=hashlib.sha256(content).hexdigest(),
+        completed_bytes=0,
+    )
+
+    assert (manager.model_root / filename).read_bytes() == content
+    assert not partial.exists()
+
+
+def test_complete_model_partial_is_verified_without_network(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    content = b"complete-model"
+    filename = "model.safetensors"
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    manager.model_root.mkdir(parents=True)
+    (manager.model_root / f"{filename}.download").write_bytes(content)
+
+    def unexpected_network(*_args, **_kwargs):
+        raise AssertionError("network should not be used for a complete verified partial")
+
+    monkeypatch.setattr(ai_module, "urlopen", unexpected_network)
+    job = AIModelDownloadJob(id="download", total_bytes=len(content))
+    manager._download_model_file(
+        job,
+        filename=filename,
+        expected_size=len(content),
+        expected_sha256=hashlib.sha256(content).hexdigest(),
+        completed_bytes=0,
+    )
+
+    assert (manager.model_root / filename).read_bytes() == content
+    assert job.snapshot()["downloaded_bytes"] == len(content)
+
+
+def test_model_download_cancelled_during_retry_is_not_reported_as_failure(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    manager.model_root.mkdir(parents=True)
+    job = AIModelDownloadJob(id="download", total_bytes=100)
+
+    def cancel_then_fail(*_args, **_kwargs):
+        job.cancel_event.set()
+        raise ai_module.URLError("network stopped")
+
+    monkeypatch.setattr(ai_module, "urlopen", cancel_then_fail)
+    with pytest.raises(InterruptedError):
+        manager._download_model_file(
+            job,
+            filename="model.safetensors",
+            expected_size=100,
+            expected_sha256="hash",
+            completed_bytes=0,
+        )
+
+
+def test_runtime_space_check_accounts_for_resumable_model_bytes(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    monkeypatch.setattr(ai_module, "MODEL_FILES", (("model.safetensors", 1_000, "hash"),))
+    monkeypatch.setattr(ai_module, "MODEL_DOWNLOAD_SIZE_BYTES", 1_000)
+    monkeypatch.setattr(ai_module, "MINIMUM_RUNTIME_FREE_BYTES", 1_500)
+    monkeypatch.setattr(ai_module, "MINIMUM_OUTPUT_FREE_BYTES", 10)
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+    )
+    manager.model_root.mkdir(parents=True)
+    (manager.model_root / "model.safetensors.download").write_bytes(b"x" * 800)
+    monkeypatch.setattr(manager, "_runtime_installed", lambda: True)
+
+    class DiskUsage:
+        free = 250
+
+    monkeypatch.setattr(ai_module.shutil, "disk_usage", lambda _path: DiskUsage())
+    assert manager._required_runtime_free_bytes(runtime_installed=True) == 200
+    resumable = manager.model_download_status()
+    assert resumable["status"] == "cancelled"
+    assert resumable["downloaded_bytes"] == 800
+    manager._prepare_runtime(AIModelDownloadJob(id="download", total_bytes=1_000))
 
 
 def test_ai_targets_preserve_aspect_ratio_and_never_downscale(
@@ -145,6 +405,34 @@ def test_runtime_archive_extraction_rejects_traversal(tmp_path: Path) -> None:
     assert not (tmp_path / "outside.txt").exists()
 
 
+def test_runtime_download_cancelled_during_retry_is_not_reported_as_failure(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    job = AIModelDownloadJob(id="download")
+    calls = 0
+
+    def cancel_then_fail(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        job.cancel_event.set()
+        raise ai_module.URLError("network stopped")
+
+    monkeypatch.setattr(ai_module, "urlopen", cancel_then_fail)
+    with pytest.raises(InterruptedError):
+        manager._download_archive(job, tmp_path / "runtime.zip")
+    assert calls == 1
+
+
 def test_ai_job_can_be_cancelled_without_leaving_partial_output(
     tmp_path: Path,
     sample_video: Path,
@@ -175,6 +463,214 @@ def test_ai_job_can_be_cancelled_without_leaving_partial_output(
     assert job.snapshot()["status"] == "cancelled"
     assert not job.output_path.exists()
     assert not list(tmp_path.glob("*.partial-*"))
+
+
+def test_running_ai_enhancement_blocks_model_download(
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source = _source(sample_video, probe_video(sample_video, ffprobe=ffprobe))
+    inference_started = threading.Event()
+
+    def wait_for_cancel(job: AIEnhancementJob, _output_path: Path) -> None:
+        inference_started.set()
+        while not job.cancel_event.wait(0.01):
+            pass
+
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=wait_for_cancel,
+    )
+    job = manager.create(source, target="1080p", output_directory=tmp_path)
+    assert inference_started.wait(5)
+    try:
+        with pytest.raises(MediaError, match="Another AI enhancement job is already running"):
+            manager.start_model_download()
+    finally:
+        manager.cancel(job.id)
+        assert job.worker is not None
+        job.worker.join(timeout=5)
+
+    assert job.snapshot()["status"] == "cancelled"
+
+
+def test_ai_model_download_api_starts_without_video_and_recovers_progress(
+    monkeypatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    model_content = b"model"
+    vae_content = b"vae"
+    files = (
+        ("model.safetensors", len(model_content), hashlib.sha256(model_content).hexdigest()),
+        ("vae.safetensors", len(vae_content), hashlib.sha256(vae_content).hexdigest()),
+    )
+    total_bytes = sum(size for _, size, _ in files)
+    monkeypatch.setattr(ai_module, "MODEL_FILES", files)
+    monkeypatch.setattr(ai_module, "MODEL_DOWNLOAD_SIZE_BYTES", total_bytes)
+
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+    )
+    state.ai_enhancements = manager
+    runtime_ready = False
+    download_started = threading.Event()
+    release_download = threading.Event()
+    download_calls = 0
+
+    def fake_runtime_installed() -> bool:
+        return runtime_ready
+
+    def fake_prepare_runtime(_job) -> None:
+        nonlocal runtime_ready
+        runtime_ready = True
+
+    def fake_download_models(job: AIModelDownloadJob) -> None:
+        nonlocal download_calls
+        download_calls += 1
+        manager._set_model_download_bytes(job, len(model_content), network=True)
+        download_started.set()
+        assert release_download.wait(5)
+        manager.model_root.mkdir(parents=True, exist_ok=True)
+        for (filename, _, sha256), content in zip(
+            files,
+            (model_content, vae_content),
+            strict=True,
+        ):
+            path = manager.model_root / filename
+            path.write_bytes(content)
+            manager._record_validated_model(path, sha256)
+        manager._set_model_download_bytes(job, total_bytes, network=True)
+
+    monkeypatch.setattr(manager, "_runtime_installed", fake_runtime_installed)
+    monkeypatch.setattr(manager, "_prepare_runtime", fake_prepare_runtime)
+    monkeypatch.setattr(manager, "_download_models", fake_download_models)
+
+    with TestClient(create_app(state)) as client:
+        bootstrap = client.get("/api/bootstrap").json()
+        headers = {"X-App-Token": bootstrap["app_token"]}
+        assert client.get("/api/ai-model-download").status_code == 403
+        idle = client.get("/api/ai-model-download", headers=headers).json()
+        assert idle["status"] == "idle"
+        assert idle["job_id"] is None
+
+        started = client.post("/api/ai-model-download", headers=headers)
+        assert started.status_code == 200, started.text
+        job_id = started.json()["job_id"]
+        assert job_id
+        assert download_started.wait(5)
+
+        progress = client.get("/api/ai-model-download", headers=headers).json()
+        assert progress["job_id"] == job_id
+        assert progress["status"] == "running"
+        assert progress["downloaded_bytes"] == len(model_content)
+        assert progress["total_bytes"] == total_bytes
+        assert progress["elapsed_seconds"] >= 0
+        assert progress["download_speed_bps"] >= 0
+
+        duplicate = client.post("/api/ai-model-download", headers=headers).json()
+        assert duplicate["job_id"] == job_id
+        assert download_calls == 1
+
+        source = _source(sample_video, probe_video(sample_video, ffprobe=ffprobe))
+        with pytest.raises(MediaError, match="Another AI enhancement"):
+            manager.create(source, target="1080p", output_directory=tmp_path)
+
+        release_download.set()
+        deadline = time.monotonic() + 5
+        completed: dict = {}
+        while time.monotonic() < deadline:
+            completed = client.get("/api/ai-model-download", headers=headers).json()
+            if completed["status"] == "completed":
+                break
+            time.sleep(0.01)
+
+        assert completed["status"] == "completed", completed
+        assert completed["progress"] == 100
+        assert completed["downloaded_bytes"] == total_bytes
+        assert completed["models_downloaded"] is True
+        assert completed["installed"] is True
+
+
+def test_ai_model_download_api_cancels_and_keeps_resumable_state(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    monkeypatch.setattr(ai_module, "MODEL_FILES", (("model.safetensors", 100, "hash"),))
+    monkeypatch.setattr(ai_module, "MODEL_DOWNLOAD_SIZE_BYTES", 100)
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+    )
+    state.ai_enhancements = manager
+    worker_started = threading.Event()
+
+    def wait_for_cancel(job: AIModelDownloadJob) -> None:
+        manager._set_model_download_bytes(job, 25, network=True)
+        worker_started.set()
+        while not job.cancel_event.wait(0.01):
+            pass
+        raise InterruptedError
+
+    monkeypatch.setattr(manager, "_prepare_runtime", lambda _job: None)
+    monkeypatch.setattr(manager, "_download_models", wait_for_cancel)
+
+    with TestClient(create_app(state)) as client:
+        token = client.get("/api/bootstrap").json()["app_token"]
+        headers = {"X-App-Token": token}
+        started = client.post("/api/ai-model-download", headers=headers).json()
+        assert started["job_id"]
+        assert worker_started.wait(5)
+
+        cancelling = client.post(
+            "/api/ai-model-download/cancel",
+            headers=headers,
+            json={"job_id": started["job_id"]},
+        )
+        assert cancelling.status_code == 200
+        assert cancelling.json()["job_id"] == started["job_id"]
+
+        unknown = client.post(
+            "/api/ai-model-download/cancel",
+            headers=headers,
+            json={"job_id": "missing"},
+        )
+        assert unknown.status_code == 400
+
+        deadline = time.monotonic() + 5
+        cancelled: dict = {}
+        while time.monotonic() < deadline:
+            cancelled = client.get("/api/ai-model-download", headers=headers).json()
+            if cancelled["status"] == "cancelled":
+                break
+            time.sleep(0.01)
+        assert cancelled["status"] == "cancelled", cancelled
+        assert cancelled["downloaded_bytes"] == 25
+        assert cancelled["models_downloaded"] is False
 
 
 def test_ai_api_creates_verified_10bit_video_and_copies_audio_packets(

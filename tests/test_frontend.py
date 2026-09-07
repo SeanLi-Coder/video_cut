@@ -18,6 +18,11 @@ def test_frontend_has_only_two_editable_text_parameters() -> None:
     assert 'id="mode-frames-button"' in html
     assert 'id="mode-rotate-button"' in html
     assert 'id="mode-enhance-button"' in html
+    assert 'id="video-workspace-tab"' in html
+    assert 'id="model-workspace-tab"' in html
+    assert 'role="tabpanel" aria-labelledby="model-workspace-tab"' in html
+    assert 'id="model-download-button"' in html
+    assert 'id="model-progress-track"' in html
     assert html.count('class="rotation-option"') == 4
     assert all(f'data-degrees="{degrees}"' in html for degrees in (90, 180, 270, 360))
     assert 'id="rotation-panel"' in html
@@ -77,3 +82,20 @@ def test_frontend_ai_mode_uses_local_quality_first_workflow() -> None:
     assert "data-ai-dimensions" in html
     assert "AI 任务可能仍在后台运行" in javascript
     assert "!state.video?.is_hdr" in javascript
+
+
+def test_frontend_has_independent_ai_model_download_manager() -> None:
+    javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    assert 'apiRequest("/api/ai-model-download")' in javascript
+    assert 'post("/api/ai-model-download")' in javascript
+    assert 'post("/api/ai-model-download/cancel", body)' in javascript
+    assert "function renderModelManager" in javascript
+    assert "function pollModelDownload" in javascript
+    assert "function switchWorkspace" in javascript
+    assert "modelDownloadIsActive()" in javascript
+    assert "download_speed_bps" in javascript
+    assert '["#ai-model", "#video"].includes(window.location.hash)' in javascript
+    assert 'role="tablist"' in html
+    assert 'aria-label="AI 模型下载进度"' in html
+    assert "不用选择视频" in html

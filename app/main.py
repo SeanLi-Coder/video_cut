@@ -77,6 +77,12 @@ class AIEnhancementRequest(BaseModel):
     target: Literal["1080p", "2k", "4k"]
 
 
+class AIModelDownloadCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+
+
 @dataclass(frozen=True)
 class PreviewSpec:
     source: VideoSource
@@ -157,7 +163,7 @@ def _user_media_error(exc: MediaError) -> str:
         "AI enhancement is only supported on Apple Silicon Mac": (
             "AI 超清只支持 Apple Silicon Mac，当前不会尝试 CUDA 或低质量替代模型。"
         ),
-        "Another AI enhancement job is already running": "一次只能运行一个 AI 超清任务。",
+        "Another AI enhancement job is already running": "一次只能运行一个 AI 模型下载或超清任务。",
         "AI enhancement job was not found": "找不到这次 AI 超清任务，请刷新页面后重试。",
         "AI enhancement requires baked-in video orientation": (
             "该视频仍带旋转标记，请先用“永久旋转”固化方向，再进行 AI 超清。"
@@ -207,6 +213,15 @@ def _user_media_error(exc: MediaError) -> str:
         ),
         "The downloaded AI runtime failed integrity verification": (
             "AI 运行器校验失败，已删除异常下载，请重试。"
+        ),
+        "Could not download the pinned AI model": (
+            "AI 模型下载失败，请检查网络后重试；已下载部分会保留以便续传。"
+        ),
+        "The downloaded AI model failed integrity verification": (
+            "AI 模型完整性校验失败，异常文件已删除，请重新下载。"
+        ),
+        "AI model download job was not found": (
+            "找不到这次 AI 模型下载任务，请刷新页面后重试。"
         ),
         "The bundled AI quality patch failed integrity verification": (
             "内置 MPS 质量补丁校验失败，请重新下载本项目。"
@@ -560,6 +575,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             else {
                 "supported": False,
                 "ready": False,
+                "prepared": False,
                 "installed": False,
                 "models_downloaded": False,
                 "model_name": "SeedVR2 3B FP16",
@@ -836,6 +852,39 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         except MediaError as exc:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
         return {"job_id": job.id, "output_name": job.output_path.name}
+
+    @app.get("/api/ai-model-download", dependencies=[Depends(require_app_token)])
+    def ai_model_download_status() -> dict[str, Any]:
+        if state.ai_enhancements is None:
+            raise HTTPException(status_code=503, detail="AI 超清尚未就绪。")
+        snapshot = state.ai_enhancements.model_download_status()
+        if snapshot.get("error"):
+            snapshot["error"] = _user_media_error(MediaError(str(snapshot["error"])))
+        return snapshot
+
+    @app.post("/api/ai-model-download", dependencies=[Depends(require_app_token)])
+    def start_ai_model_download() -> dict[str, Any]:
+        try:
+            if state.ai_enhancements is None:
+                raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
+            return state.ai_enhancements.start_model_download()
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
+
+    @app.post(
+        "/api/ai-model-download/cancel",
+        dependencies=[Depends(require_app_token)],
+    )
+    def cancel_ai_model_download(request: AIModelDownloadCancelRequest) -> dict[str, Any]:
+        try:
+            if state.ai_enhancements is None:
+                raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
+            snapshot = state.ai_enhancements.cancel_model_download(request.job_id)
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
+        if snapshot.get("error"):
+            snapshot["error"] = _user_media_error(MediaError(str(snapshot["error"])))
+        return snapshot
 
     def export_job(job_id: str):
         if state.exports is None:
