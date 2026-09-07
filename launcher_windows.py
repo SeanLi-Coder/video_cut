@@ -746,6 +746,7 @@ def launch(*, base_python: Path | None, preferred_port: int, no_browser: bool) -
         control_thread: threading.Thread | None = None
         control_shutdown = threading.Event()
         ready = False
+        verified_server_pid: int | None = None
 
         def handle_signal(_signum: int, _frame: object) -> None:
             stop_requested.set()
@@ -835,8 +836,14 @@ def launch(*, base_python: Path | None, preferred_port: int, no_browser: bool) -
                     and health.get("app_id") == APP_ID
                     and health.get("instance_id") == instance_id
                 ):
-                    ready = True
-                    break
+                    try:
+                        health_server_pid = int(health["server_pid"])
+                    except (KeyError, TypeError, ValueError):
+                        health_server_pid = 0
+                    if health_server_pid > 1:
+                        verified_server_pid = health_server_pid
+                        ready = True
+                        break
                 if stop_requested.wait(0.1):
                     break
             if stop_requested.is_set():
@@ -847,13 +854,14 @@ def launch(*, base_python: Path | None, preferred_port: int, no_browser: bool) -
                 raise LauncherError(
                     f"The local server exited during startup with code {process.returncode}"
                 )
+            assert verified_server_pid is not None
 
             _write_record(
                 {
                     "app_id": APP_ID,
                     "instance_id": instance_id,
                     "launcher_pid": os.getpid(),
-                    "server_pid": process.pid,
+                    "server_pid": verified_server_pid,
                     "phase": "running",
                     "port": port,
                     "control_port": control_port,

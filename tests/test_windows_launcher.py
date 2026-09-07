@@ -370,6 +370,7 @@ def test_windows_launch_uses_port_and_parent_pid_mode(monkeypatch, tmp_path: Pat
         lambda _port: {
             "app_id": launcher_windows.APP_ID,
             "instance_id": "test-instance",
+            "server_pid": 52_525,
         },
     )
 
@@ -389,6 +390,7 @@ def test_windows_launch_uses_port_and_parent_pid_mode(monkeypatch, tmp_path: Pat
         str(os.getpid()),
     ]
     assert records[-1]["phase"] == "running"
+    assert records[-1]["server_pid"] == 52_525
     assert records[-1]["control_port"] == 42_425
     assert captured_environment["VIDEO_CUT_AI_BASE_PYTHON"] == str(python)
 
