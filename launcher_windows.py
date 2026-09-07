@@ -5,7 +5,6 @@ import contextlib
 import hashlib
 import json
 import os
-import platform
 import secrets
 import shutil
 import signal
@@ -16,14 +15,15 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows uses launcher_windows.py
-    fcntl = None
+    import msvcrt
+except ImportError:  # pragma: no cover - imported by tests on non-Windows hosts
+    msvcrt = None
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_ROOT = PROJECT_ROOT / "data" / "runtime"
@@ -32,18 +32,10 @@ RECORD_PATH = RUNTIME_ROOT / "runtime.json"
 REQUIREMENTS_PATH = PROJECT_ROOT / "requirements.txt"
 VENV_ROOT = PROJECT_ROOT / ".venv"
 MARKER_PATH = VENV_ROOT / ".requirements.sha256"
-PROCESS_GUARD_PATH = PROJECT_ROOT / "process_guard.py"
 APP_ID = "com.seanli.local-video-cutter"
 DEFAULT_PORT = 8777
-MINIMUM_PYTHON = (3, 10)
-FFMPEG_FULL_PREFIXES = (
-    Path("/opt/homebrew/opt/ffmpeg-full"),
-    Path("/usr/local/opt/ffmpeg-full"),
-)
-MOLTEN_VK_PREFIXES = (
-    Path("/opt/homebrew/opt/molten-vk"),
-    Path("/usr/local/opt/molten-vk"),
-)
+PYTHON_PACKAGE_ID = "Python.Python.3.12"
+FFMPEG_PACKAGE_ID = "Gyan.FFmpeg"
 FFMPEG_FULL_SMOKE_FILTER = (
     "setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:"
     "colorspace=bt2020nc,"
@@ -66,17 +58,17 @@ class LauncherCancelled(LauncherError):
 
 
 def _venv_python() -> Path:
-    return VENV_ROOT / "bin" / "python"
+    return VENV_ROOT / "Scripts" / "python.exe"
 
 
-def _python_supported(executable: Path) -> bool:
+def _python_312_supported(executable: Path) -> bool:
     try:
         completed = subprocess.run(
             [
                 str(executable),
                 "-I",
                 "-c",
-                "import sys; raise SystemExit(sys.version_info < (3, 10))",
+                "import sys; raise SystemExit(sys.version_info[:2] != (3, 12))",
             ],
             check=False,
             capture_output=True,
@@ -87,69 +79,206 @@ def _python_supported(executable: Path) -> bool:
     return completed.returncode == 0
 
 
-def _stop_process_group(process: subprocess.Popen[Any]) -> None:
+def _python_from_py_launcher() -> Path | None:
+    py_launcher = shutil.which("py")
+    if not py_launcher:
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                py_launcher,
+                "-3.12",
+                "-I",
+                "-c",
+                "import sys; print(sys.executable)",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = completed.stdout.strip()
+    if completed.returncode != 0 or not value:
+        return None
+    candidate = Path(value)
+    return candidate.resolve() if _python_312_supported(candidate) else None
+
+
+def _python_candidates(initial: Path | None = None) -> list[Path]:
+    candidates: list[Path] = []
+    if initial is not None:
+        candidates.append(initial)
+    candidates.append(Path(sys.executable))
+    from_launcher = _python_from_py_launcher()
+    if from_launcher is not None:
+        candidates.append(from_launcher)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.append(
+            Path(local_app_data) / "Programs" / "Python" / "Python312" / "python.exe"
+        )
+    program_files = os.environ.get("PROGRAMFILES")
+    if program_files:
+        candidates.append(Path(program_files) / "Python312" / "python.exe")
+    for name in ("python", "python3"):
+        value = shutil.which(name)
+        if value:
+            candidates.append(Path(value))
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(str(candidate.absolute()))
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def _find_python_312(initial: Path | None = None) -> Path | None:
+    for candidate in _python_candidates(initial):
+        if candidate.is_file() and _python_312_supported(candidate):
+            return candidate.resolve()
+    return None
+
+
+def _winget_executable() -> str | None:
+    executable = shutil.which("winget")
+    if executable:
+        return executable
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidate = Path(local_app_data) / "Microsoft" / "WindowsApps" / "winget.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _creation_flags() -> int:
+    if sys.platform != "win32":
+        return 0
+    return int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+
+
+def _stop_process_tree(process: subprocess.Popen[Any]) -> None:
     if process.poll() is not None:
         return
-    with contextlib.suppress(OSError, ProcessLookupError):
-        os.killpg(process.pid, signal.SIGINT)
+    if sys.platform == "win32":
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        if process.poll() is None:
+            with contextlib.suppress(OSError):
+                process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=3)
+        return
+    with contextlib.suppress(OSError):
+        process.terminate()
     try:
         process.wait(timeout=3)
         return
     except subprocess.TimeoutExpired:
         pass
-    with contextlib.suppress(OSError, ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
-    try:
+    if process.poll() is None:
+        with contextlib.suppress(OSError):
+            process.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=2)
 
 
-def _run_owned(
-    command: list[str],
-    *,
-    stop_requested: threading.Event,
-    lock_fd: int,
-) -> int:
-    parent_pipe_read, parent_pipe_write = os.pipe()
-    os.set_inheritable(parent_pipe_read, True)
-    os.set_inheritable(lock_fd, True)
+def _run_owned(command: list[str], *, stop_requested: threading.Event) -> int:
     process = subprocess.Popen(
-        [
-            sys.executable,
-            str(PROCESS_GUARD_PATH),
-            str(parent_pipe_read),
-            *command,
-        ],
+        command,
         cwd=PROJECT_ROOT,
-        start_new_session=True,
-        pass_fds=(parent_pipe_read, lock_fd),
+        creationflags=_creation_flags(),
     )
-    os.close(parent_pipe_read)
     try:
         while process.poll() is None:
             if stop_requested.wait(0.1):
-                _stop_process_group(process)
+                _stop_process_tree(process)
                 raise LauncherCancelled("Startup was cancelled")
         return int(process.returncode or 0)
     finally:
-        with contextlib.suppress(OSError):
-            os.close(parent_pipe_write)
         if process.poll() is None:
-            _stop_process_group(process)
+            _stop_process_tree(process)
+
+
+def _install_winget_package(
+    package_id: str,
+    *,
+    stop_requested: threading.Event,
+) -> None:
+    winget = _winget_executable()
+    if not winget:
+        raise LauncherError(
+            "Windows Package Manager is required. Install App Installer from Microsoft Store, "
+            "then run start.bat again."
+        )
+    base_command = [
+        winget,
+        "install",
+        "--id",
+        package_id,
+        "--exact",
+        "--source",
+        "winget",
+        "--silent",
+        "--accept-package-agreements",
+        "--accept-source-agreements",
+        "--disable-interactivity",
+    ]
+    return_code = _run_owned(
+        [*base_command, "--scope", "user"],
+        stop_requested=stop_requested,
+    )
+    if return_code != 0:
+        return_code = _run_owned(base_command, stop_requested=stop_requested)
+    if return_code != 0:
+        raise LauncherError(f"Windows Package Manager could not install {package_id}")
+
+
+def _resolve_base_python(
+    initial: Path,
+    *,
+    stop_requested: threading.Event,
+) -> Path:
+    python = _find_python_312(initial)
+    if python is not None:
+        return python
+    print("Python 3.12 is missing. Installing it with Windows Package Manager...")
+    install_error: LauncherError | None = None
+    try:
+        _install_winget_package(PYTHON_PACKAGE_ID, stop_requested=stop_requested)
+    except LauncherError as exc:
+        # WinGet can return a non-zero "already installed/no upgrade" result.
+        # Re-detect before treating that result as a failed installation.
+        install_error = exc
+    python = _find_python_312()
+    if python is None:
+        if install_error is not None:
+            raise install_error
+        raise LauncherError(
+            "Python 3.12 was installed but could not be located. Close this window and run "
+            "start.bat again."
+        )
+    return python
 
 
 def _prepare_environment(
     base_python: Path,
     *,
     stop_requested: threading.Event,
-    lock_fd: int,
 ) -> Path:
     python = _venv_python()
-    if python.exists() and not _python_supported(python):
+    if python.exists() and not _python_312_supported(python):
         print("Rebuilding an incompatible local Python environment...")
         shutil.rmtree(VENV_ROOT)
     if not python.is_file():
@@ -157,10 +286,10 @@ def _prepare_environment(
         return_code = _run_owned(
             [str(base_python), "-m", "venv", str(VENV_ROOT)],
             stop_requested=stop_requested,
-            lock_fd=lock_fd,
         )
         if return_code != 0 or not python.is_file():
             raise LauncherError("The local Python environment could not be created")
+
     digest = hashlib.sha256(REQUIREMENTS_PATH.read_bytes()).hexdigest()
     marker = ""
     with contextlib.suppress(OSError):
@@ -185,7 +314,6 @@ def _prepare_environment(
                 str(REQUIREMENTS_PATH),
             ],
             stop_requested=stop_requested,
-            lock_fd=lock_fd,
         )
         if return_code != 0:
             raise LauncherError("Application dependencies could not be installed")
@@ -193,61 +321,69 @@ def _prepare_environment(
     return python
 
 
-def _find_ffmpeg_full(brew: str | None) -> tuple[Path, Path] | None:
-    prefixes = list(FFMPEG_FULL_PREFIXES)
-    if brew:
+def _candidate_ffmpeg_pairs() -> list[tuple[Path, Path]]:
+    candidates: list[tuple[Path, Path]] = []
+    path_ffmpeg = shutil.which("ffmpeg")
+    path_ffprobe = shutil.which("ffprobe")
+    if path_ffmpeg and path_ffprobe:
+        candidates.append((Path(path_ffmpeg), Path(path_ffprobe)))
+
+    search_roots: list[Path] = []
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        local_root = Path(local_app_data)
+        links = local_root / "Microsoft" / "WinGet" / "Links"
+        candidates.append((links / "ffmpeg.exe", links / "ffprobe.exe"))
+        search_roots.append(local_root / "Microsoft" / "WinGet" / "Packages")
+    program_data = os.environ.get("PROGRAMDATA")
+    if program_data:
+        search_roots.append(Path(program_data) / "Microsoft" / "WinGet" / "Packages")
+    program_files = os.environ.get("PROGRAMFILES")
+    if program_files:
+        machine_root = Path(program_files) / "WinGet"
+        candidates.append(
+            (machine_root / "Links" / "ffmpeg.exe", machine_root / "Links" / "ffprobe.exe")
+        )
+        search_roots.append(machine_root / "Packages")
+
+    for search_root in search_roots:
+        if not search_root.is_dir():
+            continue
+        for package_root in search_root.glob("Gyan.FFmpeg*"):
+            for ffmpeg in package_root.rglob("ffmpeg.exe"):
+                ffprobe = ffmpeg.with_name("ffprobe.exe")
+                candidates.append((ffmpeg, ffprobe))
+
+    unique: list[tuple[Path, Path]] = []
+    seen: set[tuple[str, str]] = set()
+    for ffmpeg, ffprobe in candidates:
+        key = (
+            os.path.normcase(str(ffmpeg.absolute())),
+            os.path.normcase(str(ffprobe.absolute())),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        if ffmpeg.is_file() and ffprobe.is_file():
+            unique.append((ffmpeg.resolve(), ffprobe.resolve()))
+    return unique
+
+
+def _ffmpeg_basic_check(ffmpeg: Path, ffprobe: Path) -> bool:
+    for executable in (ffmpeg, ffprobe):
         try:
             completed = subprocess.run(
-                [brew, "--prefix", "ffmpeg-full"],
+                [str(executable), "-version"],
                 check=False,
-                capture_output=True,
-                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 timeout=15,
             )
         except (OSError, subprocess.TimeoutExpired):
-            completed = None
-        if completed is not None and completed.returncode == 0:
-            value = completed.stdout.strip()
-            if value:
-                prefixes.insert(0, Path(value))
-    for prefix in prefixes:
-        full_ffmpeg = prefix / "bin" / "ffmpeg"
-        full_ffprobe = prefix / "bin" / "ffprobe"
-        if full_ffmpeg.is_file() and full_ffprobe.is_file():
-            return full_ffmpeg.resolve(), full_ffprobe.resolve()
-    return None
-
-
-def _find_molten_vk_icd(brew: str | None) -> Path | None:
-    prefixes = list(MOLTEN_VK_PREFIXES)
-    if brew:
-        try:
-            completed = subprocess.run(
-                [brew, "--prefix", "molten-vk"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            completed = None
-        if completed is not None and completed.returncode == 0:
-            value = completed.stdout.strip()
-            if value:
-                prefixes.insert(0, Path(value))
-    for prefix in prefixes:
-        candidate = prefix / "etc" / "vulkan" / "icd.d" / "MoltenVK_icd.json"
-        if candidate.is_file():
-            return candidate.resolve()
-    return None
-
-
-def _configure_molten_vk_environment(icd_path: Path | None) -> None:
-    if icd_path is None:
-        return
-    value = str(icd_path)
-    os.environ["VK_DRIVER_FILES"] = value
-    os.environ["VK_ICD_FILENAMES"] = value
+            return False
+        if completed.returncode != 0:
+            return False
+    return True
 
 
 def _ffmpeg_full_check(ffmpeg: Path) -> tuple[bool, str]:
@@ -272,132 +408,86 @@ def _ffmpeg_full_check(ffmpeg: Path) -> tuple[bool, str]:
         "null",
         "-",
     ]
-    detail = ""
-    for _attempt in range(2):
-        try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=45,
-            )
-        except subprocess.TimeoutExpired:
-            detail = "FFmpeg color-pipeline check timed out"
-            continue
-        except OSError as exc:
-            detail = str(exc)
-            continue
-        if completed.returncode == 0:
-            return True, ""
-        lines = completed.stderr.strip().splitlines()
-        detail = (
-            " | ".join(lines[-6:])[-1000:]
-            if lines
-            else f"exit code {completed.returncode}"
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=45,
         )
+    except subprocess.TimeoutExpired:
+        return False, "FFmpeg color-pipeline check timed out"
+    except OSError as exc:
+        return False, str(exc)
+    if completed.returncode == 0:
+        return True, ""
+    lines = completed.stderr.strip().splitlines()
+    detail = " | ".join(lines[-6:])[-1000:] if lines else f"exit code {completed.returncode}"
     return False, detail
 
 
-def _ffmpeg_full_usable(ffmpeg: Path) -> bool:
-    return _ffmpeg_full_check(ffmpeg)[0]
+def _find_media_executables() -> tuple[Path, Path, bool, str] | None:
+    fallback: tuple[Path, Path, bool, str] | None = None
+    for ffmpeg, ffprobe in _candidate_ffmpeg_pairs():
+        if not _ffmpeg_basic_check(ffmpeg, ffprobe):
+            continue
+        usable, detail = _ffmpeg_full_check(ffmpeg)
+        result = (ffmpeg, ffprobe, usable, detail)
+        if usable:
+            return result
+        if fallback is None or "Gyan.FFmpeg" in str(ffmpeg):
+            fallback = result
+    return fallback
 
 
-def _media_executables(
-    *,
-    stop_requested: threading.Event,
-    lock_fd: int,
-) -> tuple[Path, Path]:
-    apple_silicon = sys.platform == "darwin" and platform.machine().lower() in {
-        "arm64",
-        "aarch64",
-    }
-    brew = shutil.which("brew")
+def _media_executables(*, stop_requested: threading.Event) -> tuple[Path, Path]:
+    selected = _find_media_executables()
+    if selected is not None and selected[2]:
+        return selected[0], selected[1]
 
-    if apple_silicon:
-        full_paths = _find_ffmpeg_full(brew)
-        if full_paths is None and brew:
-            print("FFmpeg Full is required for AI video. Installing it with Homebrew...")
-            return_code = _run_owned(
-                [brew, "install", "ffmpeg-full"],
-                stop_requested=stop_requested,
-                lock_fd=lock_fd,
-            )
-            if return_code == 0:
-                full_paths = _find_ffmpeg_full(brew)
-
-        if full_paths is not None:
-            molten_vk_icd = _find_molten_vk_icd(brew)
-            if molten_vk_icd is None and brew:
-                print(
-                    "MoltenVK is required for libplacebo on macOS. "
-                    "Installing it with Homebrew..."
-                )
-                return_code = _run_owned(
-                    [brew, "install", "molten-vk"],
-                    stop_requested=stop_requested,
-                    lock_fd=lock_fd,
-                )
-                if return_code == 0:
-                    molten_vk_icd = _find_molten_vk_icd(brew)
-            _configure_molten_vk_environment(molten_vk_icd)
-            usable, detail = _ffmpeg_full_check(full_paths[0])
-            if not usable:
-                print(
-                    "FFmpeg Full was found, but its AI color-pipeline check failed. "
-                    f"The full binary will still be used. Detail: {detail}"
-                )
-            return full_paths
-
-        if brew:
-            print(
-                "FFmpeg Full could not be installed. Basic video tools will remain available."
-            )
-
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
-    if ffmpeg and ffprobe:
-        return Path(ffmpeg).resolve(), Path(ffprobe).resolve()
-    if brew:
-        print("FFmpeg is missing. Installing it with Homebrew...")
-        return_code = _run_owned(
-            [brew, "install", "ffmpeg"],
-            stop_requested=stop_requested,
-            lock_fd=lock_fd,
-        )
-        if return_code == 0:
-            ffmpeg = shutil.which("ffmpeg")
-            ffprobe = shutil.which("ffprobe")
-    if not ffmpeg or not ffprobe:
+    print("FFmpeg Full is missing. Installing it with Windows Package Manager...")
+    install_error: LauncherError | None = None
+    try:
+        _install_winget_package(FFMPEG_PACKAGE_ID, stop_requested=stop_requested)
+    except LauncherError as exc:
+        # A usable basic FFmpeg should keep the non-AI tools available even if
+        # WinGet cannot upgrade or relink its full build.
+        install_error = exc
+    selected = _find_media_executables()
+    if selected is None:
+        if install_error is not None:
+            raise install_error
         raise LauncherError(
-            "FFmpeg is required. Install Homebrew from https://brew.sh, "
-            "then run start.command again."
+            "FFmpeg was installed but could not be located. Close this window and run "
+            "start.bat again."
         )
-    return Path(ffmpeg).resolve(), Path(ffprobe).resolve()
+    if install_error is not None:
+        print(f"FFmpeg Full installation did not complete: {install_error}")
+    if not selected[2]:
+        print(
+            "FFmpeg was found, but its AI color-pipeline check failed. "
+            f"Basic video tools will remain available. Detail: {selected[3]}"
+        )
+    return selected[0], selected[1]
 
 
-def _bound_listener(preferred: int) -> socket.socket:
+def _available_port(preferred: int) -> int:
     for port in range(preferred, min(65_535, preferred + 39) + 1):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             listener.bind(("127.0.0.1", port))
-            listener.listen()
         except OSError:
-            listener.close()
             continue
-        listener.set_inheritable(True)
-        return listener
+        finally:
+            listener.close()
+        return port
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         listener.bind(("127.0.0.1", 0))
-        listener.listen()
-    except BaseException:
+        return int(listener.getsockname()[1])
+    finally:
         listener.close()
-        raise
-    listener.set_inheritable(True)
-    return listener
 
 
 def _health(port: int, timeout: float = 0.5) -> dict[str, Any] | None:
@@ -435,7 +525,6 @@ def _write_record(payload: dict[str, Any]) -> None:
     )
     temporary_path = Path(temporary_name)
     try:
-        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
             handle.write("\n")
@@ -449,11 +538,7 @@ def _write_record(payload: dict[str, Any]) -> None:
 def _open_browser(port: int) -> None:
     url = f"http://127.0.0.1:{port}"
     try:
-        subprocess.Popen(
-            ["/usr/bin/open", url],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        os.startfile(url)  # type: ignore[attr-defined]
     except OSError:
         print(f"Open this address in a browser: {url}")
 
@@ -515,12 +600,44 @@ def _close_control_channel(
         thread.join(timeout=1)
 
 
+def _prepare_lock_file() -> BinaryIO:
+    if msvcrt is None:
+        raise LauncherError("The Windows launcher can only run on Windows")
+    RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+    handle = LOCK_PATH.open("a+b")
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+    handle.seek(0)
+    return handle
+
+
+def _try_lock(lock_handle: BinaryIO) -> bool:
+    if msvcrt is None:
+        return False
+    lock_handle.seek(0)
+    try:
+        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock(lock_handle: BinaryIO) -> None:
+    if msvcrt is None:
+        return
+    lock_handle.seek(0)
+    with contextlib.suppress(OSError):
+        msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def _open_existing_instance(
     *,
-    lock_handle,
+    lock_handle: BinaryIO,
     no_browser: bool = False,
 ) -> bool:
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + 180
     waiting_reported = False
     while time.monotonic() < deadline:
         record = _read_record()
@@ -544,11 +661,7 @@ def _open_existing_instance(
             if record.get("phase") == "starting" and not waiting_reported:
                 print("Local Video Cutter is already starting. Waiting for it to become ready...")
                 waiting_reported = True
-        try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            pass
-        else:
+        if _try_lock(lock_handle):
             return False
         time.sleep(0.25)
     raise LauncherError("Another instance owns the project lock but did not become ready")
@@ -559,35 +672,10 @@ def _request_stop(port: int, token: str) -> None:
         f"http://127.0.0.1:{port}/api/runtime/stop",
         data=b"{}",
         method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "X-Stop-Token": token,
-        },
+        headers={"Content-Type": "application/json", "X-Stop-Token": token},
     )
     with contextlib.suppress(HTTPError, URLError, OSError, TimeoutError):
         urlopen(request, timeout=1).close()
-
-
-def _terminate_group(process: subprocess.Popen[Any]) -> None:
-    def group_exists() -> bool:
-        try:
-            os.killpg(process.pid, 0)
-        except (OSError, ProcessLookupError):
-            return False
-        return True
-
-    with contextlib.suppress(OSError, ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
-    deadline = time.monotonic() + 5
-    while group_exists() and time.monotonic() < deadline:
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=0.1)
-        time.sleep(0.05)
-    if group_exists():
-        with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=3)
 
 
 def _port_argument(value: str) -> int:
@@ -601,32 +689,32 @@ def _port_argument(value: str) -> int:
 
 
 def launch(*, base_python: Path, preferred_port: int, no_browser: bool) -> int:
-    RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
-    lock_handle = LOCK_PATH.open("a+")
+    lock_handle = _prepare_lock_file()
+    owns_lock = _try_lock(lock_handle)
     try:
-        try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not owns_lock:
             if _open_existing_instance(lock_handle=lock_handle, no_browser=no_browser):
                 return 0
+            owns_lock = True
 
         instance_id = secrets.token_hex(16)
         stop_token = secrets.token_urlsafe(32)
         stop_requested = threading.Event()
         process: subprocess.Popen[Any] | None = None
-        listener: socket.socket | None = None
-        parent_pipe_read: int | None = None
-        parent_pipe_write: int | None = None
         control_listener: socket.socket | None = None
         control_thread: threading.Thread | None = None
         control_shutdown = threading.Event()
+        ready = False
 
         def handle_signal(_signum: int, _frame: object) -> None:
             stop_requested.set()
 
+        handled_signals = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGBREAK"):
+            handled_signals.append(signal.SIGBREAK)
         previous_handlers = {
             handled_signal: signal.signal(handled_signal, handle_signal)
-            for handled_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+            for handled_signal in handled_signals
         }
         try:
             (
@@ -647,22 +735,16 @@ def launch(*, base_python: Path, preferred_port: int, no_browser: bool) -> int:
                     "stop_token": stop_token,
                 }
             )
-            python = _prepare_environment(
+            resolved_python = _resolve_base_python(
                 base_python,
                 stop_requested=stop_requested,
-                lock_fd=lock_handle.fileno(),
             )
-            ffmpeg, ffprobe = _media_executables(
-                stop_requested=stop_requested,
-                lock_fd=lock_handle.fileno(),
-            )
+            python = _prepare_environment(resolved_python, stop_requested=stop_requested)
+            ffmpeg, ffprobe = _media_executables(stop_requested=stop_requested)
             if stop_requested.is_set():
                 raise LauncherCancelled("Startup was cancelled")
-            listener = _bound_listener(preferred_port)
-            port = int(listener.getsockname()[1])
-            parent_pipe_read, parent_pipe_write = os.pipe()
-            os.set_inheritable(parent_pipe_read, True)
-            os.set_inheritable(lock_handle.fileno(), True)
+
+            port = _available_port(preferred_port)
             environment = dict(os.environ)
             environment.update(
                 {
@@ -673,24 +755,22 @@ def launch(*, base_python: Path, preferred_port: int, no_browser: bool) -> int:
                     "VIDEO_CUT_STOP_TOKEN": stop_token,
                 }
             )
+            environment["PATH"] = os.pathsep.join(
+                [str(ffmpeg.parent), environment.get("PATH", "")]
+            )
             process = subprocess.Popen(
                 [
                     str(python),
                     str(PROJECT_ROOT / "run.py"),
-                    "--socket-fd",
-                    str(listener.fileno()),
-                    "--parent-pipe-fd",
-                    str(parent_pipe_read),
+                    "--port",
+                    str(port),
+                    "--parent-pid",
+                    str(os.getpid()),
                 ],
                 cwd=PROJECT_ROOT,
                 env=environment,
-                start_new_session=True,
-                pass_fds=(listener.fileno(), parent_pipe_read, lock_handle.fileno()),
+                creationflags=_creation_flags(),
             )
-            os.close(parent_pipe_read)
-            parent_pipe_read = None
-            listener.close()
-            listener = None
             _write_record(
                 {
                     "app_id": APP_ID,
@@ -704,8 +784,8 @@ def launch(*, base_python: Path, preferred_port: int, no_browser: bool) -> int:
                     "stop_token": stop_token,
                 }
             )
-            deadline = time.monotonic() + 45
-            ready = False
+
+            deadline = time.monotonic() + 60
             while time.monotonic() < deadline and process.poll() is None:
                 health = _health(port)
                 if (
@@ -719,76 +799,67 @@ def launch(*, base_python: Path, preferred_port: int, no_browser: bool) -> int:
                     break
             if stop_requested.is_set():
                 raise LauncherCancelled("Startup was cancelled")
-            if not ready and process.poll() is None:
-                raise LauncherError("The local server did not become ready in time")
-            if ready:
-                _write_record(
-                    {
-                        "app_id": APP_ID,
-                        "instance_id": instance_id,
-                        "launcher_pid": os.getpid(),
-                        "server_pid": process.pid,
-                        "phase": "running",
-                        "port": port,
-                        "project_root": str(PROJECT_ROOT),
-                        "stop_token": stop_token,
-                    }
+            if not ready:
+                if process.poll() is None:
+                    raise LauncherError("The local server did not become ready in time")
+                raise LauncherError(
+                    f"The local server exited during startup with code {process.returncode}"
                 )
-                _close_control_channel(control_listener, control_thread, control_shutdown)
-                control_listener = None
-                control_thread = None
-                print(f"Local Video Cutter is ready at http://127.0.0.1:{port}")
-                if not no_browser:
-                    _open_browser(port)
+
+            _write_record(
+                {
+                    "app_id": APP_ID,
+                    "instance_id": instance_id,
+                    "launcher_pid": os.getpid(),
+                    "server_pid": process.pid,
+                    "phase": "running",
+                    "port": port,
+                    "control_port": control_port,
+                    "project_root": str(PROJECT_ROOT),
+                    "stop_token": stop_token,
+                }
+            )
+            print(f"Local Video Cutter is ready at http://127.0.0.1:{port}")
+            if not no_browser:
+                _open_browser(port)
+
             while process.poll() is None and not stop_requested.wait(0.25):
                 pass
+            if ready and process.poll() is not None and not stop_requested.is_set():
+                stop_requested.wait(0.5)
             if stop_requested.is_set() and process.poll() is None:
                 _request_stop(port, stop_token)
                 try:
-                    process.wait(timeout=6)
+                    process.wait(timeout=8)
                 except subprocess.TimeoutExpired:
-                    _terminate_group(process)
+                    _stop_process_tree(process)
             return_code = process.wait() if process.poll() is None else int(process.returncode or 0)
-            if stop_requested.is_set() or return_code in {-signal.SIGINT, -signal.SIGTERM}:
-                return 0
-            return return_code
+            return 0 if stop_requested.is_set() or return_code == 0 else return_code
         except LauncherCancelled:
             return 0
         finally:
             _close_control_channel(control_listener, control_thread, control_shutdown)
             for handled_signal, previous in previous_handlers.items():
                 signal.signal(handled_signal, previous)
-            if parent_pipe_write is not None:
-                with contextlib.suppress(OSError):
-                    os.close(parent_pipe_write)
-            if parent_pipe_read is not None:
-                with contextlib.suppress(OSError):
-                    os.close(parent_pipe_read)
-            if listener is not None:
-                listener.close()
             if process is not None:
-                _terminate_group(process)
+                _stop_process_tree(process)
             with contextlib.suppress(OSError):
                 current = _read_record()
                 if current and current.get("instance_id") == instance_id:
                     RECORD_PATH.unlink()
     finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        if owns_lock:
+            _unlock(lock_handle)
         lock_handle.close()
 
 
 def main(argv: list[str] | None = None) -> int:
-    if sys.platform == "win32":
-        from launcher_windows import main as windows_main
-
-        return windows_main(argv)
-    parser = argparse.ArgumentParser(description="Start the Local Video Cutter")
+    parser = argparse.ArgumentParser(description="Start the Local Video Cutter on Windows")
     parser.add_argument("--port", type=_port_argument, default=DEFAULT_PORT)
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args(argv)
-    if sys.version_info < MINIMUM_PYTHON:
-        print("Python 3.10 or newer is required.")
+    if sys.platform != "win32":
+        print("launcher_windows.py can only run on Windows.")
         return 1
     try:
         return launch(

@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -15,9 +16,39 @@ RECORD_PATH = PROJECT_ROOT / "data" / "runtime" / "runtime.json"
 APP_ID = "com.seanli.local-video-cutter"
 
 
+def _windows_pid_is_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.windll.kernel32
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_exit_code.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    handle = open_process(process_query_limited_information, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if not get_exit_code(handle, ctypes.byref(exit_code)):
+            return False
+        return exit_code.value == still_active
+    finally:
+        close_handle(handle)
+
+
 def _pid_is_alive(pid: int) -> bool:
     if pid <= 1:
         return False
+    if sys.platform == "win32":
+        return _windows_pid_is_alive(pid)
     try:
         os.kill(pid, 0)
     except (OSError, ProcessLookupError):
@@ -125,6 +156,8 @@ def main() -> int:
     if not response or response.get("instance_id") != instance_id:
         print("The verified server did not accept the stop request.")
         return 1
+    if "control_port" in record:
+        _request_starting_stop(record)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         health = _request_json(Request(f"http://127.0.0.1:{port}/api/health"), 0.25)

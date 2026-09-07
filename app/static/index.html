@@ -122,8 +122,8 @@
             <span class="file-play"></span>
           </div>
           <div class="source-empty-copy">
-            <strong>先从 Mac 中选一个视频</strong>
-            <span>将在 Finder 中打开文件选择窗口</span>
+            <strong>先从这台电脑中选一个视频</strong>
+            <span>将打开系统文件选择窗口</span>
           </div>
           <button class="button button-primary" id="select-video-button" type="button">
             <span class="button-spinner" aria-hidden="true"></span>
@@ -263,7 +263,7 @@
             <p class="ai-target-note" id="ai-target-note" aria-live="polite">选择视频后会自动推荐可用的目标清晰度。</p>
             <div class="ai-quality-note">
               <span aria-hidden="true">✦</span>
-              <p><strong>质量优先，预计会很慢</strong><br><span id="ai-runtime-inline-note">仅支持 Apple Silicon，全程本地处理；可以提前下载约 7.3 GB 模型。</span></p>
+              <p><strong>质量优先，预计会很慢</strong><br><span id="ai-runtime-inline-note">正在检测本机 AI 加速设备；可以提前下载约 7.3 GB 模型。</span></p>
               <button class="text-button ai-model-link" id="open-model-manager-button" type="button">管理 AI 模型</button>
             </div>
           </div>
@@ -373,7 +373,7 @@
             <span class="success-path" id="completed-output-path">—</span>
           </div>
           <div class="success-actions">
-            <button class="button button-primary button-compact" id="reveal-output-button" type="button">在 Finder 中显示</button>
+            <button class="button button-primary button-compact" id="reveal-output-button" type="button">在文件夹中显示</button>
             <button class="button button-secondary button-compact" id="continue-button" type="button">继续剪辑</button>
           </div>
         </div>
@@ -384,7 +384,7 @@
         <div class="model-hero">
           <p class="eyebrow">AI MODEL MANAGER</p>
           <h1>提前把 AI 模型准备好</h1>
-          <p>不用选择视频，也不用等到开始超清时才下载。模型只保存在这台 Mac，准备完成后所有视频都能直接使用。</p>
+          <p>不用选择视频，也不用等到开始超清时才下载。模型只保存在这台电脑，准备完成后所有视频都能直接使用。</p>
         </div>
 
         <article class="workflow-card model-manager-card" aria-labelledby="model-manager-heading">
@@ -395,7 +395,7 @@
             <div>
               <span class="model-kicker">默认且唯一的质量模型</span>
               <h2 id="model-manager-heading">SeedVR2 3B FP16</h2>
-              <p>时序视频增强模型，针对 Apple Silicon 的 MPS 路径准备。</p>
+              <p id="model-backend-description">时序视频增强模型，会按本机支持的 MPS 或 CUDA 路径准备。</p>
             </div>
             <span class="model-status-badge" id="model-status-badge" data-status="idle">正在检查</span>
           </div>
@@ -403,8 +403,8 @@
           <dl class="model-facts" aria-label="AI 模型信息">
             <div><dt>模型文件</dt><dd id="model-size-value">约 7.3 GB</dd></div>
             <div><dt>精度</dt><dd>FP16</dd></div>
-            <div><dt>运行设备</dt><dd>Apple Silicon · MPS</dd></div>
-            <div><dt>所需空间</dt><dd>至少约 12 GB</dd></div>
+            <div><dt>运行设备</dt><dd id="model-device-value">正在检测…</dd></div>
+            <div><dt>所需空间</dt><dd id="model-space-value">至少约 12 GB</dd></div>
           </dl>
 
           <div class="model-components" aria-label="准备状态">
@@ -457,7 +457,7 @@
         <div class="model-info-grid">
           <article>
             <span aria-hidden="true">01</span>
-            <div><strong>只需准备一次</strong><p>安装完成后会一直保留，下次双击 start.command 不会重复下载。</p></div>
+            <div><strong>只需准备一次</strong><p>安装完成后会一直保留，下次运行启动入口不会重复下载。</p></div>
           </article>
           <article>
             <span aria-hidden="true">02</span>

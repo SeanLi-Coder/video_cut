@@ -37,6 +37,8 @@ from .media import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNTIME_ROOT = PROJECT_ROOT / "data" / "ai"
 AI_REQUIREMENTS_PATH = PROJECT_ROOT / "requirements-ai.txt"
+AI_CUDA_REQUIREMENTS_PATH = PROJECT_ROOT / "requirements-ai-cuda.txt"
+AI_COMMON_REQUIREMENTS_PATH = PROJECT_ROOT / "requirements-ai-common.txt"
 AI_PATCH_PATH = PROJECT_ROOT / "vendor" / "seedvr2-mps-quality.patch"
 AI_COLOR_PATCH_PATH = PROJECT_ROOT / "vendor" / "seedvr2-color-input.patch"
 
@@ -68,6 +70,7 @@ MODEL_DOWNLOAD_SIZE_BYTES = sum(size for _, size, _ in MODEL_FILES)
 FIRST_MODEL_DOWNLOAD_GB = round((MODEL_SIZE_BYTES + VAE_SIZE_BYTES) / 1_000_000_000, 1)
 
 MINIMUM_RUNTIME_FREE_BYTES = 12 * 1024**3
+MINIMUM_CUDA_RUNTIME_FREE_BYTES = 18 * 1024**3
 MINIMUM_OUTPUT_FREE_BYTES = 512 * 1024**2
 MAX_ESTIMATED_REMAINING_SECONDS = 30 * 24 * 60 * 60
 AI_SDR_COLOR_FILTER_GRAPH = (
@@ -151,6 +154,248 @@ class AIResolutionTarget:
     label: str
     short_edge: int
     long_edge: int
+
+
+@dataclass(frozen=True)
+class AIComputeDevice:
+    backend: str
+    name: str
+    index: int = 0
+    uuid: str | None = None
+    memory_bytes: int | None = None
+    compute_capability: tuple[int, int] | None = None
+    driver_version: str | None = None
+
+
+def _parse_cuda_compute_capability(value: str) -> tuple[int, int] | None:
+    match = re.fullmatch(r"\s*(\d+)\.(\d+)\s*", value)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _numeric_version(value: str | None) -> tuple[int, ...]:
+    if not value:
+        return ()
+    return tuple(int(part) for part in re.findall(r"\d+", value))
+
+
+def _cuda_driver_supported(value: str | None) -> bool:
+    current = _numeric_version(value)
+    if not current:
+        return True
+    minimum = (580, 88) if sys.platform == "win32" else (580, 65, 6)
+    padded = current + (0,) * max(0, len(minimum) - len(current))
+    return padded[: len(minimum)] >= minimum
+
+
+def _nvidia_smi_executable() -> str | None:
+    candidate = shutil.which("nvidia-smi") or shutil.which("nvidia-smi.exe")
+    if candidate:
+        return candidate
+    if sys.platform == "win32":
+        fixed = Path(
+            os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        ) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"
+        if fixed.is_file():
+            return str(fixed)
+    return None
+
+
+def _detect_rtx_5090() -> AIComputeDevice | None:
+    executable = _nvidia_smi_executable()
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                executable,
+                "--query-gpu=index,uuid,name,memory.total,compute_cap,driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    for raw_line in completed.stdout.splitlines():
+        fields = [field.strip() for field in raw_line.split(",")]
+        if len(fields) != 6 or "RTX 5090" not in fields[2].upper():
+            continue
+        capability = _parse_cuda_compute_capability(fields[4])
+        if capability is None or capability < (12, 0):
+            continue
+        try:
+            index = int(fields[0])
+            memory_bytes = int(float(fields[3]) * 1024**2)
+        except ValueError:
+            continue
+        return AIComputeDevice(
+            backend="cuda",
+            name=fields[2],
+            index=index,
+            uuid=fields[1],
+            memory_bytes=memory_bytes,
+            compute_capability=capability,
+            driver_version=fields[5],
+        )
+    return None
+
+
+def _detect_compute_device() -> AIComputeDevice | None:
+    if sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}:
+        return AIComputeDevice(backend="mps", name="Apple Silicon")
+    if sys.platform in {"win32", "linux"}:
+        return _detect_rtx_5090()
+    return None
+
+
+_HUNK_HEADER = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
+)
+
+
+def _normalized_patch_line(value: str) -> str:
+    return re.sub(r"\s+", " ", value.rstrip("\r\n").strip())
+
+
+def _safe_patch_target(root: Path, header: str) -> Path:
+    value = header[4:].split("\t", 1)[0].strip()
+    parts = PurePosixPath(value).parts
+    if parts and parts[0] in {"a", "b"}:
+        parts = parts[1:]
+    if not parts or ".." in parts or PurePosixPath(*parts).is_absolute():
+        raise MediaError("The bundled AI patch contains an unsafe path")
+    target = (root / Path(*parts)).resolve()
+    resolved_root = root.resolve()
+    if resolved_root not in target.parents or target.is_symlink():
+        raise MediaError("The bundled AI patch contains an unsafe path")
+    return target
+
+
+def _parse_unified_patch(
+    patch_path: Path,
+    root: Path,
+) -> list[tuple[Path, list[tuple[int, int, int, list[tuple[str, str]]]]]]:
+    lines = patch_path.read_text(encoding="utf-8").splitlines()
+    files: list[tuple[Path, list[tuple[int, int, int, list[tuple[str, str]]]]]] = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].startswith("--- "):
+            index += 1
+            continue
+        if index + 1 >= len(lines) or not lines[index + 1].startswith("+++ "):
+            raise MediaError(f"Malformed bundled AI patch: {patch_path.name}")
+        target = _safe_patch_target(root, lines[index + 1])
+        index += 2
+        hunks: list[tuple[int, int, int, list[tuple[str, str]]]] = []
+        while index < len(lines):
+            match = _HUNK_HEADER.fullmatch(lines[index])
+            if match is None:
+                if lines[index].startswith(("diff --git ", "--- ")):
+                    break
+                index += 1
+                continue
+            old_start = int(match.group(1))
+            old_count = int(match.group(2) or 1)
+            new_count = int(match.group(4) or 1)
+            index += 1
+            body: list[tuple[str, str]] = []
+            seen_old = 0
+            seen_new = 0
+            while index < len(lines) and (seen_old < old_count or seen_new < new_count):
+                raw = lines[index]
+                if raw.startswith("\\ No newline at end of file"):
+                    index += 1
+                    continue
+                if raw == "":
+                    prefix, content = " ", ""
+                elif raw[0] in {" ", "+", "-"}:
+                    prefix, content = raw[0], raw[1:]
+                else:
+                    raise MediaError(f"Malformed bundled AI patch: {patch_path.name}")
+                body.append((prefix, content))
+                if prefix in {" ", "-"}:
+                    seen_old += 1
+                if prefix in {" ", "+"}:
+                    seen_new += 1
+                if seen_old > old_count or seen_new > new_count:
+                    raise MediaError(f"Malformed bundled AI patch: {patch_path.name}")
+                index += 1
+            if seen_old != old_count or seen_new != new_count:
+                missing_old = old_count - seen_old
+                missing_new = new_count - seen_new
+                if index == len(lines) and missing_old == missing_new and missing_old > 0:
+                    old_count = seen_old
+                    new_count = seen_new
+                else:
+                    raise MediaError(f"Incomplete bundled AI patch: {patch_path.name}")
+            hunks.append((old_start, old_count, new_count, body))
+        if not hunks:
+            raise MediaError(f"Bundled AI patch has no hunks: {patch_path.name}")
+        files.append((target, hunks))
+    if not files:
+        raise MediaError(f"Bundled AI patch has no files: {patch_path.name}")
+    return files
+
+
+def _hunk_matches(
+    source: list[str],
+    position: int,
+    old_lines: list[str],
+) -> bool:
+    if position < 0 or position + len(old_lines) > len(source):
+        return False
+    return all(
+        _normalized_patch_line(source[position + offset])
+        == _normalized_patch_line(expected)
+        for offset, expected in enumerate(old_lines)
+    )
+
+
+def _apply_unified_patch(patch_path: Path, root: Path) -> None:
+    for target, hunks in _parse_unified_patch(patch_path, root):
+        if not target.is_file():
+            raise MediaError(f"Bundled AI patch target is missing: {target.name}")
+        source = target.read_bytes().decode("utf-8").splitlines(keepends=True)
+        offset = 0
+        minimum_position = 0
+        for old_start, old_count, new_count, body in hunks:
+            old_lines = [content for prefix, content in body if prefix in {" ", "-"}]
+            expected_position = max(minimum_position, old_start - 1 + offset)
+            if _hunk_matches(source, expected_position, old_lines):
+                position = expected_position
+            else:
+                candidates = [
+                    candidate
+                    for candidate in range(minimum_position, len(source) - len(old_lines) + 1)
+                    if _hunk_matches(source, candidate, old_lines)
+                ]
+                if not candidates:
+                    raise MediaError(
+                        f"Bundled AI patch does not match pinned runner: {patch_path.name}"
+                    )
+                position = min(candidates, key=lambda candidate: abs(candidate - expected_position))
+            replacement: list[str] = []
+            cursor = position
+            for prefix, content in body:
+                if prefix == " ":
+                    replacement.append(source[cursor])
+                    cursor += 1
+                elif prefix == "-":
+                    cursor += 1
+                else:
+                    replacement.append(content + "\n")
+            if cursor - position != old_count or len(replacement) != new_count:
+                raise MediaError(f"Malformed bundled AI patch: {patch_path.name}")
+            source[position:cursor] = replacement
+            offset += new_count - old_count
+            minimum_position = position + len(replacement)
+        target.write_bytes("".join(source).encode("utf-8"))
 
 
 AI_TARGETS: dict[str, AIResolutionTarget] = {
@@ -577,6 +822,11 @@ class AIEnhancementManager:
         runtime_root: Path = DEFAULT_RUNTIME_ROOT,
         base_python: str | None = None,
         platform_supported: bool | None = None,
+        compute_backend: str | None = None,
+        device_name: str | None = None,
+        device_index: int = 0,
+        device_uuid: str | None = None,
+        device_memory_bytes: int | None = None,
         inference_runner: InferenceRunner | None = None,
     ) -> None:
         self.ffmpeg = str(Path(ffmpeg).resolve())
@@ -584,10 +834,44 @@ class AIEnhancementManager:
         self.runtime_root = runtime_root.expanduser().resolve()
         self.base_python = str(Path(base_python or sys.executable).resolve())
         self.inference_runner = inference_runner
-        detected = sys.platform == "darwin" and platform.machine().lower() in {
-            "arm64",
-            "aarch64",
-        }
+        detected_device = _detect_compute_device() if compute_backend is None else None
+        selected_backend = compute_backend or (
+            detected_device.backend if detected_device is not None else None
+        )
+        if selected_backend is None and platform_supported is True:
+            selected_backend = "mps"
+        if selected_backend not in {None, "mps", "cuda"}:
+            raise ValueError(f"Unsupported AI compute backend: {selected_backend}")
+        self.compute_backend = selected_backend
+        self.device_name = device_name or (
+            detected_device.name
+            if detected_device is not None
+            else "Apple Silicon"
+            if selected_backend == "mps"
+            else "NVIDIA GeForce RTX 5090"
+            if selected_backend == "cuda"
+            else None
+        )
+        self.device_index = (
+            detected_device.index if detected_device is not None else int(device_index)
+        )
+        self.device_uuid = detected_device.uuid if detected_device is not None else device_uuid
+        self.device_memory_bytes = (
+            detected_device.memory_bytes
+            if detected_device is not None
+            else device_memory_bytes
+        )
+        self.compute_capability = (
+            detected_device.compute_capability if detected_device is not None else None
+        )
+        self.driver_version = (
+            detected_device.driver_version if detected_device is not None else None
+        )
+        self.hardware_detected = detected_device is not None
+        self.driver_supported = (
+            selected_backend != "cuda" or _cuda_driver_supported(self.driver_version)
+        )
+        detected = detected_device is not None or compute_backend is not None
         self.platform_supported = detected if platform_supported is None else platform_supported
         self.encoder_available = inference_runner is not None or self._has_encoder("libx265")
         self.color_pipeline_error: str | None = None
@@ -606,7 +890,25 @@ class AIEnhancementManager:
 
     @property
     def venv_python(self) -> Path:
+        if sys.platform == "win32":
+            return self.runtime_root / "venv" / "Scripts" / "python.exe"
         return self.runtime_root / "venv" / "bin" / "python"
+
+    @property
+    def backend_label(self) -> str:
+        if self.compute_backend == "cuda":
+            return "NVIDIA CUDA 13.0"
+        if self.compute_backend == "mps":
+            return "Apple Silicon · MPS"
+        return "Unavailable"
+
+    @property
+    def runtime_requirements_path(self) -> Path:
+        return (
+            AI_CUDA_REQUIREMENTS_PATH
+            if self.compute_backend == "cuda"
+            else AI_REQUIREMENTS_PATH
+        )
 
     @property
     def model_root(self) -> Path:
@@ -696,7 +998,16 @@ class AIEnhancementManager:
     def _runtime_fingerprint(self) -> str:
         digest = hashlib.sha256()
         digest.update(RUNNER_REVISION.encode("ascii"))
-        for path in (AI_REQUIREMENTS_PATH, AI_PATCH_PATH, AI_COLOR_PATCH_PATH):
+        digest.update((self.compute_backend or "unsupported").encode("ascii"))
+        digest.update(sys.platform.encode("ascii"))
+        digest.update(platform.machine().lower().encode("ascii", errors="ignore"))
+        digest.update(f"{sys.version_info.major}.{sys.version_info.minor}".encode("ascii"))
+        for path in (
+            self.runtime_requirements_path,
+            AI_COMMON_REQUIREMENTS_PATH,
+            AI_PATCH_PATH,
+            AI_COLOR_PATCH_PATH,
+        ):
             try:
                 digest.update(path.read_bytes())
             except OSError:
@@ -713,6 +1024,7 @@ class AIEnhancementManager:
         return bool(
             marker.get("fingerprint") == self._runtime_fingerprint()
             and marker.get("runner_revision") == RUNNER_REVISION
+            and marker.get("backend") == self.compute_backend
             and marker.get("patch_sha256") == RUNNER_PATCH_SHA256
             and marker.get("color_patch_sha256") == RUNNER_COLOR_PATCH_SHA256
         )
@@ -789,14 +1101,21 @@ class AIEnhancementManager:
 
     def _required_runtime_free_bytes(self, *, runtime_installed: bool) -> int:
         remaining_models = max(0, MODEL_DOWNLOAD_SIZE_BYTES - self._available_model_bytes())
+        minimum_runtime_bytes = (
+            MINIMUM_CUDA_RUNTIME_FREE_BYTES
+            if self.compute_backend == "cuda"
+            else MINIMUM_RUNTIME_FREE_BYTES
+        )
         runtime_install = (
             0
             if runtime_installed
-            else max(0, MINIMUM_RUNTIME_FREE_BYTES - MODEL_DOWNLOAD_SIZE_BYTES)
+            else max(0, minimum_runtime_bytes - MODEL_DOWNLOAD_SIZE_BYTES)
         )
         return max(MINIMUM_OUTPUT_FREE_BYTES, remaining_models + runtime_install)
 
     def _memory_bytes(self) -> int | None:
+        if self.compute_backend == "cuda":
+            return self.device_memory_bytes
         if sys.platform != "darwin":
             return None
         try:
@@ -817,27 +1136,40 @@ class AIEnhancementManager:
         models_downloaded = self.inference_runner is not None or self._models_downloaded()
         memory = self._memory_bytes()
         if not self.platform_supported:
-            message = "AI 超清仅支持 Apple Silicon Mac；不会尝试 CUDA 路径。"
+            message = (
+                "未检测到 Apple Silicon MPS 或 NVIDIA GeForce RTX 5090。"
+                "基础剪辑功能仍可使用。"
+            )
+        elif not self.driver_supported:
+            message = (
+                f"当前 NVIDIA 驱动 {self.driver_version or 'unknown'} 过旧；"
+                "RTX 5090 的 PyTorch CUDA 13.0 路径需要 R580 或更高版本。"
+            )
         elif not self.encoder_available:
             message = "当前 FFmpeg 缺少 libx265，无法生成质量优先的 10-bit 成片。"
         elif not self.color_pipeline_available:
             detail = str(self.color_pipeline_error or "").lower()
-            if "vulkan" in detail or "vk_error" in detail:
+            if self.compute_backend == "mps" and (
+                "vulkan" in detail or "vk_error" in detail
+            ):
                 message = (
                     "当前 Mac 无法加载 Vulkan→Metal 驱动；请运行 "
                     "brew install molten-vk 后重新启动。"
                 )
             else:
                 message = (
-                    "FFmpeg Full 的 AI 色彩链路检测失败。请重新运行 start.command；"
+                    "FFmpeg Full 的 AI 色彩链路检测失败。请重新运行启动脚本；"
                     f"检测详情：{self.color_pipeline_error or 'unknown error'}"
                 )
         elif installed and models_downloaded:
-            message = "SeedVR2 3B FP16 与 MPS 运行环境已就绪。"
+            message = f"SeedVR2 3B FP16 与 {self.backend_label} 运行环境已就绪。"
         elif installed:
             message = f"首次处理会下载约 {FIRST_MODEL_DOWNLOAD_GB:.1f} GB 的已校验模型。"
         elif models_downloaded:
-            message = "SeedVR2 3B FP16 已校验，仍需安装固定版本的 MPS 运行环境。"
+            message = (
+                f"SeedVR2 3B FP16 已校验，仍需安装固定版本的 {self.backend_label} "
+                "运行环境。"
+            )
         else:
             message = (
                 f"首次处理会自动安装独立 AI 环境，并下载约 {FIRST_MODEL_DOWNLOAD_GB:.1f} GB 模型。"
@@ -846,11 +1178,13 @@ class AIEnhancementManager:
             "supported": self.platform_supported,
             "ready": (
                 self.platform_supported
+                and self.driver_supported
                 and self.encoder_available
                 and self.color_pipeline_available
             ),
             "prepared": (
                 self.platform_supported
+                and self.driver_supported
                 and self.encoder_available
                 and self.color_pipeline_available
                 and installed
@@ -863,9 +1197,29 @@ class AIEnhancementManager:
             "precision": "FP16",
             "runner_version": RUNNER_VERSION,
             "runner_revision": RUNNER_REVISION,
+            "backend": self.compute_backend,
+            "backend_label": self.backend_label,
+            "device_name": self.device_name,
+            "device_index": self.device_index if self.compute_backend == "cuda" else None,
+            "device_memory_gb": round(memory / 1024**3, 1) if memory else None,
+            "compute_capability": (
+                ".".join(str(part) for part in self.compute_capability)
+                if self.compute_capability is not None
+                else None
+            ),
+            "driver_version": self.driver_version,
+            "driver_supported": self.driver_supported,
+            "hardware_detected": self.hardware_detected,
+            "hardware_verified": bool(self.hardware_detected and installed),
             "color_pipeline": "libplacebo + zscale, 16-bit sRGB / BT.2446A to BT.709 SDR",
             "color_pipeline_available": self.color_pipeline_available,
             "first_download_gb": FIRST_MODEL_DOWNLOAD_GB,
+            "minimum_runtime_free_gb": (
+                MINIMUM_CUDA_RUNTIME_FREE_BYTES
+                if self.compute_backend == "cuda"
+                else MINIMUM_RUNTIME_FREE_BYTES
+            )
+            / 1024**3,
             "memory_gb": round(memory / 1024**3) if memory else None,
             "message": message,
         }
@@ -921,13 +1275,13 @@ class AIEnhancementManager:
                     else round(downloaded_bytes / MODEL_DOWNLOAD_SIZE_BYTES * 98, 1)
                 ),
                 "message": (
-                    "SeedVR2 3B FP16 模型和 MPS 运行环境已经就绪。"
+                    f"SeedVR2 3B FP16 模型和 {self.backend_label} 运行环境已经就绪。"
                     if prepared
                     else (
                         str(runtime["message"])
                         if runtime_unavailable
                         else (
-                            "模型已经校验；点击按钮即可安装或更新 MPS 运行环境。"
+                            f"模型已经校验；点击按钮即可安装或更新 {self.backend_label} 运行环境。"
                             if requires_runtime_update
                             else (
                                 "检测到可续传的模型文件，点击继续下载即可恢复。"
@@ -1003,7 +1357,9 @@ class AIEnhancementManager:
 
     def start_model_download(self) -> dict[str, Any]:
         if not self.platform_supported:
-            raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
+            raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
+        if not self.driver_supported:
+            raise MediaError("NVIDIA driver R580 or newer is required for RTX 5090")
         if not self.encoder_available:
             raise MediaError("Required FFmpeg encoder is not available: libx265")
         if not self.color_pipeline_available:
@@ -1069,7 +1425,9 @@ class AIEnhancementManager:
         output_directory: Path,
     ) -> AIEnhancementJob:
         if not self.platform_supported:
-            raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
+            raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
+        if not self.driver_supported:
+            raise MediaError("NVIDIA driver R580 or newer is required for RTX 5090")
         if not self.encoder_available:
             raise MediaError("Required FFmpeg encoder is not available: libx265")
         if not self.color_pipeline_available:
@@ -1169,11 +1527,16 @@ class AIEnhancementManager:
         if process.poll() is not None:
             return
         try:
-            if sys.platform != "win32":
-                os.killpg(process.pid, signal.SIGINT)
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    check=False,
+                    capture_output=True,
+                    timeout=10,
+                )
             else:
-                process.terminate()
-        except (OSError, ProcessLookupError):
+                os.killpg(process.pid, signal.SIGINT)
+        except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
             return
 
     @classmethod
@@ -1192,11 +1555,17 @@ class AIEnhancementManager:
         try:
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            with contextlib.suppress(OSError, ProcessLookupError):
-                if sys.platform != "win32":
+            if sys.platform == "win32":
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        check=False,
+                        capture_output=True,
+                        timeout=10,
+                    )
+            else:
+                with contextlib.suppress(OSError, ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=2)
 
@@ -1554,7 +1923,7 @@ class AIEnhancementManager:
             with job.lock:
                 job.status = "running"
                 job.stage = "setup"
-                job.message = "正在准备固定版本的 SeedVR2 MPS 运行环境"
+                job.message = f"正在准备固定版本的 SeedVR2 {self.backend_label} 运行环境"
                 job.started_at = time.time()
             self._prepare_runtime(job)
             if job.cancel_event.is_set():
@@ -1584,7 +1953,7 @@ class AIEnhancementManager:
                 job.stage = "completed"
                 job.progress = 100.0
                 job.downloaded_bytes = job.total_bytes
-                job.message = f"{MODEL_NAME} 模型和 MPS 运行环境已就绪"
+                job.message = f"{MODEL_NAME} 模型和 {self.backend_label} 运行环境已就绪"
                 job.finished_at = time.time()
         except InterruptedError:
             with job.lock:
@@ -1743,8 +2112,11 @@ class AIEnhancementManager:
             "stderr": subprocess.STDOUT,
             "text": True,
             "bufsize": 1,
-            "start_new_session": True,
         }
+        if sys.platform == "win32":
+            options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            options["start_new_session"] = True
         try:
             with job.lock:
                 if job.cancel_event.is_set():
@@ -1792,18 +2164,26 @@ class AIEnhancementManager:
             raise MediaError(self._friendly_process_error(recent, return_code))
         return recent
 
-    @staticmethod
-    def _friendly_process_error(recent: deque[str], return_code: int) -> str:
+    def _friendly_process_error(self, recent: deque[str], return_code: int) -> str:
         text = "\n".join(recent).lower()
-        if "out of memory" in text or "mps backend out of memory" in text:
+        if "out of memory" in text or "backend out of memory" in text:
+            if self.compute_backend == "cuda":
+                return (
+                    "RTX 5090 显存不足，AI 超清未完成。请先关闭占用 GPU 的应用，"
+                    "并用短样片确认该目标分辨率；模型不会自动降级或量化。"
+                )
             return (
                 "AI 超清所需统一内存超过了这台 Mac 当前可用容量。"
                 "请关闭大型应用或改选更低的目标分辨率后重试；模型不会自动降级。"
             )
         if "no space left" in text:
             return "磁盘空间不足，AI 超清未完成。"
+        if "sm_120" in text or "compute capability" in text:
+            return "PyTorch CUDA 环境不包含 RTX 5090 的 sm_120 支持，请在模型管理中重新安装。"
+        if "cuda driver" in text or "driver version" in text:
+            return "NVIDIA 驱动不满足 CUDA 13.0 要求，请更新到 R580 或更高版本后重试。"
         if "nan" in text or "infinite" in text or "not finite" in text:
-            return "检测到 MPS 生成了异常画面数值，已停止导出以避免保存损坏视频。"
+            return "检测到 AI 生成了异常画面数值，已停止导出以避免保存损坏视频。"
         if "color-managed input failed" in text or "libplacebo" in text:
             return "AI 输入色彩转换失败，已停止以避免生成偏色或亮度错误的视频。"
         if "download" in text or "urlopen" in text or "network" in text:
@@ -1811,6 +2191,48 @@ class AIEnhancementManager:
         detail = recent[-1] if recent else f"process exited with code {return_code}"
         detail = re.sub(r"\x1b\[[0-9;]*m", "", detail)
         return f"AI 超清进程未完成：{detail[-500:]}"
+
+    @staticmethod
+    def _apply_runtime_patch(patch_path: Path, root: Path) -> None:
+        _apply_unified_patch(patch_path, root)
+
+    def _runtime_probe_script(self) -> str:
+        if self.compute_backend == "cuda":
+            return (
+                "import torch, torchvision; "
+                "torch.cuda.set_device(0); "
+                "assert torch.cuda.is_available(), 'CUDA is unavailable'; "
+                "assert str(torch.version.cuda).startswith('13.'), "
+                "f'CUDA 13.0 wheel required, found {torch.version.cuda}'; "
+                "assert torch.cuda.get_device_capability() >= (12, 0), "
+                "f'RTX 5090 compute capability 12.0 required, found "
+                "{torch.cuda.get_device_capability()}'; "
+                "assert 'sm_120' in torch.cuda.get_arch_list(), "
+                "f'sm_120 missing from {torch.cuda.get_arch_list()}'; "
+                "assert 'RTX 5090' in torch.cuda.get_device_name().upper(), "
+                "f'RTX 5090 required, found {torch.cuda.get_device_name()}'; "
+                "x=torch.randn((256,256),device='cuda',dtype=torch.float16); "
+                "y=x@x; torch.cuda.synchronize(); "
+                "assert torch.isfinite(y).all().item(), "
+                "'CUDA FP16 smoke produced non-finite values'; "
+                "print(torch.cuda.get_device_name(), torch.version.cuda)"
+            )
+        return (
+            "import torch, torchvision; "
+            "assert torch.backends.mps.is_built() and torch.backends.mps.is_available(), "
+            "'MPS is unavailable'; "
+            "x=torch.randn((64,64),device='mps',dtype=torch.float16); "
+            "y=x@x; "
+            "assert torch.isfinite(y.float().cpu()).all().item(), "
+            "'MPS FP16 smoke produced non-finite values'"
+        )
+
+    def _verify_compute_runtime(self, job: AIWorkerJob, python: Path) -> None:
+        self._run_process(
+            job,
+            [str(python), "-c", self._runtime_probe_script()],
+            env=self._inference_environment(python.parent),
+        )
 
     def _prepare_runtime(self, job: AIWorkerJob) -> None:
         if self.inference_runner is not None:
@@ -1825,7 +2247,12 @@ class AIEnhancementManager:
 
         if not all(
             path.is_file()
-            for path in (AI_REQUIREMENTS_PATH, AI_PATCH_PATH, AI_COLOR_PATCH_PATH)
+            for path in (
+                self.runtime_requirements_path,
+                AI_COMMON_REQUIREMENTS_PATH,
+                AI_PATCH_PATH,
+                AI_COLOR_PATCH_PATH,
+            )
         ):
             raise MediaError("The bundled AI runtime files are missing")
         if self._file_sha256(AI_PATCH_PATH) != RUNNER_PATCH_SHA256:
@@ -1845,56 +2272,62 @@ class AIEnhancementManager:
         if staging.exists():
             shutil.rmtree(staging)
         try:
-            self._set_job(job, stage="setup", progress=3.5, message="正在校验并安装 MPS 质量补丁")
+            self._set_job(
+                job,
+                stage="setup",
+                progress=3.5,
+                message="正在校验并安装跨平台质量与色彩补丁",
+            )
             extracted = self._safe_extract(archive, staging_code)
-            self._run_process(
-                job,
-                ["/usr/bin/patch", "-l", "-p1", "-i", str(AI_PATCH_PATH)],
-                cwd=extracted,
-            )
-            self._run_process(
-                job,
-                ["/usr/bin/patch", "-l", "-p1", "-i", str(AI_COLOR_PATCH_PATH)],
-                cwd=extracted,
-            )
+            self._apply_runtime_patch(AI_PATCH_PATH, extracted)
+            self._apply_runtime_patch(AI_COLOR_PATCH_PATH, extracted)
             for backup in extracted.rglob("*.orig"):
                 backup.unlink(missing_ok=True)
             if job.cancel_event.is_set():
                 raise InterruptedError
             self._set_job(job, stage="setup", progress=5, message="正在创建独立 AI Python 环境")
             self._run_process(job, [self.base_python, "-m", "venv", str(staging_venv)])
-            python = staging_venv / "bin" / "python"
+            python = (
+                staging_venv / "Scripts" / "python.exe"
+                if sys.platform == "win32"
+                else staging_venv / "bin" / "python"
+            )
             self._set_job(
                 job,
                 stage="setup",
                 progress=6,
-                message="正在安装 PyTorch MPS 与 AI 依赖，首次需要一些时间",
+                message=f"正在安装固定版本的 {self.backend_label} 与 AI 依赖，首次需要一些时间",
             )
+            pip_options = [
+                str(python),
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+            ]
+            if self.compute_backend == "cuda":
+                pip_options.append("--no-cache-dir")
+                self._run_process(
+                    job,
+                    [
+                        *pip_options,
+                        "-r",
+                        str(AI_CUDA_REQUIREMENTS_PATH),
+                    ],
+                )
+                dependency_path = AI_COMMON_REQUIREMENTS_PATH
+            else:
+                dependency_path = AI_REQUIREMENTS_PATH
             self._run_process(
                 job,
                 [
-                    str(python),
-                    "-m",
-                    "pip",
-                    "install",
-                    "--disable-pip-version-check",
-                    "--no-input",
+                    *pip_options,
                     "-r",
-                    str(AI_REQUIREMENTS_PATH),
+                    str(dependency_path),
                 ],
             )
-            self._run_process(
-                job,
-                [
-                    str(python),
-                    "-c",
-                    (
-                        "import torch, torchvision; "
-                        "raise SystemExit(0 if (torch.backends.mps.is_built() "
-                        "and torch.backends.mps.is_available()) else 2)"
-                    ),
-                ],
-            )
+            self._verify_compute_runtime(job, python)
             self._run_process(
                 job,
                 [str(python), str(extracted / "inference_cli.py"), "--help"],
@@ -1913,6 +2346,9 @@ class AIEnhancementManager:
                         "fingerprint": self._runtime_fingerprint(),
                         "runner_revision": RUNNER_REVISION,
                         "runner_version": RUNNER_VERSION,
+                        "backend": self.compute_backend,
+                        "backend_label": self.backend_label,
+                        "device_name": self.device_name,
                         "patch_sha256": RUNNER_PATCH_SHA256,
                         "color_patch_sha256": RUNNER_COLOR_PATCH_SHA256,
                         "model": MODEL_FILENAME,
@@ -1930,7 +2366,12 @@ class AIEnhancementManager:
         if not self._runtime_installed():
             raise MediaError("The AI runtime did not pass its installation check")
 
-    def _quality_batch_size(self) -> int:
+    def _quality_batch_size(self, target: AIResolutionTarget) -> int:
+        if self.compute_backend == "cuda":
+            # SeedVR2 recommends batch 21 for its 24 GB+ FP16 1080p path.
+            # Scale the temporal window down as spatial resolution increases so
+            # the 32 GB RTX 5090 keeps the full-precision model without OOMing.
+            return {"1080p": 21, "2k": 13, "4k": 5}[target.id]
         memory = self._memory_bytes() or 0
         if memory >= 128 * 1024**3:
             return 13
@@ -1944,7 +2385,7 @@ class AIEnhancementManager:
         input_path: Path,
         output_path: Path,
     ) -> list[str]:
-        batch_size = self._quality_batch_size()
+        batch_size = self._quality_batch_size(job.target)
         chunk_size = batch_size * 8 + 1
         command = [
             str(self.venv_python),
@@ -1996,6 +2437,8 @@ class AIEnhancementManager:
             "--tensor_offload_device",
             "cpu",
         ]
+        if self.compute_backend == "cuda":
+            command.extend(["--cuda_device", "0"])
         color_plan = ai_input_color_plan(job.source)
         if color_plan.filter_graph:
             metadata = job.source.metadata
@@ -2035,16 +2478,29 @@ class AIEnhancementManager:
         env.update(
             {
                 "PYTHONUNBUFFERED": "1",
-                "PYTORCH_ENABLE_MPS_FALLBACK": "1",
-                "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.95",
-                "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.85",
                 "VIDEO_CUT_OUTPUT_VF": AI_OUTPUT_COLOR_FILTER_GRAPH,
             }
         )
+        if self.compute_backend == "mps":
+            env.update(
+                {
+                    "PYTORCH_ENABLE_MPS_FALLBACK": "1",
+                    "PYTORCH_MPS_HIGH_WATERMARK_RATIO": "0.95",
+                    "PYTORCH_MPS_LOW_WATERMARK_RATIO": "0.85",
+                }
+            )
+        elif self.compute_backend == "cuda":
+            env.update(
+                {
+                    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+                    "CUDA_VISIBLE_DEVICES": self.device_uuid or str(self.device_index),
+                    "PYTORCH_CUDA_ALLOC_CONF": "backend:cudaMallocAsync",
+                }
+            )
         path_entries = [str(Path(self.ffmpeg).parent)]
         if python_directory is not None:
             path_entries.insert(0, str(python_directory))
-        env["PATH"] = os.pathsep.join([*path_entries, env.get("PATH", "/usr/bin:/bin")])
+        env["PATH"] = os.pathsep.join([*path_entries, env.get("PATH", os.defpath)])
         return env
 
     def _run_inference(
@@ -2463,7 +2919,7 @@ class AIEnhancementManager:
                 started_at = time.time()
                 job.status = "running"
                 job.stage = "setup"
-                job.message = "正在准备质量优先的 MPS AI 环境"
+                job.message = f"正在准备质量优先的 {self.backend_label} AI 环境"
                 job.started_at = started_at
                 job.stage_started_at = started_at
             self._audit_frame_timing(job)

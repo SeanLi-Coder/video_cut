@@ -1,4 +1,4 @@
-# SeedVR2 MPS quality patch
+# SeedVR2 cross-platform quality patches
 
 This directory contains a project-maintained patch for the Apache-2.0 licensed
 `numz/ComfyUI-SeedVR2_VideoUpscaler` runner.
@@ -21,6 +21,10 @@ The patch changes the upstream runner to:
   `CRF 10`, and the `hvc1` tag;
 - remove artificial lead-in frames from the single-device streaming path; and
 - cache successful model SHA-256 validation after the first download.
+
+The MPS numerical workarounds remain conditional on `device.type == "mps"`.
+The precision, validation, streaming, color, and output changes are also used by
+the CUDA 13.0 RTX 5090 path.
 
 The additional `seedvr2-color-input.patch` adds a streaming FFmpeg reader for
 trusted, application-generated filter graphs. It sends `bgr48le` frames directly

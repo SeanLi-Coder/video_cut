@@ -109,6 +109,9 @@ const elements = {
   openModelManagerButton: byId("open-model-manager-button"),
   modelStatusBadge: byId("model-status-badge"),
   modelSizeValue: byId("model-size-value"),
+  modelBackendDescription: byId("model-backend-description"),
+  modelDeviceValue: byId("model-device-value"),
+  modelSpaceValue: byId("model-space-value"),
   runtimeComponentDot: byId("runtime-component-dot"),
   runtimeComponentStatus: byId("runtime-component-status"),
   weightsComponentDot: byId("weights-component-dot"),
@@ -1102,7 +1105,7 @@ function renderAiTargetOptions(controlsLocked = state.exporting) {
       || (!state.video
         ? "请先选择视频"
         : !state.aiEnhanceReady
-          ? "当前 Mac 无法使用 AI 超清"
+          ? "当前电脑无法使用 AI 超清"
           : "目标清晰度低于原片，不会降级处理");
     option.title = available ? `增强到 ${AI_TARGETS[target].label}` : reason;
     const dimensions = option.querySelector("[data-ai-dimensions]");
@@ -1118,7 +1121,7 @@ function renderAiTargetOptions(controlsLocked = state.exporting) {
   if (!state.video) {
     elements.aiTargetNote.textContent = "选择视频后会自动推荐第一个可用目标清晰度。";
   } else if (!state.aiEnhanceReady) {
-    elements.aiTargetNote.textContent = runtimeMessage || "AI 超清仅支持 Apple Silicon Mac，当前运行环境不可用。";
+    elements.aiTargetNote.textContent = runtimeMessage || "当前电脑没有可用的 AI 加速运行环境。";
   } else if (!state.enhanceTarget) {
     elements.aiTargetNote.textContent = unavailable.length
       ? `当前没有可用目标：${unavailable.join("；")}`
@@ -1149,7 +1152,7 @@ function renderModeCopy() {
         ? "把这一小段逐帧保存"
         : "留下想要的这一段";
   elements.heroCopy.textContent = enhance
-    ? "选择 1080p、2K 或 4K，使用 SeedVR2 3B FP16 在这台 Mac 本地逐帧增强；非标准色彩会自动转换，HDR 会明确映射为 SDR。"
+    ? `选择 1080p、2K 或 4K，使用 SeedVR2 3B FP16 在${aiDeviceShortName()}本地增强；非标准色彩会自动转换，HDR 会明确映射为 SDR。`
     : rotate
       ? "选一个视频和旋转角度，确认预览后生成同级新文件。原视频始终不会被修改。"
       : frames
@@ -1330,7 +1333,7 @@ function renderVideoDetails() {
 async function selectVideo() {
   if (!state.appReady || state.selectingVideo || state.exporting) return;
   state.selectingVideo = true;
-  setButtonBusy(elements.selectVideoButton, true, "正在打开 Finder…");
+  setButtonBusy(elements.selectVideoButton, true, "正在打开文件选择窗口…");
   setButtonBusy(elements.replaceVideoButton, true, "正在打开…");
   renderControls();
 
@@ -1405,7 +1408,7 @@ async function selectVideo() {
 async function selectOutputDirectory() {
   if (!state.appReady || state.selectingDirectory || state.exporting || isRotateMode()) return;
   state.selectingDirectory = true;
-  setButtonBusy(elements.selectDirectoryButton, true, "正在打开 Finder…");
+  setButtonBusy(elements.selectDirectoryButton, true, "正在打开文件夹选择窗口…");
   renderControls();
 
   try {
@@ -1458,6 +1461,37 @@ function modelRuntimePrepared(runtime = state.aiRuntime) {
   if (!runtime || typeof runtime !== "object") return false;
   if (typeof runtime.prepared === "boolean") return runtime.prepared;
   return Boolean(runtime.installed && runtime.models_downloaded);
+}
+
+function aiBackendLabel(runtime = state.aiRuntime) {
+  const configuredLabel = String(runtime?.backend_label || "").trim();
+  if (configuredLabel) return configuredLabel;
+  const backend = String(runtime?.backend || "").trim().toUpperCase();
+  return backend || "本机 AI 加速";
+}
+
+function aiDeviceShortName(runtime = state.aiRuntime) {
+  return String(runtime?.device_name || "").trim() || "这台电脑";
+}
+
+function aiDeviceSummary(runtime = state.aiRuntime) {
+  const deviceName = String(runtime?.device_name || "").trim();
+  const backendLabel = aiBackendLabel(runtime);
+  const memoryGb = Number(runtime?.device_memory_gb);
+  const parts = [];
+  if (deviceName) parts.push(deviceName);
+  if (backendLabel && !deviceName.toLowerCase().includes(backendLabel.toLowerCase())) {
+    parts.push(backendLabel);
+  }
+  if (Number.isFinite(memoryGb) && memoryGb > 0) {
+    const digits = memoryGb >= 10 || Number.isInteger(memoryGb) ? 0 : 1;
+    parts.push(`${memoryGb.toFixed(digits)} GB`);
+  }
+  if (runtime?.hardware_verified === true) parts.push("已检测");
+  else if (runtime?.hardware_verified === false && (deviceName || runtime?.backend)) {
+    parts.push("待硬件校验");
+  }
+  return parts.join(" · ") || "正在检测本机 AI 加速设备";
 }
 
 function modelDownloadIsActive(snapshot = state.modelDownload) {
@@ -1551,6 +1585,17 @@ function renderModelManager() {
     cancelling: state.modelDownloadCancelling,
   });
 
+  const backendLabel = aiBackendLabel(runtime);
+  const deviceName = aiDeviceShortName(runtime);
+  elements.modelDeviceValue.textContent = aiDeviceSummary(runtime);
+  const minimumRuntimeGb = Number(runtime.minimum_runtime_free_gb);
+  elements.modelSpaceValue.textContent = Number.isFinite(minimumRuntimeGb) && minimumRuntimeGb > 0
+    ? `至少约 ${minimumRuntimeGb.toFixed(0)} GB`
+    : "至少约 12 GB";
+  elements.modelBackendDescription.textContent = runtime.backend || runtime.backend_label
+    ? `时序视频增强模型，当前使用 ${deviceName} 的 ${backendLabel} 路径和 FP16 + SDPA。`
+    : "时序视频增强模型，会按本机支持的加速路径准备。";
+
   let badgeStatus = "idle";
   let badgeText = "尚未下载";
   if (checking) badgeText = "正在检查";
@@ -1623,7 +1668,7 @@ function renderModelManager() {
     || snapshot.message
     || runtime.message;
   elements.modelProgressMessage.textContent = prepared
-    ? "SeedVR2 3B FP16、VAE 与本地 MPS 运行环境均已完成校验。"
+    ? `SeedVR2 3B FP16、VAE 与本地 ${backendLabel} 运行环境均已完成校验。`
     : String(message || "可以现在提前准备，之后做 AI 超清时无需再等待首次下载。");
 
   const busy = active || state.modelDownloadStarting;
@@ -1659,7 +1704,7 @@ function renderModelManager() {
     : active
       ? "可以切回视频处理；下载会继续，已完成部分会保留。"
       : !platformReady && !checking
-        ? String(runtime.message || "AI 模型仅支持在 Apple Silicon Mac 上准备。")
+        ? String(runtime.message || "当前电脑没有可用的 AI 加速运行环境。")
         : needsSetup
           ? "模型文件无需重下；只会更新本地运行环境。"
         : failed
@@ -1672,7 +1717,7 @@ function renderModelManager() {
       ? String(runtime.message || "当前环境无法使用 AI 超清。")
     : active
       ? `SeedVR2 模型正在后台准备（${Math.round(progress)}%），切换页面不会中断。`
-      : "仅支持 Apple Silicon，全程本地处理；可以提前下载约 7.3 GB 模型。";
+      : `${aiDeviceSummary(runtime)}；全程本地处理，可以提前下载约 7.3 GB 模型。`;
   elements.openModelManagerButton.textContent = prepared
     ? "查看模型状态"
     : active
@@ -2199,16 +2244,16 @@ async function revealOutput() {
   try {
     await post(`${exportApiBase()}/${encodeURIComponent(state.exportJobId)}/reveal`);
     showToast(isEnhanceMode()
-      ? "已在 Finder 中显示 AI 超清视频"
+      ? "已在文件夹中显示 AI 超清视频"
       : isRotateMode()
-      ? "已在 Finder 中显示旋转后的视频"
+      ? "已在文件夹中显示旋转后的视频"
       : isFrameMode()
-        ? "已在 Finder 中显示截图文件夹"
-        : "已在 Finder 中显示导出文件");
+        ? "已在文件夹中显示截图"
+        : "已在文件夹中显示导出文件");
   } catch (error) {
     showToast(error.message || (isFrameMode()
-      ? "无法在 Finder 中显示截图文件夹"
-      : "无法在 Finder 中显示文件"), "error");
+      ? "无法在文件夹中显示截图"
+      : "无法在文件夹中显示文件"), "error");
   } finally {
     elements.revealOutputButton.disabled = false;
   }
@@ -2274,7 +2319,7 @@ function renderReadyNote(range) {
   } else if (isEnhanceMode() && !aiSelectionReady()) {
     if (!state.aiEnhanceReady) {
       elements.readyNote.classList.add("is-error");
-      elements.readyNoteText.textContent = String(state.aiRuntime.message || state.aiRuntime.reason || "AI 超清仅支持 Apple Silicon Mac，当前运行环境不可用");
+      elements.readyNoteText.textContent = String(state.aiRuntime.message || state.aiRuntime.reason || "当前电脑没有可用的 AI 加速运行环境");
     } else elements.readyNoteText.textContent = "当前视频没有可用目标；AI 超清不会把原片降级到更低分辨率";
   } else if (!range.valid) {
     elements.readyNoteText.textContent = "请先修正起始时间和结束时间";
@@ -2285,7 +2330,7 @@ function renderReadyNote(range) {
   } else if (!(isEnhanceMode() ? state.aiEnhanceReady : isRotateMode() ? state.rotationReady : isFrameMode() ? state.frameExportReady : state.ffmpegReady)) {
     elements.readyNote.classList.add("is-error");
     elements.readyNoteText.textContent = isEnhanceMode()
-      ? String(state.aiRuntime.message || state.aiRuntime.reason || "AI 超清仅支持 Apple Silicon Mac，当前运行环境不可用")
+      ? String(state.aiRuntime.message || state.aiRuntime.reason || "当前电脑没有可用的 AI 加速运行环境")
       : isRotateMode()
       ? "当前 FFmpeg 缺少永久旋转所需编码器"
       : isFrameMode()
@@ -2411,7 +2456,7 @@ async function bootstrap() {
     renderModelManager();
 
     if (!state.appToken) {
-      showSystemBanner("本地服务响应异常", "请刷新页面；如果仍未恢复，请重新双击 start.command。", "error");
+      showSystemBanner("本地服务响应异常", "请刷新页面；如果仍未恢复，请重新运行项目的启动入口。", "error");
     } else if (!state.ffmpegReady && !state.frameExportReady && !state.rotationReady) {
       showSystemBanner("未检测到 FFmpeg", "可以先选择和预览视频，但需要按启动窗口提示安装 FFmpeg 后才能导出。", "warning");
     } else if (!state.ffmpegReady || !state.frameExportReady || !state.rotationReady) {

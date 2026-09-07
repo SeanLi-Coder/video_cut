@@ -24,6 +24,8 @@ def test_frontend_has_only_two_editable_text_parameters() -> None:
     assert 'id="model-download-button"' in html
     assert 'id="model-progress-track"' in html
     assert 'id="model-download-remaining"' in html
+    assert 'id="model-backend-description"' in html
+    assert 'id="model-device-value"' in html
     assert 'id="export-remaining"' in html
     assert html.count('aria-valuetext="0%') == 2
     assert 'aria-label="任务处理进度"' in html
@@ -89,6 +91,23 @@ def test_frontend_ai_mode_uses_local_quality_first_workflow() -> None:
     assert "HDR 视频暂不支持安全 AI 超清" not in javascript
     assert "HDR 会明确映射为 SDR" in javascript
     assert "将 HDR 映射为 BT.709 SDR 后" in javascript
+    assert "FP16 + SDPA" in javascript
+
+
+def test_frontend_renders_detected_ai_backend_without_platform_hardcoding() -> None:
+    javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    assert "function aiBackendLabel" in javascript
+    assert "function aiDeviceSummary" in javascript
+    assert "runtime?.backend_label" in javascript
+    assert "runtime?.backend" in javascript
+    assert "runtime?.device_name" in javascript
+    assert "runtime?.device_memory_gb" in javascript
+    assert "runtime?.hardware_verified" in javascript
+    assert "modelDeviceValue.textContent = aiDeviceSummary(runtime)" in javascript
+    for obsolete_copy in ("仅支持 Apple Silicon", "当前 Mac", "Finder", "start.command"):
+        assert obsolete_copy not in javascript
+        assert obsolete_copy not in html
 
 
 def test_frontend_has_independent_ai_model_download_manager() -> None:

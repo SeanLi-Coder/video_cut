@@ -1,6 +1,6 @@
 # 本地视频剪辑、逐帧截图、永久旋转与 AI 超清
 
-一个面向 macOS 的本地视频处理工具，提供“剪辑视频”“逐帧截图”“永久旋转”和“AI 超清”四种模式，并带独立的 AI 模型预下载与进度管理页面。双击 `start.command` 就能用；视频不会上传，原文件也不会被修改。
+一个面向 macOS 和 Windows 11 的跨平台本地视频处理工具，提供“剪辑视频”“逐帧截图”“永久旋转”和“AI 超清”四种模式，并带独立的 AI 模型预下载与进度管理页面。macOS 双击 `start.command`，Windows 双击 `start.bat` 即可启动；视频不会上传，原文件也不会被修改。
 
 ## 零基础使用方法
 
@@ -12,7 +12,10 @@
 
 ### 2. 双击启动
 
-打开解压后的文件夹，双击 `start.command`。
+打开解压后的文件夹，根据系统双击启动：
+
+- macOS：`start.command`
+- Windows 11：`start.bat`
 
 首次启动会做这些事情：
 
@@ -22,11 +25,11 @@
 - 检查 FFmpeg 和 FFprobe；
 - 启动仅供本机访问的网页，并自动在浏览器中打开。
 
-第一次安装需要联网，可能持续几分钟。Terminal 窗口在工具运行期间需要保持打开。
+第一次安装需要联网，可能持续几分钟。启动脚本打开的 Terminal 或 Windows Terminal 窗口在工具运行期间需要保持打开。
 
 ### 3. 提前下载 AI 模型（可选）
 
-网页最上方有独立的“AI 模型管理”标签页。打开后直接点击“提前下载并安装”，无需先选择视频或保存目录，就能准备 SeedVR2 3B FP16、本地 MPS 运行环境和 VAE。
+网页最上方有独立的“AI 模型管理”标签页。打开后直接点击“提前下载并安装”，无需先选择视频或保存目录，就能准备 SeedVR2 3B FP16、VAE，以及适合当前设备的 MPS 或 CUDA 运行环境。页面会显示实际检测到的设备名称、后端和显存或统一内存。
 
 页面会显示当前阶段、百分比、已下载容量、下载速度、已用时间和预计剩余时间。切换回“视频处理”不会中断；刷新页面后也会自动找回正在运行的任务。取消后已下载部分会保留，下次点击“继续下载”会断点续传。全部完成并通过 SHA-256 校验后，AI 超清可以直接加载模型。
 
@@ -34,8 +37,8 @@
 
 ### 4. 选择视频和保存目录
 
-1. 在网页中点击“选择视频”，从 Finder 选择本地视频。
-2. 点击“选择文件夹”，从 Finder 选择成片或截图的保存目录。这个目录会被记住，下次启动仍可使用，也可以随时更换。
+1. 在网页中点击“选择视频”，从系统文件选择窗口选取本地视频。
+2. 点击“选择文件夹”，从系统文件夹选择窗口选取成片或截图的保存目录。这个目录会被记住，下次启动仍可使用，也可以随时更换。
 
 永久旋转不需要选择保存目录：新视频固定生成在原视频同级目录，方便立即找到。
 
@@ -66,7 +69,7 @@ AI 超清也不需要填写时间。选择一个目标清晰度即可；右侧�
 
 两个时间都有效后，页面会生成对应片段的预览。修改任意一个时间，预览会按新范围重新生成；逐帧截图模式下修改起始时间时，结束时间也会自动跟随为起点后 5 秒。
 
-剪辑模式下点击“确定并导出”；逐帧截图模式下点击“确定并截图”；永久旋转模式下点击“确定并旋转”；AI 模式下点击“确定并开始 AI 超清”。完成后可以直接点击“在 Finder 中显示”。四种操作都会创建新内容，原视频始终保留不变。
+剪辑模式下点击“确定并导出”；逐帧截图模式下点击“确定并截图”；永久旋转模式下点击“确定并旋转”；AI 模式下点击“确定并开始 AI 超清”。完成后可以直接点击“在文件夹中显示”。四种操作都会创建新内容，原视频始终保留不变。
 
 运行中的剪辑、逐帧截图、永久旋转和 AI 超清会显示动态预计剩余时间。开始阶段尚无足够速度样本时会显示“正在估算”，进入校验、音频封装等短暂阶段后会显示“正在收尾”；预计时间会根据实际处理速度持续修正，并不是完成时间承诺。
 
@@ -119,7 +122,7 @@ AI 超清的默认文件名为：
 
 选择 3B FP16 不是为了省时间：SeedVR2 官方论文的专家盲测中，蒸馏后的普通 3B 模型相对普通 7B 模型，在 Visual Quality 和包含时序一致性的 Overall Quality 上都高出 16%。后加的 7B sharp checkpoint 没有对应官方盲测，不能把“更锐”当成“总体更好”。依据见 [SeedVR2 论文](https://arxiv.org/html/2506.05301)和[官方项目](https://github.com/ByteDance-Seed/SeedVR)。
 
-这里的“默认最佳”限定为当前可在 Apple Silicon 上完全本地、离线运行，且有官方主观实验支持的成熟选择，并不是声称它在 CUDA 服务器上也绝对领先。更新的 [FlashVSR](https://github.com/OpenImagingLab/FlashVSR) 有更强的论文盲测结果，但其高质量实现依赖 Linux/CUDA 的 [Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention)，不能在这台 Mac 上保持原方案质量，因此没有接入低质量近似版。
+这里的“默认最佳”指本项目在 macOS MPS 与 Windows CUDA 两条本地路径上统一采用、且有官方主观实验支持的成熟质量方案，并不是声称它在所有素材和所有硬件上绝对领先。更新的 [FlashVSR](https://github.com/OpenImagingLab/FlashVSR) 有更强的论文盲测结果，但其高质量实现依赖 Linux/CUDA 的 [Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention)，没有适合本项目两条路径的一致成熟实现，因此没有接入低质量近似版。
 
 目标档位定义如下；2K 在本工具中明确指常见的 QHD，而不是 DCI 2K：
 
@@ -131,16 +134,25 @@ AI 超清的默认文件名为：
 
 画面保持原始宽高比，不拉伸、不裁边；超宽或其他比例会落在对应边界以内。同分辨率可以做 restoration；如果某个档位会缩小原片，该按钮会禁用。
 
-AI 模式只在 Apple Silicon Mac 上开放，使用 PyTorch MPS，不安装也不尝试 CUDA、Apex、FlashAttention 或 Triton。可以在独立的“AI 模型管理”标签页提前完成以下准备；如果跳过，第一次真正开始 AI 任务时也会自动执行：
+AI 模式支持以下本地加速路径：
+
+- Apple Silicon Mac：PyTorch MPS。
+- Windows 11 + NVIDIA GeForce RTX 5090：PyTorch `2.12.1` 的 CUDA 13.0（`cu130`）官方 wheel。
+
+两条路径都使用完全相同的 SeedVR2 3B FP16 权重和 PyTorch SDPA attention。RTX 5090 路径不会默认换成 FP8，也不会默认安装 SageAttention、Apex、FlashAttention 或额外 Triton kernel；这样可以保留 FP16 质量并避免把一次性编译、第三方二进制兼容性变成“即开即用”的前置条件。程序不会因显存不足静默降低模型精度。
+
+可以在独立的“AI 模型管理”标签页提前完成以下准备；如果跳过，第一次真正开始 AI 任务时也会自动执行：
 
 1. 在 `data/ai/` 创建与主程序隔离的 Python 环境；
-2. 下载固定 commit 的 SeedVR2 Mac 运行器并校验 SHA-256；
-3. 应用本项目固定的 MPS 稳定性、16-bit 色彩输入与真正 10-bit 输出补丁；
+2. 下载固定 commit 的 SeedVR2 运行器并校验 SHA-256；
+3. 应用本项目固定的跨后端稳定性、16-bit 色彩输入与真正 10-bit 输出补丁；
 4. 下载并校验约 7.3 GB 的 3B FP16 与 VAE 权重。
 
-模型管理页支持查看实时百分比、下载容量、速度、耗时和预计剩余时间。中途取消会停止下载或安装进程；已完整下载的模型会保留，`.download` 临时权重也会保留以便下次续传。AI 视频任务中途取消时会停止整个 AI/FFmpeg 进程组并删除未完成成片。以后双击 `start.command` 不会重复安装或下载。
+模型管理页支持查看实时百分比、下载容量、速度、耗时和预计剩余时间。中途取消会停止下载或安装进程；已完整下载的模型会保留，`.download` 临时权重也会保留以便下次续传。AI 视频任务中途取消时会停止整个 AI/FFmpeg 进程组并删除未完成成片。以后再次运行 `start.command` 或 `start.bat` 不会重复安装或下载。
 
-M4 Max 有不同统一内存容量。程序会根据内存只调整同一个 FP16 模型的时序 batch，不会降低模型精度；1080p、2K、4K 的内存需求相差很大，4K 仍可能因可用统一内存不足而明确失败。4K 是本工具的输出尺寸档位，不代表论文对任意素材都给出了 4K 质量保证。关闭占用大量内存的软件后重试，或选择较低目标档位。SeedVR2 是研究原型，重度退化、大幅运动可能恢复失败，原本已经很清晰的素材也可能被过度生成或锐化；AI 生成的细节不是原片中可证明存在的真实细节。
+Apple Silicon 有不同统一内存容量，RTX 5090 提供独立显存。程序会根据当前设备和目标尺寸只调整同一个 FP16 模型的时序 batch，不会降低模型精度；RTX 5090 默认对 1080p、2K、4K 分别使用 `21`、`13`、`5` 帧 batch。1080p 的 `21` 来自上游 24 GB+ FP16 推荐配置，2K 与 4K 按像素量和 32 GB 显存保守缩小。batch 越高通常越有利于时序一致性，但三档仍必须在实机用短片验证显存峰值。1080p、2K、4K 的内存需求相差很大，4K 仍可能因可用内存不足而明确失败。4K 是本工具的输出尺寸档位，不代表论文对任意素材都给出了 4K 质量保证。关闭占用大量内存或显存的软件后重试，或选择较低目标档位。SeedVR2 是研究原型，重度退化、大幅运动可能恢复失败，原本已经很清晰的素材也可能被过度生成或锐化；AI 生成的细节不是原片中可证明存在的真实细节。
+
+> RTX 5090 验收状态：当前适配代码是在 Apple M2 开发机上完成，可通过静态检查、mock 设备测试和无 CUDA 的自动化测试，但这些不能替代真实显卡运行。正式处理重要长视频前，仍必须在实际的 Windows 11 + RTX 5090 电脑上完成模型安装、短片推理、显存峰值、取消任务和成片校验；在这一步完成前，不应把“M2 上测试通过”理解为“5090 实机已经验收”。
 
 AI 输入不再限定为 BT.709 limited YUV。所有输入都会由 FFmpeg Full 的 `libplacebo` 在内存中逐帧转换为 BT.709 primaries、sRGB transfer、full-range 的 16-bit RGB 工作画面，再直接送入 SeedVR2，不会生成占用巨大空间的中间视频。full-range、BT.601/P3/BT.2020 SDR、RGB 以及 10/12-bit 素材都走同一条受控管线；普通 SDR 缺少色彩标签时，会按 RGB/HD/NTSC SD/PAL SD 的分辨率与帧率规则推断，并在开始前显示具体假设。原文件不会修改。
 
@@ -163,7 +175,7 @@ AI 视频从模型输出的 sRGB full-range RGB 显式进行 transfer、matrix�
 
 这里的“保持清晰程度”不等于逐字节复制。除适合逐帧切分的 ProRes 外，多数视频会重新编码，因此不是 bit-identical，也不是数学意义上的视频无损。对常见长 GOP 视频，任意切点的精确剪辑与完全不重编码不能同时保证：单纯使用 stream copy 虽然不重编码，但起点通常只能落在关键帧附近。本工具优先保证你输入的剪辑范围准确，并使用高质量或无损编码避免可察觉的降质。
 
-高质量重编码可能比原视频片段更大，导出速度也取决于视频时长、分辨率和 Mac 性能。
+高质量重编码可能比原视频片段更大，导出速度也取决于视频时长、分辨率和电脑性能。
 剪辑模式下，HDR 片段会优先直接播放原片；如果浏览器无法解码，才生成一份 8-bit 兼容定位预览，此时颜色只用于定位，剪辑成片仍走原 HDR 色彩信息的导出路径。Dolby Vision、动态 HDR 元数据、多音轨、字幕或沉浸式音频等专业素材不保证完整保留；这类文件请先备份，并抽查一小段成片。本工具默认保留主视频流和主音轨。
 
 永久旋转会把方向真正烘焙到每一帧中，因此视频画面必须解码后重新编码，无法同时做到视频码流逐字节不变。工具会优先保留源编码家族、帧率、位深、像素格式、色彩标记、静态 HDR 信息和画面清晰度；FFV1 继续使用 FFV1，H.264/HEVC 使用高质量编码，无法安全映射的专业格式改用无损 FFV1。90° 与 270° 必然交换宽高，180° 与 360° 保持宽高。原音频直接 stream copy，不进行二次音频编码。
@@ -176,7 +188,14 @@ AI 视频从模型输出的 sRGB full-range RGB 显式进行 transfer、matrix�
 
 ## 安装要求与自动处理边界
 
-基础功能需要 macOS、Python 3.10+ 和 FFmpeg。AI 超清额外要求 Apple Silicon（M 系列芯片）、带 `libplacebo` 与 `zscale` 的 FFmpeg Full、供 `libplacebo` 使用的 MoltenVK、足够的统一内存和至少约 12 GB 的模型/环境可用磁盘空间；成片目录还需要单独的输出空间。
+基础功能支持 macOS 和 Windows 11，需要 Python 3.10+ 与包含所需编码器的 FFmpeg。AI 超清还需要带 `libplacebo` 与 `zscale` 的 FFmpeg Full，以及下面一种设备：
+
+- Apple Silicon（M 系列芯片）、足够的统一内存和至少约 12 GB 模型/环境磁盘空间；`libplacebo` 还需要 MoltenVK。
+- NVIDIA GeForce RTX 5090、至少约 18 GB 模型/环境磁盘空间，以及 R580 或更新分支的 NVIDIA 驱动。Windows CUDA 环境固定安装 PyTorch `2.12.1` + `cu130`，wheel 已包含所需 CUDA 用户态运行库，**不需要另外安装 CUDA Toolkit**。
+
+成片目录需要单独的输出空间。RTX 5090 的驱动不会由本工具自动升级；如果 `nvidia-smi` 不可用或驱动过旧，基础视频功能仍可使用，AI 模型页会显示具体原因。
+
+### macOS
 
 `start.command` 会优先查找 Apple Silicon Homebrew 的 `/opt/homebrew/bin/python3`、Intel Homebrew 的 `/usr/local/bin/python3`，再检查当前 `PATH` 中的 `python3`。
 
@@ -186,7 +205,7 @@ AI 视频从模型输出的 sRGB full-range RGB 显式进行 transfer、matrix�
 - 自动安装需要网络连接，并可能要求你在 Terminal 中确认系统提示或输入当前 Mac 账号密码。
 - macOS 自带的旧版 `/usr/bin/python3` 不会被替换或修改。
 
-也可以先手动安装：
+也可以先手动安装 macOS 依赖：
 
 ```bash
 brew install python ffmpeg-full molten-vk
@@ -200,9 +219,23 @@ python3 --version
 /opt/homebrew/opt/ffmpeg-full/bin/ffprobe -version
 ```
 
+### Windows 11 + RTX 5090
+
+双击 `start.bat`。启动器会查找兼容的 Python，建立项目内独立环境，并检查 FFmpeg、FFprobe、`nvidia-smi` 和 RTX 5090。缺少 Python 或 FFmpeg 时会在可用的情况下通过 WinGet 安装；请保留启动窗口，按其中提示处理系统确认。
+
+请先从 [NVIDIA 官方驱动页面](https://www.nvidia.com/Download/index.aspx)安装 R580 或更新分支驱动并重启。无需下载 CUDA Toolkit、cuDNN 或 Visual Studio CUDA workload；AI 模型页会在独立环境中安装固定的 PyTorch `2.12.1` `cu130` wheel。可以在 PowerShell 先检查：
+
+```powershell
+nvidia-smi
+py -3.12 --version
+ffmpeg -version
+```
+
+`nvidia-smi` 应明确列出 `NVIDIA GeForce RTX 5090`。进入网页的“AI 模型管理”后，“运行设备”也应显示 RTX 5090、CUDA 后端和显存；如果页面仍显示不可用，先不要运行长片。
+
 ## 停止工具
 
-正常情况下，在启动工具的 Terminal 窗口按 `Control + C`。如果已经找不到那个窗口，可以双击 `stop.command`。
+正常情况下，在启动工具的终端窗口按 `Control + C`。如果已经找不到那个窗口，macOS 双击 `stop.command`，Windows 双击 `stop.bat`。
 
 导出过程中关闭工具会取消当前导出并清理未完成的临时文件；已经成功完成的文件不会被删除。AI 任务的完整模型缓存不会随取消而删除。
 
@@ -210,7 +243,7 @@ python3 --version
 
 - Web 服务只监听 `127.0.0.1`，不向局域网或公网开放。
 - 所选视频直接从原位置读取，不会上传到服务器，也不会复制到项目目录。
-- 预览、最终剪辑、逐帧截图和永久旋转都由本机 FFmpeg 完成；AI 超清由本机 SeedVR2、PyTorch MPS 和 FFmpeg 完成。
+- 预览、最终剪辑、逐帧截图和永久旋转都由本机 FFmpeg 完成；AI 超清由本机 SeedVR2、PyTorch MPS 或 CUDA，以及 FFmpeg 完成。
 - 保存目录设置记录在项目内的 `data/settings.json`；视频内容不会写入该配置。
 - 首次安装依赖时会访问 Homebrew 或 PyPI；第一次 AI 任务还会从固定 GitHub/Hugging Face 地址下载运行器和模型，但视频素材始终不会上传。
 
@@ -232,7 +265,7 @@ chmod +x start.command stop.command
 
 在 Finder 中按住 Control 点击 `start.command`，选择“打开”。如果仍被阻止，到“系统设置 → 隐私与安全性”查看并确认对应提示。只应对从你信任的仓库下载的文件执行此操作。
 
-### 提示找不到 Python、FFmpeg 或 FFprobe
+### macOS 提示找不到 Python、FFmpeg 或 FFprobe
 
 先安装 Homebrew，然后执行：
 
@@ -242,9 +275,15 @@ brew install python ffmpeg-full molten-vk
 
 完全关闭旧 Terminal 后重新双击 `start.command`。Apple Silicon Mac 的 Homebrew 通常位于 `/opt/homebrew`。
 
-### Finder 无法选择视频或保存目录
+### Windows 无法识别 RTX 5090 或提示 CUDA 不可用
 
-检查“系统设置 → 隐私与安全性 → 文件与文件夹”，允许 Terminal 访问视频所在目录。外接磁盘还需要确认磁盘已挂载且保存目录可写。
+先在 PowerShell 运行 `nvidia-smi`。如果没有命令、未列出 RTX 5090，或驱动分支低于 R580，请从 NVIDIA 官网安装新驱动并重启。只安装 CUDA Toolkit 不能代替显卡驱动，本项目本身也不需要 CUDA Toolkit。
+
+如果 `nvidia-smi` 正常，但模型页仍不可用，请关闭旧的启动窗口，重新运行 `start.bat`，让独立 AI 环境完成 PyTorch `2.12.1` `cu130` 校验。不要把系统里另一个 Python 环境的 `torch` 版本当成本项目环境。
+
+### 无法选择视频或保存目录
+
+macOS 请检查“系统设置 → 隐私与安全性 → 文件与文件夹”，允许 Terminal 访问视频所在目录。Windows 请检查文件是否仍被其他程序独占，以及目标目录是否允许当前账号写入。外接磁盘还需要确认磁盘已挂载且保存目录可写。
 
 ### 浏览器没有自动打开
 
@@ -258,15 +297,15 @@ brew install python ffmpeg-full molten-vk
 
 精确剪辑和永久旋转都需要高质量重编码，并非简单复制数据。4K、HEVC、10-bit 和长视频会明显更慢；旋转整段视频需要的空间按原视频所在磁盘计算。逐帧截图使用无损图片，即使只有 5 秒，4K/60 fps 也可能产生数百张图片和数 GB 数据；请保持 Terminal 和网页开启，并确保保存位置有足够空间。为保证长 GOP 视频不漏掉目标范围开头的帧，截图会从视频轨起点精确解码到所选位置，因此截取长视频靠后的范围也可能需要等待；页面会持续显示状态，并可随时安全取消。
 
-### AI 超清一直很慢，或者提示统一内存不足
+### AI 超清一直很慢，或者提示内存/显存不足
 
 这是预期行为。SeedVR2 3B FP16 是数十亿参数的时序生成模型，本项目优先质量而不是速度，并且最终还会用 CPU 做高质量 10-bit HEVC 编码。几分钟原片可能需要数小时甚至更久。页面会持续显示安装、下载、AI 计算、回封装和验证阶段；可以安全取消。
 
-如果提示 MPS/统一内存不足，请先关闭大型应用，再选择较低目标档位。程序不会静默换成量化模型。即使同为 M4 Max，不同统一内存配置对 4K 的可行性也不同。
+如果提示 MPS 统一内存或 CUDA 显存不足，请先关闭大型应用和其他 GPU 程序，再选择较低目标档位。程序不会静默换成量化模型。即使同为 M 系列芯片，不同统一内存配置对 4K 的可行性也不同；RTX 5090 上的其他显存占用也会影响可用 batch。
 
 ### 更新后仍打开旧页面
 
-先按 `Control + C` 停止旧实例，或双击 `stop.command`，再重新运行 `start.command`。必要时在浏览器中按 `Command + Shift + R` 强制刷新。
+先按 `Control + C` 停止旧实例，或运行当前系统的停止脚本，再重新运行启动脚本。必要时在浏览器中强制刷新：macOS 通常是 `Command + Shift + R`，Windows 通常是 `Control + F5`。
 
 ## 开发与测试
 
@@ -290,7 +329,7 @@ python -m pytest
 python launcher.py --no-browser
 ```
 
-GitHub Actions 会在 macOS 和 Ubuntu 上，分别使用 Python 3.10 与 3.13 安装 FFmpeg、检查 Python 代码并运行 `pytest`。原生 Finder 文件与文件夹选择器只在 macOS 上提供；Ubuntu CI 用于验证不依赖 Finder 的核心逻辑。
+GitHub Actions 会在 macOS、Windows 和 Ubuntu 环境中检查 Python 代码并运行可执行的测试。自动化测试能够覆盖平台分支、命令生成和模拟设备探测，但云端 runner 没有 RTX 5090，不能替代前文的真实 5090 验收。
 
 ## 项目结构
 
@@ -298,24 +337,29 @@ GitHub Actions 会在 macOS 和 Ubuntu 上，分别使用 Python 3.10 与 3.13 �
 video_cut/
 ├── start.command             # macOS 双击启动入口
 ├── stop.command              # 安全停止本地服务
-├── launcher.py               # Python 环境、依赖、FFmpeg 与进程管理
+├── start.bat                 # Windows 双击启动入口
+├── stop.bat                  # Windows 安全停止入口
+├── launcher.py               # macOS Python 环境、依赖、FFmpeg 与进程管理
+├── launcher_windows.py       # Windows 环境、依赖、FFmpeg 与进程管理
 ├── process_guard.py          # 首次安装阶段的子进程与锁守护
 ├── run.py                    # 仅供启动器调用的 Uvicorn 服务入口
 ├── stop.py                   # 带实例身份校验的停止逻辑
 ├── app/
 │   ├── main.py               # FastAPI 接口与本地工作流
 │   ├── media.py              # 时间解析、FFprobe、预览、精确导出、逐帧截图与永久旋转
-│   ├── ai_enhance.py         # SeedVR2 MPS 环境、模型预下载、AI 任务、音轨回封装与成片验证
-│   ├── dialogs.py            # macOS Finder 原生选择窗口
+│   ├── ai_enhance.py         # SeedVR2 MPS/CUDA 环境、模型预下载、AI 任务、音轨回封装与成片验证
+│   ├── dialogs.py            # 系统原生文件与文件夹选择窗口
 │   ├── storage.py            # 本地设置持久化
 │   ├── build_info.py         # 应用名称、版本与默认端口
 │   └── static/               # HTML、CSS、JavaScript 与图标
 ├── tests/                    # 自动化测试
 ├── .github/workflows/        # GitHub Actions
 ├── requirements.txt          # 运行依赖
-├── requirements-ai.txt       # 首次 AI 任务才安装的独立依赖
+├── requirements-ai.txt       # Apple Silicon MPS 的固定 AI 依赖入口
+├── requirements-ai-cuda.txt  # RTX 5090 的 PyTorch CUDA 13.0 固定依赖
+├── requirements-ai-common.txt# 两种 AI 后端共用的固定依赖
 ├── requirements-dev.txt      # 测试依赖
-├── vendor/                   # 固定上游版本的 MPS/10-bit 质量补丁与许可说明
+├── vendor/                   # 固定上游版本的稳定性/10-bit 质量补丁与许可说明
 ├── pyproject.toml            # 项目与测试配置
 └── LICENSE                   # MIT License
 ```
@@ -324,4 +368,4 @@ video_cut/
 
 [MIT](LICENSE)
 
-SeedVR2 官方代码、模型及所用社区 Mac 运行器按 Apache License 2.0 提供。本仓库不直接打包约 7.3 GB 权重；首次使用时从固定来源下载并校验。补丁、固定 revision、来源和修改说明见 [`vendor/README.md`](vendor/README.md)。
+SeedVR2 官方代码、模型及所用社区运行器按 Apache License 2.0 提供。本仓库不直接打包约 7.3 GB 权重；首次使用时从固定来源下载并校验。补丁、固定 revision、来源和修改说明见 [`vendor/README.md`](vendor/README.md)。

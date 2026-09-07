@@ -15,12 +15,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - macos-14
-          - ubuntu-latest
-        python:
-          - "3.10"
-          - "3.13"
+        include:
+          - os: macos-14
+            python: "3.10"
+          - os: macos-14
+            python: "3.13"
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.12"
 
     steps:
       - uses: actions/checkout@v7
@@ -35,6 +40,10 @@ jobs:
             echo "$(brew --prefix ffmpeg-full)/bin" >> "$GITHUB_PATH"
             "$(brew --prefix ffmpeg-full)/bin/ffmpeg" -version
             "$(brew --prefix ffmpeg-full)/bin/ffprobe" -version
+          elif [[ "$RUNNER_OS" == "Windows" ]]; then
+            choco install ffmpeg-full -y --no-progress
+            ffmpeg -version
+            ffprobe -version
           else
             sudo apt-get update
             sudo apt-get install -y ffmpeg

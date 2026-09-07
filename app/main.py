@@ -4,7 +4,6 @@ import contextlib
 import mimetypes
 import os
 import secrets
-import signal
 import subprocess
 import sys
 import threading
@@ -159,13 +158,19 @@ def _user_media_error(exc: MediaError) -> str:
         ),
         "Required FFmpeg encoders are not available": "当前 FFmpeg 缺少必要的高质量编码器。",
         "Required FFmpeg color filters are not available": (
-            "当前 Mac 的 AI 色彩链路不可用；请重新运行 start.command。"
-            "如仍失败，请执行 brew install ffmpeg-full molten-vk。"
+            "当前 FFmpeg 的 AI 色彩链路不可用；请重新运行对应系统的启动脚本，"
+            "并按启动窗口提示安装完整 FFmpeg。"
         ),
         "Export job was not found": "找不到这次导出任务，请刷新页面后重试。",
         "Unsupported AI enhancement target": "请选择 1080p、2K QHD 或 4K UHD。",
         "AI enhancement is only supported on Apple Silicon Mac": (
-            "AI 超清只支持 Apple Silicon Mac，当前不会尝试 CUDA 或低质量替代模型。"
+            "AI 超清需要 Apple Silicon MPS 或 NVIDIA GeForce RTX 5090。"
+        ),
+        "AI enhancement requires Apple Silicon MPS or an RTX 5090": (
+            "AI 超清需要 Apple Silicon MPS 或 NVIDIA GeForce RTX 5090。"
+        ),
+        "NVIDIA driver R580 or newer is required for RTX 5090": (
+            "RTX 5090 的 CUDA 13.0 环境需要 NVIDIA R580 或更高版本驱动。"
         ),
         "Another AI enhancement job is already running": "一次只能运行一个 AI 模型下载或超清任务。",
         "AI enhancement job was not found": "找不到这次 AI 超清任务，请刷新页面后重试。",
@@ -207,7 +212,7 @@ def _user_media_error(exc: MediaError) -> str:
             "原片尺寸已经超过所选档位；AI 超清不会偷偷缩小画面，请选择更高档位。"
         ),
         "There is not enough free space for the AI runtime and models": (
-            "AI 环境和模型至少需要约 12 GB 可用空间，请清理项目所在磁盘后重试。"
+            "AI 环境和模型约需 12–18 GB 可用空间，请清理项目所在磁盘后重试。"
         ),
         "Could not download the pinned AI runtime": (
             "无法下载固定版本的 AI 运行器，请检查网络后重试。"
@@ -225,7 +230,7 @@ def _user_media_error(exc: MediaError) -> str:
             "找不到这次 AI 模型下载任务，请刷新页面后重试。"
         ),
         "The bundled AI quality patch failed integrity verification": (
-            "内置 MPS 质量补丁校验失败，请重新下载本项目。"
+            "内置 AI 质量补丁校验失败，请重新下载本项目。"
         ),
         "The bundled AI runtime files are missing": "AI 运行文件不完整，请重新下载本项目。",
         "The AI runtime archive contains an unsafe path": (
@@ -285,7 +290,9 @@ def _user_media_error(exc: MediaError) -> str:
     if message.startswith("Required FFmpeg encoder is not available"):
         return "当前 FFmpeg 缺少处理这类素材所需的编码器。"
     if message.startswith("Could not start AI process"):
-        return "无法启动本机 AI 进程，请重新运行 start.command 后再试。"
+        return "无法启动本机 AI 进程，请重新运行对应系统的启动脚本后再试。"
+    if message.startswith("Could not apply bundled AI patch"):
+        return "内置 AI 补丁无法应用，请删除 data/ai 后重新运行模型安装。"
     if message.startswith("The pixel format cannot be preserved safely"):
         return "该视频的专业像素格式暂时无法安全保留，已停止导出以避免静默降质。"
     return translations.get(message, "无法处理该视频，请查看详情或更换文件。")
@@ -519,6 +526,7 @@ def _proxy_chunks(
 
 def create_app(application_state: ApplicationState | None = None) -> FastAPI:
     state = application_state or ApplicationState()
+    runtime_stop_event = threading.Event()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -534,6 +542,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.application = state
+    app.state.runtime_stop_event = runtime_stop_event
     app.add_middleware(
         TrustedHostMiddleware,
         allowed_hosts=["127.0.0.1", "localhost", "testserver"],
@@ -862,7 +871,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
     def create_ai_enhancement(request: AIEnhancementRequest) -> dict[str, Any]:
         try:
             if state.ai_enhancements is None:
-                raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
+                raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
             source = state.video(request.video_id)
             output_directory = state.output_directory()
             if output_directory is None:
@@ -889,7 +898,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
     def start_ai_model_download() -> dict[str, Any]:
         try:
             if state.ai_enhancements is None:
-                raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
+                raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
             return state.ai_enhancements.start_model_download()
         except MediaError as exc:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
@@ -901,7 +910,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
     def cancel_ai_model_download(request: AIModelDownloadCancelRequest) -> dict[str, Any]:
         try:
             if state.ai_enhancements is None:
-                raise MediaError("AI enhancement is only supported on Apple Silicon Mac")
+                raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
             snapshot = state.ai_enhancements.cancel_model_download(request.job_id)
         except MediaError as exc:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
@@ -1076,11 +1085,12 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         snapshot = job.snapshot()
         if snapshot["status"] != "completed" or not job.output_path.is_file():
             raise HTTPException(status_code=409, detail="AI 超清尚未完成。")
-        command = (
-            ["/usr/bin/open", "-R", str(job.output_path)]
-            if sys.platform == "darwin"
-            else ["xdg-open", str(job.output_path.parent)]
-        )
+        if sys.platform == "darwin":
+            command = ["/usr/bin/open", "-R", str(job.output_path)]
+        elif sys.platform == "win32":
+            command = ["explorer", "/select,", str(job.output_path)]
+        else:
+            command = ["xdg-open", str(job.output_path.parent)]
         try:
             subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:
@@ -1095,7 +1105,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
 
         def stop_after_response() -> None:
             threading.Event().wait(0.15)
-            os.kill(os.getpid(), signal.SIGTERM)
+            runtime_stop_event.set()
 
         threading.Thread(target=stop_after_response, daemon=True).start()
         return {

@@ -75,6 +75,45 @@ def test_bundled_ai_patch_matches_integrity_pin() -> None:
     )
 
 
+def test_cuda_requirements_pin_official_cu130_wheels() -> None:
+    requirements = ai_module.AI_CUDA_REQUIREMENTS_PATH.read_text(encoding="utf-8")
+    assert "--extra-index-url https://download.pytorch.org/whl/cu130" in requirements
+    assert "torch==2.12.1+cu130" in requirements
+    assert "torchvision==0.27.1+cu130" in requirements
+
+
+def test_python_patch_applier_matches_whitespace_like_patch_l(tmp_path: Path) -> None:
+    root = tmp_path / "runner"
+    root.mkdir()
+    target = root / "example.py"
+    target.write_text("def    value():\n\treturn 1\n", encoding="utf-8")
+    patch = tmp_path / "quality.patch"
+    patch.write_text(
+        "--- a/example.py\n"
+        "+++ b/example.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-def value():\n"
+        "+def improved_value():\n"
+        "     return 1\n",
+        encoding="utf-8",
+    )
+
+    ai_module._apply_unified_patch(patch, root)
+
+    assert target.read_text(encoding="utf-8") == "def improved_value():\n\treturn 1\n"
+
+
+def test_bundled_patches_are_parseable_without_platform_patch_tool(tmp_path: Path) -> None:
+    quality_files = ai_module._parse_unified_patch(AI_PATCH_PATH, tmp_path)
+    color_files = ai_module._parse_unified_patch(AI_COLOR_PATCH_PATH, tmp_path)
+
+    assert len(quality_files) == 11
+    assert len(color_files) == 1
+    _, color_hunks = color_files[0]
+    assert len(color_hunks) == 14
+    assert color_hunks[-1][1:3] == (5, 17)
+
+
 def test_model_download_eta_uses_remaining_bytes_and_current_speed() -> None:
     assert ai_module._estimated_model_download_remaining_seconds(
         status="running",
@@ -830,6 +869,185 @@ def test_ai_command_is_full_precision_mps_quality_path(
     assert "zscale=" in environment["VIDEO_CUT_OUTPUT_VF"]
     assert "transfer=bt709" in environment["VIDEO_CUT_OUTPUT_VF"]
     assert "chromal=left" in environment["VIDEO_CUT_OUTPUT_VF"]
+
+
+@pytest.mark.parametrize(
+    ("target_id", "expected_batch_size"),
+    (("1080p", 21), ("2k", 13), ("4k", 5)),
+)
+def test_ai_command_is_full_precision_rtx_5090_cuda_path(
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+    target_id: str,
+    expected_batch_size: int,
+) -> None:
+    source = _source(sample_video, probe_video(sample_video, ffprobe=ffprobe))
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        compute_backend="cuda",
+        device_name="NVIDIA GeForce RTX 5090",
+        device_index=2,
+        device_uuid="GPU-5090-test",
+        device_memory_bytes=32 * 1024**3,
+        inference_runner=lambda _job, _output: None,
+    )
+    job = AIEnhancementJob(
+        id="job",
+        source=source,
+        target=ai_module.AI_TARGETS[target_id],
+        output_path=tmp_path / "output.mp4",
+        expected_width=3840,
+        expected_height=2160,
+    )
+
+    command = manager.inference_command(job, sample_video, tmp_path / "ai.mp4")
+    joined = " ".join(command)
+    assert MODEL_FILENAME in command
+    assert "--cuda_device 0" in joined
+    assert f"--batch_size {expected_batch_size}" in joined
+    assert f"--chunk_size {expected_batch_size * 8 + 1}" in joined
+    assert "--attention_mode sdpa" in joined
+    assert "--tensor_offload_device cpu" in joined
+    assert "--10bit" in command
+    assert not any(token in joined.lower() for token in ("fp8", "gguf", "sageattn"))
+
+    environment = manager._inference_environment()
+    assert environment["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert environment["CUDA_VISIBLE_DEVICES"] == "GPU-5090-test"
+    assert environment["PYTORCH_CUDA_ALLOC_CONF"] == "backend:cudaMallocAsync"
+    assert "PYTORCH_ENABLE_MPS_FALLBACK" not in environment
+    assert "PYTORCH_MPS_HIGH_WATERMARK_RATIO" not in environment
+
+    probe = manager._runtime_probe_script()
+    assert "torch.version.cuda" in probe
+    assert "sm_120" in probe
+    assert "get_device_capability() >= (12, 0)" in probe
+    assert "set_device(0)" in probe
+    assert "dtype=torch.float16" in probe
+
+    runtime = manager.runtime_status()
+    assert runtime["backend"] == "cuda"
+    assert runtime["backend_label"] == "NVIDIA CUDA 13.0"
+    assert runtime["device_name"] == "NVIDIA GeForce RTX 5090"
+    assert runtime["device_index"] == 2
+    assert runtime["device_memory_gb"] == 32.0
+
+
+def test_cuda_runtime_probe_uses_selected_gpu_visibility(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        compute_backend="cuda",
+        device_index=3,
+        device_uuid="GPU-selected-5090",
+        inference_runner=lambda _job, _output: None,
+    )
+    captured: dict[str, object] = {}
+
+    def capture(_job, command, **options):
+        captured["command"] = command
+        captured.update(options)
+        return None
+
+    monkeypatch.setattr(manager, "_run_process", capture)
+    python = tmp_path / "venv" / "Scripts" / "python.exe"
+    manager._verify_compute_runtime(AIModelDownloadJob(id="job"), python)
+
+    assert captured["command"] == [str(python), "-c", manager._runtime_probe_script()]
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "GPU-selected-5090"
+    assert captured["env"]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+
+
+def test_rtx_5090_detection_requires_sm_120_and_reads_vram(monkeypatch) -> None:
+    completed = subprocess.CompletedProcess(
+        args=["nvidia-smi"],
+        returncode=0,
+        stdout=(
+            "0, GPU-4090, NVIDIA GeForce RTX 4090, 24564, 8.9, 580.88\n"
+            "1, GPU-5090, NVIDIA GeForce RTX 5090 D, 32607, 12.0, 581.15\n"
+        ),
+        stderr="",
+    )
+    monkeypatch.setattr(ai_module, "_nvidia_smi_executable", lambda: "nvidia-smi")
+    monkeypatch.setattr(ai_module.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    device = ai_module._detect_rtx_5090()
+
+    assert device is not None
+    assert device.backend == "cuda"
+    assert device.index == 1
+    assert device.uuid == "GPU-5090"
+    assert device.name == "NVIDIA GeForce RTX 5090 D"
+    assert device.compute_capability == (12, 0)
+    assert device.memory_bytes == 32607 * 1024**2
+    assert device.driver_version == "581.15"
+
+
+def test_runtime_fingerprint_isolated_by_compute_backend(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    common = {
+        "ffmpeg": ffmpeg,
+        "ffprobe": ffprobe,
+        "runtime_root": tmp_path / "runtime",
+        "platform_supported": True,
+        "inference_runner": lambda _job, _output: None,
+    }
+    mps = AIEnhancementManager(**common, compute_backend="mps")
+    cuda = AIEnhancementManager(**common, compute_backend="cuda")
+
+    assert mps._runtime_fingerprint() != cuda._runtime_fingerprint()
+    assert mps.runtime_requirements_path == ai_module.AI_REQUIREMENTS_PATH
+    assert cuda.runtime_requirements_path == ai_module.AI_CUDA_REQUIREMENTS_PATH
+
+
+def test_python_runtime_path_uses_windows_scripts_directory(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        compute_backend="cuda",
+        inference_runner=lambda _job, _output: None,
+    )
+    monkeypatch.setattr(ai_module.sys, "platform", "win32")
+
+    assert manager.venv_python == tmp_path / "runtime" / "venv" / "Scripts" / "python.exe"
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "driver", "supported"),
+    [
+        ("win32", "580.88", True),
+        ("win32", "580.87", False),
+        ("linux", "580.65.06", True),
+        ("linux", "580.64.99", False),
+    ],
+)
+def test_cuda_driver_minimums(
+    monkeypatch,
+    platform_name: str,
+    driver: str,
+    supported: bool,
+) -> None:
+    monkeypatch.setattr(ai_module.sys, "platform", platform_name)
+    assert ai_module._cuda_driver_supported(driver) is supported
 
 
 def test_frame_timing_audit_sets_exact_count_duration_and_rational_rate(

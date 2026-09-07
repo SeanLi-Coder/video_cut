@@ -14,6 +14,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import pytest
+
 import launcher
 import stop
 
@@ -208,6 +210,7 @@ def test_media_executables_installs_missing_full_then_molten_vk(
     assert os.environ["VK_ICD_FILENAMES"] == str(molten_vk_icd)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher lifecycle")
 def test_launch_passes_molten_vk_environment_to_backend(
     monkeypatch,
     tmp_path: Path,
@@ -275,6 +278,7 @@ def test_launch_passes_molten_vk_environment_to_backend(
     assert captured_environment["VIDEO_CUT_FFPROBE"] == str(ffprobe)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor inheritance")
 def test_reserved_socket_and_parent_pipe_control_backend(
     ffmpeg: str,
     ffprobe: str,
@@ -338,6 +342,67 @@ def test_reserved_socket_and_parent_pipe_control_backend(
             process.communicate(timeout=5)
 
 
+def test_port_and_parent_pid_control_backend(ffmpeg: str, ffprobe: str) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    port = int(listener.getsockname()[1])
+    listener.close()
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "VIDEO_CUT_FFMPEG": ffmpeg,
+            "VIDEO_CUT_FFPROBE": ffprobe,
+            "VIDEO_CUT_INSTANCE_ID": "port-lifecycle-test",
+            "VIDEO_CUT_STOP_TOKEN": "port-lifecycle-stop-token",
+        }
+    )
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(PROJECT_ROOT / "run.py"),
+            "--port",
+            str(port),
+            "--parent-pid",
+            str(os.getpid()),
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert _wait_until(lambda: _health(port) is not None)
+        health = _health(port)
+        assert health is not None
+        assert health["instance_id"] == "port-lifecycle-test"
+        assert health["server_pid"] == process.pid
+
+        request = Request(
+            f"http://127.0.0.1:{port}/api/runtime/stop",
+            data=b"{}",
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Stop-Token": "port-lifecycle-stop-token",
+            },
+        )
+        with urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        assert payload["status"] == "stopping"
+        assert payload["instance_id"] == "port-lifecycle-test"
+        assert process.wait(timeout=15) == 0
+        assert _wait_until(lambda: _health(port) is None)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=5)
+
+
 def test_run_server_requires_launcher_owned_descriptors() -> None:
     completed = subprocess.run(
         [sys.executable, str(PROJECT_ROOT / "run.py")],
@@ -384,6 +449,7 @@ def test_authenticated_startup_control_channel() -> None:
         launcher._close_control_channel(listener, thread, shutdown_requested)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process guard")
 def test_process_guard_stops_child_when_launcher_pipe_closes(tmp_path: Path) -> None:
     parent_pipe_read, parent_pipe_write = os.pipe()
     os.set_inheritable(parent_pipe_read, True)
