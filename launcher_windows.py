@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -430,6 +431,36 @@ def _ffmpeg_full_check(ffmpeg: Path) -> tuple[bool, str]:
     return False, detail
 
 
+def _ffmpeg_required_components_available(ffmpeg: Path) -> bool:
+    try:
+        filters = subprocess.run(
+            [str(ffmpeg), "-hide_banner", "-filters"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        encoders = subprocess.run(
+            [str(ffmpeg), "-hide_banner", "-encoders"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if filters.returncode != 0 or encoders.returncode != 0:
+        return False
+    has_libplacebo = bool(
+        re.search(r"^\s*[TSC.]+\s+libplacebo\s+", filters.stdout, re.MULTILINE)
+    )
+    has_zscale = bool(re.search(r"^\s*[TSC.]+\s+zscale\s+", filters.stdout, re.MULTILINE))
+    has_libx265 = bool(
+        re.search(r"^\s*[A-Z.]{6}\s+libx265\b", encoders.stdout, re.MULTILINE)
+    )
+    return has_libplacebo and has_zscale and has_libx265
+
+
 def _find_media_executables() -> tuple[Path, Path, bool, str] | None:
     fallback: tuple[Path, Path, bool, str] | None = None
     for ffmpeg, ffprobe in _candidate_ffmpeg_pairs():
@@ -447,6 +478,13 @@ def _find_media_executables() -> tuple[Path, Path, bool, str] | None:
 def _media_executables(*, stop_requested: threading.Event) -> tuple[Path, Path]:
     selected = _find_media_executables()
     if selected is not None and selected[2]:
+        return selected[0], selected[1]
+    if selected is not None and _ffmpeg_required_components_available(selected[0]):
+        print(
+            "FFmpeg Full components are installed, but the GPU color-pipeline check failed. "
+            "Basic video tools will remain available; AI enhancement will show the driver or "
+            f"Vulkan detail. Detail: {selected[3]}"
+        )
         return selected[0], selected[1]
 
     print("FFmpeg Full is missing. Installing it with Windows Package Manager...")

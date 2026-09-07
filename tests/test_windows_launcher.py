@@ -220,6 +220,21 @@ def test_media_executables_keeps_verified_existing_full_build(
     )
 
 
+def test_ffmpeg_required_components_are_parsed(monkeypatch, tmp_path: Path) -> None:
+    outputs = iter(
+        (
+            SimpleNamespace(
+                returncode=0,
+                stdout=" ... libplacebo        V->V\n ... zscale           V->V\n",
+            ),
+            SimpleNamespace(returncode=0, stdout=" V....D libx265              HEVC\n"),
+        )
+    )
+    monkeypatch.setattr(launcher_windows.subprocess, "run", lambda *_args, **_kwargs: next(outputs))
+
+    assert launcher_windows._ffmpeg_required_components_available(tmp_path / "ffmpeg.exe")
+
+
 def test_media_executables_installs_full_build_when_existing_ffmpeg_is_basic(
     monkeypatch,
     tmp_path: Path,
@@ -247,6 +262,34 @@ def test_media_executables_installs_full_build_when_existing_ffmpeg_is_basic(
         full_ffprobe,
     )
     assert packages == [launcher_windows.FFMPEG_PACKAGE_ID]
+
+
+def test_media_executables_does_not_reinstall_full_build_without_gpu(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffprobe = tmp_path / "ffprobe.exe"
+    monkeypatch.setattr(
+        launcher_windows,
+        "_find_media_executables",
+        lambda: (ffmpeg, ffprobe, False, "Failed creating Vulkan device"),
+    )
+    monkeypatch.setattr(
+        launcher_windows,
+        "_ffmpeg_required_components_available",
+        lambda _ffmpeg: True,
+    )
+    monkeypatch.setattr(
+        launcher_windows,
+        "_install_winget_package",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected install")),
+    )
+
+    assert launcher_windows._media_executables(stop_requested=threading.Event()) == (
+        ffmpeg,
+        ffprobe,
+    )
 
 
 def test_media_executables_keeps_basic_tools_when_winget_upgrade_fails(
