@@ -11,7 +11,9 @@ from types import SimpleNamespace
 
 import launcher_windows
 import stop
+import windows_exe
 from app import dialogs
+from app import paths as app_paths
 
 
 def test_posix_launcher_imports_when_fcntl_is_unavailable() -> None:
@@ -48,6 +50,16 @@ def test_find_python_312_uses_per_user_install(monkeypatch, tmp_path: Path) -> N
     )
 
     assert launcher_windows._find_python_312() == expected.resolve()
+
+
+def test_frozen_launcher_does_not_treat_itself_as_python(monkeypatch) -> None:
+    monkeypatch.setattr(launcher_windows, "is_frozen", lambda: True)
+    monkeypatch.setattr(launcher_windows, "_python_from_py_launcher", lambda: None)
+    monkeypatch.setattr(launcher_windows.shutil, "which", lambda _name: None)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv("PROGRAMFILES", raising=False)
+
+    assert launcher_windows._python_candidates() == []
 
 
 def test_resolve_base_python_installs_python_312(monkeypatch, tmp_path: Path) -> None:
@@ -262,6 +274,7 @@ def test_windows_launch_uses_port_and_parent_pid_mode(monkeypatch, tmp_path: Pat
     ffmpeg = tmp_path / "ffmpeg.exe"
     ffprobe = tmp_path / "ffprobe.exe"
     captured_command: list[str] = []
+    captured_environment: dict[str, str] = {}
     records: list[dict[str, object]] = []
     fake_lock = io.BytesIO(b"\0")
 
@@ -282,6 +295,7 @@ def test_windows_launch_uses_port_and_parent_pid_mode(monkeypatch, tmp_path: Pat
 
     def start_backend(command, **_kwargs):
         captured_command.extend(command)
+        captured_environment.update(_kwargs["env"])
         return BackendProcess()
 
     monkeypatch.setattr(launcher_windows, "_prepare_lock_file", lambda: fake_lock)
@@ -333,6 +347,68 @@ def test_windows_launch_uses_port_and_parent_pid_mode(monkeypatch, tmp_path: Pat
     ]
     assert records[-1]["phase"] == "running"
     assert records[-1]["control_port"] == 42_425
+    assert captured_environment["VIDEO_CUT_AI_BASE_PYTHON"] == str(python)
+
+
+def test_frozen_launcher_resolves_python_without_executable_recursion(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.setattr(launcher_windows, "is_frozen", lambda: True)
+
+    def launch(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(launcher_windows, "launch", launch)
+
+    assert launcher_windows.main(["--no-browser"]) == 0
+    assert captured["base_python"] is None
+
+
+def test_portable_paths_split_resources_and_writable_data(monkeypatch, tmp_path: Path) -> None:
+    resource_root = tmp_path / "bundle"
+    executable = tmp_path / "portable" / "LocalVideoCutter.exe"
+    monkeypatch.setattr(app_paths.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(app_paths.sys, "_MEIPASS", str(resource_root), raising=False)
+    monkeypatch.setattr(app_paths.sys, "executable", str(executable))
+
+    assert app_paths.resource_root() == resource_root.resolve()
+    assert app_paths.application_root() == executable.parent.resolve()
+
+
+def test_windows_executable_resets_dll_search_path(monkeypatch) -> None:
+    calls: list[object] = []
+
+    class SetDllDirectory:
+        argtypes = None
+        restype = None
+
+        def __call__(self, value):
+            calls.append(value)
+            return 1
+
+    setter = SetDllDirectory()
+    monkeypatch.setattr(windows_exe.sys, "platform", "win32")
+    monkeypatch.setattr(
+        windows_exe.ctypes,
+        "windll",
+        SimpleNamespace(kernel32=SimpleNamespace(SetDllDirectoryW=setter)),
+        raising=False,
+    )
+
+    windows_exe._reset_windows_dll_search_path()
+
+    assert calls == [None]
+    assert setter.argtypes == [windows_exe.ctypes.c_wchar_p]
+    assert setter.restype is windows_exe.ctypes.c_int
+
+
+def test_windows_executable_routes_stop_command(monkeypatch) -> None:
+    monkeypatch.setattr(windows_exe.multiprocessing, "freeze_support", lambda: None)
+    monkeypatch.setattr(windows_exe, "_reset_windows_dll_search_path", lambda: None)
+    monkeypatch.setattr(stop, "main", lambda: 17)
+
+    assert windows_exe.main(["--stop"]) == 17
 
 
 def test_windows_dialog_returns_utf8_path(monkeypatch, tmp_path: Path) -> None:

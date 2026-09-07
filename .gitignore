@@ -4,6 +4,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+release/
+build/
+dist/
+*.spec
 
 data/settings.json
 data/runtime/*

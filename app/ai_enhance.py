@@ -33,14 +33,15 @@ from .media import (
     probe_video,
     safe_output_stem,
 )
+from .paths import APPLICATION_ROOT, RESOURCE_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RUNTIME_ROOT = PROJECT_ROOT / "data" / "ai"
-AI_REQUIREMENTS_PATH = PROJECT_ROOT / "requirements-ai.txt"
-AI_CUDA_REQUIREMENTS_PATH = PROJECT_ROOT / "requirements-ai-cuda.txt"
-AI_COMMON_REQUIREMENTS_PATH = PROJECT_ROOT / "requirements-ai-common.txt"
-AI_PATCH_PATH = PROJECT_ROOT / "vendor" / "seedvr2-mps-quality.patch"
-AI_COLOR_PATCH_PATH = PROJECT_ROOT / "vendor" / "seedvr2-color-input.patch"
+PROJECT_ROOT = RESOURCE_ROOT
+DEFAULT_RUNTIME_ROOT = APPLICATION_ROOT / "data" / "ai"
+AI_REQUIREMENTS_PATH = RESOURCE_ROOT / "requirements-ai.txt"
+AI_CUDA_REQUIREMENTS_PATH = RESOURCE_ROOT / "requirements-ai-cuda.txt"
+AI_COMMON_REQUIREMENTS_PATH = RESOURCE_ROOT / "requirements-ai-common.txt"
+AI_PATCH_PATH = RESOURCE_ROOT / "vendor" / "seedvr2-mps-quality.patch"
+AI_COLOR_PATCH_PATH = RESOURCE_ROOT / "vendor" / "seedvr2-color-input.patch"
 
 RUNNER_REVISION = "4490bd1f482e026674543386bb2a4d176da245b9"
 RUNNER_VERSION = "2.5.24"
@@ -1211,6 +1212,7 @@ class AIEnhancementManager:
             "driver_supported": self.driver_supported,
             "hardware_detected": self.hardware_detected,
             "hardware_verified": bool(self.hardware_detected and installed),
+            "encoder_available": self.encoder_available,
             "color_pipeline": "libplacebo + zscale, 16-bit sRGB / BT.2446A to BT.709 SDR",
             "color_pipeline_available": self.color_pipeline_available,
             "first_download_gb": FIRST_MODEL_DOWNLOAD_GB,

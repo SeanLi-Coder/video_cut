@@ -19,13 +19,15 @@ from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from app.paths import APPLICATION_ROOT, is_frozen
+
 try:
     import msvcrt
 except ImportError:  # pragma: no cover - imported by tests on non-Windows hosts
     msvcrt = None
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = APPLICATION_ROOT
 RUNTIME_ROOT = PROJECT_ROOT / "data" / "runtime"
 LOCK_PATH = RUNTIME_ROOT / "project.lock"
 RECORD_PATH = RUNTIME_ROOT / "runtime.json"
@@ -110,7 +112,8 @@ def _python_candidates(initial: Path | None = None) -> list[Path]:
     candidates: list[Path] = []
     if initial is not None:
         candidates.append(initial)
-    candidates.append(Path(sys.executable))
+    if not is_frozen():
+        candidates.append(Path(sys.executable))
     from_launcher = _python_from_py_launcher()
     if from_launcher is not None:
         candidates.append(from_launcher)
@@ -220,7 +223,7 @@ def _install_winget_package(
     if not winget:
         raise LauncherError(
             "Windows Package Manager is required. Install App Installer from Microsoft Store, "
-            "then run start.bat again."
+            "then start Local Video Cutter again."
         )
     base_command = [
         winget,
@@ -246,7 +249,7 @@ def _install_winget_package(
 
 
 def _resolve_base_python(
-    initial: Path,
+    initial: Path | None,
     *,
     stop_requested: threading.Event,
 ) -> Path:
@@ -267,7 +270,7 @@ def _resolve_base_python(
             raise install_error
         raise LauncherError(
             "Python 3.12 was installed but could not be located. Close this window and run "
-            "start.bat again."
+            "Local Video Cutter again."
         )
     return python
 
@@ -460,7 +463,7 @@ def _media_executables(*, stop_requested: threading.Event) -> tuple[Path, Path]:
             raise install_error
         raise LauncherError(
             "FFmpeg was installed but could not be located. Close this window and run "
-            "start.bat again."
+            "Local Video Cutter again."
         )
     if install_error is not None:
         print(f"FFmpeg Full installation did not complete: {install_error}")
@@ -688,7 +691,7 @@ def _port_argument(value: str) -> int:
     return port
 
 
-def launch(*, base_python: Path, preferred_port: int, no_browser: bool) -> int:
+def launch(*, base_python: Path | None, preferred_port: int, no_browser: bool) -> int:
     lock_handle = _prepare_lock_file()
     owns_lock = _try_lock(lock_handle)
     try:
@@ -753,6 +756,7 @@ def launch(*, base_python: Path, preferred_port: int, no_browser: bool) -> int:
                     "VIDEO_CUT_FFPROBE": str(ffprobe),
                     "VIDEO_CUT_INSTANCE_ID": instance_id,
                     "VIDEO_CUT_STOP_TOKEN": stop_token,
+                    "VIDEO_CUT_AI_BASE_PYTHON": str(resolved_python),
                 }
             )
             environment["PATH"] = os.pathsep.join(
@@ -863,7 +867,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         return launch(
-            base_python=Path(sys.executable).resolve(),
+            base_python=None if is_frozen() else Path(sys.executable).resolve(),
             preferred_port=args.port,
             no_browser=args.no_browser,
         )

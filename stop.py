@@ -11,7 +11,9 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+from app.paths import APPLICATION_ROOT
+
+PROJECT_ROOT = APPLICATION_ROOT
 RECORD_PATH = PROJECT_ROOT / "data" / "runtime" / "runtime.json"
 APP_ID = "com.seanli.local-video-cutter"
 

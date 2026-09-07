@@ -40,10 +40,11 @@ from .media import (
     validate_frame_range,
     validate_time_range,
 )
+from .paths import APPLICATION_ROOT, RESOURCE_ROOT
 from .storage import SettingsStore
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-STATIC_ROOT = Path(__file__).resolve().parent / "static"
+PROJECT_ROOT = APPLICATION_ROOT
+STATIC_ROOT = RESOURCE_ROOT / "app" / "static"
 SETTINGS_PATH = PROJECT_ROOT / "data" / "settings.json"
 MAX_REMEMBERED_VIDEOS = 12
 MAX_PREVIEW_SPECS = 80
@@ -340,6 +341,7 @@ class ApplicationState:
         self.ai_enhancements = AIEnhancementManager(
             ffmpeg=resolved_ffmpeg,
             ffprobe=resolved_ffprobe,
+            base_python=os.environ.get("VIDEO_CUT_AI_BASE_PYTHON"),
         )
 
     def output_directory(self) -> Path | None:

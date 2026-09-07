@@ -64,3 +64,86 @@ jobs:
 
       - name: Run tests
         run: python -m pytest
+
+  windows_portable:
+    name: Windows portable package
+    needs: pytest
+    runs-on: windows-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      package_name: ${{ steps.package.outputs.package_name }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install FFmpeg Full
+        run: choco install ffmpeg-full -y --no-progress
+
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Build portable package
+        id: package
+        shell: pwsh
+        run: ./scripts/build_windows_portable.ps1 -OutputDirectory "$env:RUNNER_TEMP\release"
+
+      - name: Smoke-test extracted package
+        shell: pwsh
+        run: ./scripts/smoke_windows_portable.ps1 -ArchivePath "${{ steps.package.outputs.archive }}"
+
+      - name: Upload portable package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.package_name }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - pytest
+      - windows_portable
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Validate release version
+        env:
+          PACKAGE_VERSION: ${{ needs.windows_portable.outputs.version }}
+        run: |
+          if [ "v${PACKAGE_VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package version ${PACKAGE_VERSION}."
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.windows_portable.outputs.package_name }}
+          path: release-assets
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" release-assets/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" release-assets/* \
+              --verify-tag \
+              --title "Local Video Cutter ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi

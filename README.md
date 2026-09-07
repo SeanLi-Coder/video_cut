@@ -1,21 +1,22 @@
 # 本地视频剪辑、逐帧截图、永久旋转与 AI 超清
 
-一个面向 macOS 和 Windows 11 的跨平台本地视频处理工具，提供“剪辑视频”“逐帧截图”“永久旋转”和“AI 超清”四种模式，并带独立的 AI 模型预下载与进度管理页面。macOS 双击 `start.command`，Windows 双击 `start.bat` 即可启动；视频不会上传，原文件也不会被修改。
+一个面向 macOS 和 Windows 11 的跨平台本地视频处理工具，提供“剪辑视频”“逐帧截图”“永久旋转”和“AI 超清”四种模式，并带独立的 AI 模型预下载与进度管理页面。macOS 双击 `start.command`，Windows 便携版双击 `LocalVideoCutter.exe` 即可启动；视频不会上传，原文件也不会被修改。
 
 ## 零基础使用方法
 
 ### 1. 下载并解压
 
-在 GitHub 项目页面点击 **Code → Download ZIP**，下载后双击 ZIP 解压。
+Windows 11 / RTX 5090 用户建议打开 [GitHub Releases](https://github.com/SeanLi-Coder/video_cut/releases/latest)，下载名称以 `LocalVideoCutter-Windows-RTX5090` 开头的 ZIP。macOS 或需要源码的用户可以在项目页面点击 **Code → Download ZIP**。
 
-不要直接在 ZIP 压缩包预览窗口里运行；请先把整个项目文件夹解压到“下载”或“桌面”等普通目录。
+不要直接在 ZIP 压缩包预览窗口里运行，也不要只复制其中的 EXE；请先把整个文件夹解压到“下载”或“桌面”等普通可写目录。
 
 ### 2. 双击启动
 
 打开解压后的文件夹，根据系统双击启动：
 
 - macOS：`start.command`
-- Windows 11：`start.bat`
+- Windows 11 便携版：`LocalVideoCutter.exe`
+- Windows 11 源码版：`start.bat`
 
 首次启动会做这些事情：
 
@@ -25,7 +26,7 @@
 - 检查 FFmpeg 和 FFprobe；
 - 启动仅供本机访问的网页，并自动在浏览器中打开。
 
-第一次安装需要联网，可能持续几分钟。启动脚本打开的 Terminal 或 Windows Terminal 窗口在工具运行期间需要保持打开。
+第一次安装需要联网，可能持续几分钟。启动时打开的 Terminal 或 Windows Console 窗口在工具运行期间需要保持打开。
 
 ### 3. 提前下载 AI 模型（可选）
 
@@ -221,7 +222,11 @@ python3 --version
 
 ### Windows 11 + RTX 5090
 
-双击 `start.bat`。启动器会查找兼容的 Python，建立项目内独立环境，并检查 FFmpeg、FFprobe、`nvidia-smi` 和 RTX 5090。缺少 Python 或 FFmpeg 时会在可用的情况下通过 WinGet 安装；请保留启动窗口，按其中提示处理系统确认。
+推荐使用 Releases 中的 Windows 便携包：完整解压后双击 `LocalVideoCutter.exe`。只需要复制这个解压后的完整文件夹，不需要 Git，也不需要手动执行命令。源码包仍可双击 `start.bat` 启动。
+
+便携版 EXE 是一键启动器，旁边的 `app`、`vendor` 和 requirements 文件是程序本体的一部分，不能只单独复制 EXE。启动器会查找兼容的 Python，建立项目内独立环境，并检查 FFmpeg、FFprobe、`nvidia-smi` 和 RTX 5090。缺少 Python 3.12 或 FFmpeg 时会在可用的情况下通过 WinGet 自动安装；请保留启动窗口，按其中提示处理系统确认。模型不会打进 ZIP，请在网页的“AI 模型管理”中单独下载并查看进度。
+
+便携包应放在桌面、下载目录或其他普通用户可写目录，不要放入 `Program Files`。程序数据会写在便携包内部的 `.venv` 和 `data` 目录，因此移动到另一台 Windows 电脑时应复制整个文件夹；第一次在新电脑上仍会按该机器重新准备运行环境。
 
 请先从 [NVIDIA 官方驱动页面](https://www.nvidia.com/Download/index.aspx)安装 R580 或更新分支驱动并重启。无需下载 CUDA Toolkit、cuDNN 或 Visual Studio CUDA workload；AI 模型页会在独立环境中安装固定的 PyTorch `2.12.1` `cu130` wheel。可以在 PowerShell 先检查：
 
@@ -235,7 +240,7 @@ ffmpeg -version
 
 ## 停止工具
 
-正常情况下，在启动工具的终端窗口按 `Control + C`。如果已经找不到那个窗口，macOS 双击 `stop.command`，Windows 双击 `stop.bat`。
+正常情况下，在启动工具的终端窗口按 `Control + C`。如果已经找不到那个窗口，macOS 双击 `stop.command`，Windows 双击 `stop.bat`；Windows 便携版也支持在命令行执行 `LocalVideoCutter.exe --stop`。
 
 导出过程中关闭工具会取消当前导出并清理未完成的临时文件；已经成功完成的文件不会被删除。AI 任务的完整模型缓存不会随取消而删除。
 
@@ -279,7 +284,15 @@ brew install python ffmpeg-full molten-vk
 
 先在 PowerShell 运行 `nvidia-smi`。如果没有命令、未列出 RTX 5090，或驱动分支低于 R580，请从 NVIDIA 官网安装新驱动并重启。只安装 CUDA Toolkit 不能代替显卡驱动，本项目本身也不需要 CUDA Toolkit。
 
-如果 `nvidia-smi` 正常，但模型页仍不可用，请关闭旧的启动窗口，重新运行 `start.bat`，让独立 AI 环境完成 PyTorch `2.12.1` `cu130` 校验。不要把系统里另一个 Python 环境的 `torch` 版本当成本项目环境。
+如果 `nvidia-smi` 正常，但模型页仍不可用，请关闭旧的启动窗口，重新运行 `LocalVideoCutter.exe`（源码版运行 `start.bat`），让独立 AI 环境完成 PyTorch `2.12.1` `cu130` 校验。不要把系统里另一个 Python 环境的 `torch` 版本当成本项目环境。
+
+### Windows SmartScreen 显示“未知发布者”
+
+当前 GitHub Release 没有商业代码签名证书，Windows 可能在第一次运行时显示 SmartScreen 提示。请只使用本仓库 Releases 中的 ZIP，并核对同页 `.sha256` 文件；确认来源后点击“更多信息”再选择“仍要运行”。SHA-256 可以在 PowerShell 中检查：
+
+```powershell
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.7.0.zip -Algorithm SHA256
+```
 
 ### 无法选择视频或保存目录
 
@@ -329,7 +342,7 @@ python -m pytest
 python launcher.py --no-browser
 ```
 
-GitHub Actions 会在 macOS、Windows 和 Ubuntu 环境中检查 Python 代码并运行可执行的测试。自动化测试能够覆盖平台分支、命令生成和模拟设备探测，但云端 runner 没有 RTX 5090，不能替代前文的真实 5090 验收。
+GitHub Actions 会在 macOS、Windows 和 Ubuntu 环境中检查 Python 代码并运行可执行的测试。全部平台测试通过后，Windows runner 才会构建便携 ZIP；它会把成品解压到带空格和中文的路径，实际启动 EXE、检查网页与便携数据目录，再通过同一个 EXE 安全停止。自动化测试能够覆盖平台分支、命令生成和模拟设备探测，但云端 runner 没有 RTX 5090，不能替代前文的真实 5090 推理验收。
 
 ## 项目结构
 
@@ -339,6 +352,7 @@ video_cut/
 ├── stop.command              # 安全停止本地服务
 ├── start.bat                 # Windows 双击启动入口
 ├── stop.bat                  # Windows 安全停止入口
+├── windows_exe.py            # Windows 便携 EXE 的最小入口
 ├── launcher.py               # macOS Python 环境、依赖、FFmpeg 与进程管理
 ├── launcher_windows.py       # Windows 环境、依赖、FFmpeg 与进程管理
 ├── process_guard.py          # 首次安装阶段的子进程与锁守护
@@ -351,6 +365,7 @@ video_cut/
 │   ├── dialogs.py            # 系统原生文件与文件夹选择窗口
 │   ├── storage.py            # 本地设置持久化
 │   ├── build_info.py         # 应用名称、版本与默认端口
+│   ├── paths.py              # 源码与便携运行时路径分离
 │   └── static/               # HTML、CSS、JavaScript 与图标
 ├── tests/                    # 自动化测试
 ├── .github/workflows/        # GitHub Actions
@@ -359,6 +374,8 @@ video_cut/
 ├── requirements-ai-cuda.txt  # RTX 5090 的 PyTorch CUDA 13.0 固定依赖
 ├── requirements-ai-common.txt# 两种 AI 后端共用的固定依赖
 ├── requirements-dev.txt      # 测试依赖
+├── requirements-build.txt    # Windows 便携包固定构建依赖
+├── scripts/                  # Windows 便携包构建与成品冒烟测试
 ├── vendor/                   # 固定上游版本的稳定性/10-bit 质量补丁与许可说明
 ├── pyproject.toml            # 项目与测试配置
 └── LICENSE                   # MIT License
