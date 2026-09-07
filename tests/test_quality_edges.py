@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -8,13 +9,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main_module
+import app.media as media_module
 from app.main import ApplicationState, create_app
 from app.media import (
     ExportManager,
     FrameExtractionJob,
     FrameExtractionManager,
     MediaError,
+    RotationJob,
+    RotationManager,
     VideoSource,
+    _is_dynamic_hdr_side_data_type,
     probe_video,
     validate_time_range,
 )
@@ -72,6 +77,58 @@ def _extract_frames(
     return source.metadata, job
 
 
+def _rotate(
+    source_path: Path,
+    *,
+    ffmpeg: str,
+    ffprobe: str,
+    degrees: int,
+):
+    source = VideoSource(
+        "rotation-quality-edge",
+        source_path,
+        probe_video(source_path, ffprobe=ffprobe),
+    )
+    manager = RotationManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+    job = manager.create(source, degrees=degrees)
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline and job.snapshot()["status"] in {"queued", "running"}:
+        time.sleep(0.05)
+    assert job.snapshot()["status"] == "completed", job.snapshot()
+    return source.metadata, probe_video(job.output_path, ffprobe=ffprobe), job.output_path
+
+
+def _decoded_video_md5(
+    path: Path,
+    ffmpeg: str,
+    *,
+    pixel_format: str,
+    video_filter: str | None = None,
+) -> str:
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-map",
+        "0:v:0",
+        "-an",
+    ]
+    if video_filter is not None:
+        command.extend(["-vf", video_filter])
+    command.extend(["-pix_fmt", pixel_format, "-f", "md5", "pipe:1"])
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return completed.stdout.strip()
+
+
 @pytest.mark.parametrize(
     ("pixel_format", "expected_codec", "expected_suffix"),
     [
@@ -117,6 +174,485 @@ def test_high_depth_and_alpha_formats_are_not_silently_reduced(
     assert result["has_alpha"] == source["has_alpha"]
     assert result["width"] == source["width"]
     assert result["height"] == source["height"]
+
+
+def test_rotation_preserves_prores_4444_alpha_and_high_bit_depth(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "rotation-alpha.mov"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=96x64:rate=8:duration=1,format=yuva444p10le",
+            "-c:v",
+            "prores_ks",
+            "-profile:v",
+            "4",
+            "-alpha_bits",
+            "16",
+            str(source_path),
+        ],
+    )
+    source, result, output_path = _rotate(
+        source_path,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        degrees=90,
+    )
+
+    assert source["video_codec"] == "prores"
+    assert source["has_alpha"] is True
+    assert output_path.parent == source_path.parent
+    assert (result["width"], result["height"]) == (source["height"], source["width"])
+    assert result["rotation"] == 0
+    assert result["display_matrix"] is None
+    assert result["pix_fmt"] == source["pix_fmt"]
+    assert result["video_bit_depth"] >= source["video_bit_depth"] >= 10
+    assert result["has_alpha"] is True
+    assert result["pixel_log2_chroma_w"] == source["pixel_log2_chroma_w"]
+    assert result["pixel_log2_chroma_h"] == source["pixel_log2_chroma_h"]
+    assert result["fps"] == source["fps"]
+
+
+def test_rotation_preserves_hdr_color_metadata_and_ten_bit_precision(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "rotation-hdr.mp4"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=10:duration=1",
+            "-vf",
+            "format=yuv420p10le",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-x265-params",
+            (
+                "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
+                "hdr-opt=1:repeat-headers=1:"
+                "master-display=G(13250,34500)B(7500,3000)R(34000,16000)"
+                "WP(15635,16450)L(10000000,50):max-cll=1000,400"
+            ),
+            "-color_range",
+            "tv",
+            "-color_primaries",
+            "bt2020",
+            "-color_trc",
+            "smpte2084",
+            "-colorspace",
+            "bt2020nc",
+            str(source_path),
+        ],
+    )
+    source, result, output_path = _rotate(
+        source_path,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        degrees=270,
+    )
+
+    assert output_path.parent == source_path.parent
+    assert (result["width"], result["height"]) == (source["height"], source["width"])
+    assert result["video_codec"] == source["video_codec"] == "hevc"
+    assert result["pix_fmt"] == source["pix_fmt"] == "yuv420p10le"
+    assert result["video_bit_depth"] == source["video_bit_depth"] == 10
+    assert result["is_hdr"] is source["is_hdr"] is True
+    assert result["color_range"] == source["color_range"] == "tv"
+    assert result["color_primaries"] == source["color_primaries"] == "bt2020"
+    assert result["color_transfer"] == source["color_transfer"] == "smpte2084"
+    assert result["color_space"] == source["color_space"] == "bt2020nc"
+    assert source["static_hdr_metadata"]
+    assert result["static_hdr_metadata"] == source["static_hdr_metadata"]
+    assert result["fps"] == source["fps"]
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        (
+            {
+                "is_hdr": True,
+                "hdr_metadata_inspected": True,
+                "dynamic_hdr_metadata_types": ("HDR10+ Metadata",),
+            },
+            "Dynamic HDR metadata",
+        ),
+        (
+            {"is_hdr": True, "hdr_metadata_inspected": False},
+            "HDR metadata could not be inspected",
+        ),
+    ],
+)
+def test_rotation_rejects_hdr_that_cannot_be_preserved_safely(
+    metadata: dict[str, object],
+    message: str,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "unsafe-hdr.mp4"
+    source_path.touch()
+    source = VideoSource("unsafe-hdr", source_path, metadata)
+    manager = RotationManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+
+    with pytest.raises(MediaError, match=message):
+        manager.create(source, degrees=90)
+
+
+@pytest.mark.parametrize(
+    "side_data_type",
+    [
+        "DOVI configuration record",
+        "Dolby Vision metadata",
+        "HDR10+ Metadata",
+        "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)",
+        "HDR Dynamic Metadata CUVA 005.1 2021 (Vivid)",
+        "HDR Vivid metadata",
+    ],
+)
+def test_dynamic_hdr_side_data_type_variants_are_detected(side_data_type: str) -> None:
+    assert _is_dynamic_hdr_side_data_type(side_data_type) is True
+
+
+def test_rotation_full_frame_scan_rejects_late_dynamic_hdr(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "late-hdr10plus.mp4"
+    source_path.touch()
+    source = VideoSource(
+        "late-hdr10plus",
+        source_path,
+        {
+            "duration": 3.0,
+            "video_stream_index": 0,
+            "static_hdr_metadata": {
+                "Mastering display metadata": {"red_x": "17/25"},
+            },
+        },
+    )
+    job = RotationJob(
+        id="late-hdr-job",
+        source=source,
+        degrees=90,
+        output_path=tmp_path / "late-hdr10plus_rotated_90.mp4",
+    )
+    commands: list[list[str]] = []
+
+    class FakeProbeProcess:
+        def __init__(self, command, **_options) -> None:
+            commands.append(command)
+            self.stdout = iter(
+                [
+                    (
+                        "best_effort_timestamp_time=0.000000|"
+                        "side_datum/mastering_display_metadata:"
+                        "side_data_type=Mastering display metadata|"
+                        "side_datum/mastering_display_metadata:red_x=17/25\n"
+                    ),
+                    "best_effort_timestamp_time=1.000000\n",
+                    (
+                        "best_effort_timestamp_time=2.000000|"
+                        "side_datum/hdr_dynamic_metadata_cuva:"
+                        "side_data_type=HDR Dynamic Metadata CUVA 005.1 2021 (Vivid)\n"
+                    ),
+                ]
+            )
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout=None) -> int:
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def send_signal(self, _signal) -> None:
+            self.returncode = -2
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(media_module.subprocess, "Popen", FakeProbeProcess)
+    manager = RotationManager.__new__(RotationManager)
+    manager.ffprobe = "/fake/ffprobe"
+    manager._lock = threading.RLock()
+
+    with pytest.raises(MediaError, match="Dynamic HDR metadata"):
+        manager._scan_all_frame_hdr_metadata(job)
+
+    assert commands
+    assert "-show_frames" in commands[0]
+    assert "-read_intervals" not in commands[0]
+    assert job.process is None
+
+
+def test_rotation_manager_does_not_require_export_only_encoders(monkeypatch) -> None:
+    monkeypatch.setattr(ExportManager, "_read_encoders", lambda _self: {"ffv1"})
+    manager = RotationManager(ffmpeg="/fake/ffmpeg", ffprobe="/fake/ffprobe")
+    assert manager.encoders == {"ffv1"}
+
+
+def test_rotation_keeps_ffv1_yuv444p10_lossless(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "ffv1-10-bit.mkv"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=96x64:rate=8:duration=1",
+            "-vf",
+            "format=yuv444p10le",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-pix_fmt",
+            "yuv444p10le",
+            str(source_path),
+        ],
+    )
+    source, result, output_path = _rotate(
+        source_path,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        degrees=90,
+    )
+
+    assert output_path.suffix == ".mkv"
+    assert source["video_codec"] == result["video_codec"] == "ffv1"
+    assert source["pix_fmt"] == result["pix_fmt"] == "yuv444p10le"
+    assert source["video_bit_depth"] == result["video_bit_depth"] == 10
+    assert (result["width"], result["height"]) == (source["height"], source["width"])
+    assert _decoded_video_md5(
+        output_path,
+        ffmpeg,
+        pixel_format="yuv444p10le",
+        video_filter="transpose=cclock",
+    ) == _decoded_video_md5(
+        source_path,
+        ffmpeg,
+        pixel_format="yuv444p10le",
+    )
+
+
+def test_quarter_turn_promotes_asymmetric_chroma_without_reducing_detail(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "ffv1-yuv422.mkv"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=96x64:rate=8:duration=1",
+            "-vf",
+            "format=yuv422p",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-pix_fmt",
+            "yuv422p",
+            str(source_path),
+        ],
+    )
+    source, result, output_path = _rotate(
+        source_path,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        degrees=90,
+    )
+
+    assert source["pix_fmt"] == "yuv422p"
+    assert result["video_codec"] == "ffv1"
+    assert result["pix_fmt"] == "yuv444p"
+    assert result["pixel_log2_chroma_w"] == 0
+    assert result["pixel_log2_chroma_h"] == 0
+    assert _decoded_video_md5(
+        output_path,
+        ffmpeg,
+        pixel_format="yuv444p",
+        video_filter="transpose=cclock",
+    ) == _decoded_video_md5(
+        source_path,
+        ffmpeg,
+        pixel_format="yuv444p",
+    )
+
+
+@pytest.mark.parametrize(
+    ("display_rotation", "degrees", "source_sar", "expected_sar"),
+    [
+        (0, 90, "4:3", "3:4"),
+        (0, 180, "4:3", "4:3"),
+        (0, 270, "4:3", "3:4"),
+        (0, 360, "4:3", "4:3"),
+        (90, 90, "3:4", "4:3"),
+    ],
+)
+def test_rotation_preserves_anamorphic_display_geometry(
+    display_rotation: int,
+    degrees: int,
+    source_sar: str,
+    expected_sar: str,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    encoded_path = tmp_path / "anamorphic.mp4"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=96x64:rate=8:duration=1",
+            "-vf",
+            "setsar=4/3,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            str(encoded_path),
+        ],
+    )
+    source_path = encoded_path
+    if display_rotation:
+        source_path = tmp_path / "anamorphic-display-rotated.mp4"
+        _run_ffmpeg(
+            ffmpeg,
+            [
+                "-display_rotation",
+                str(display_rotation),
+                "-i",
+                str(encoded_path),
+                "-c",
+                "copy",
+                str(source_path),
+            ],
+        )
+
+    source, result, _ = _rotate(
+        source_path,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        degrees=degrees,
+    )
+
+    assert source["rotation"] == display_rotation
+    assert source["sample_aspect_ratio"] == source_sar
+    assert result["sample_aspect_ratio"] == expected_sar
+    expected_dimensions = (
+        (source["height"], source["width"])
+        if degrees in {90, 270}
+        else (source["width"], source["height"])
+    )
+    assert (result["width"], result["height"]) == expected_dimensions
+    assert result["rotation"] == 0
+    assert result["display_matrix"] is None
+
+
+def test_prores_4444_timecode_data_does_not_break_ffv1_mkv_rotation(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = tmp_path / "prores-with-timecode.mov"
+    _run_ffmpeg(
+        ffmpeg,
+        [
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=96x64:rate=25:duration=1,format=yuva444p10le",
+            "-c:v",
+            "prores_ks",
+            "-profile:v",
+            "4",
+            "-alpha_bits",
+            "16",
+            "-timecode",
+            "01:00:00:00",
+            str(source_path),
+        ],
+    )
+    input_data_stream = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "d",
+            "-show_entries",
+            "stream=codec_type,codec_tag_string",
+            "-of",
+            "csv=p=0",
+            str(source_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert "data,tmcd" in input_data_stream.stdout
+
+    source, result, output_path = _rotate(
+        source_path,
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        degrees=90,
+    )
+
+    assert source["video_codec"] == "prores"
+    assert source["has_alpha"] is True
+    assert output_path.suffix == ".mkv"
+    assert result["video_codec"] == "ffv1"
+    assert result["pix_fmt"] == source["pix_fmt"]
+    assert result["has_alpha"] is True
+    output_data_stream = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "d",
+            "-show_entries",
+            "stream=codec_type,codec_tag_string",
+            "-of",
+            "csv=p=0",
+            str(output_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert output_data_stream.stdout.strip() == ""
 
 
 @pytest.mark.parametrize(

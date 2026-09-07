@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f5f7fb">
-    <meta name="description" content="在本机快速预览、剪辑视频并逐帧截图">
+    <meta name="description" content="在本机快速预览、剪辑、逐帧截图并永久旋转视频">
     <title>本地视频剪辑</title>
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/assets/styles.css">
@@ -37,7 +37,7 @@
 
     <main id="main-content" class="main-content">
       <section class="hero" aria-labelledby="page-title">
-        <p class="eyebrow">高保真精准剪辑，不绕弯</p>
+        <p class="eyebrow">本地高保真处理，不绕弯</p>
         <h1 id="page-title">留下想要的这一段</h1>
         <p class="hero-copy" id="hero-copy">选一个视频，填好起点和终点，预览满意后直接保存。原视频始终不会被修改。</p>
 
@@ -50,6 +50,10 @@
             <button class="mode-button" id="mode-frames-button" type="button" aria-pressed="false">
               <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="6" width="13" height="11" rx="2"/><path d="M8 3h11a2 2 0 0 1 2 2v9"/></svg>
               <span><strong>逐帧截图</strong><small>每一帧保存成图片</small></span>
+            </button>
+            <button class="mode-button" id="mode-rotate-button" type="button" aria-pressed="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8V4l-2 2a8 8 0 1 0 2.2 8"/><path d="M15 4h4v4"/></svg>
+              <span><strong>永久旋转</strong><small>把方向写进新视频</small></span>
             </button>
           </div>
         </div>
@@ -149,7 +153,7 @@
         </div>
 
         <div class="trim-layout">
-          <div class="time-panel">
+          <div class="time-panel" id="time-panel">
             <div class="time-field">
               <label for="start-time">起始时间</label>
               <div class="time-input-wrap">
@@ -192,8 +196,34 @@
             </div>
           </div>
 
+          <div class="rotation-panel" id="rotation-panel" hidden>
+            <div class="rotation-heading">
+              <strong>顺时针旋转</strong>
+              <span>点一个角度，右侧立即预览</span>
+            </div>
+            <div class="rotation-options" role="group" aria-label="选择顺时针旋转角度">
+              <button class="rotation-option" type="button" data-degrees="90" aria-pressed="true">
+                <span class="rotation-option-icon" aria-hidden="true">↻</span>
+                <strong>90°</strong>
+              </button>
+              <button class="rotation-option" type="button" data-degrees="180" aria-pressed="false">
+                <span class="rotation-option-icon is-half" aria-hidden="true">↻</span>
+                <strong>180°</strong>
+              </button>
+              <button class="rotation-option" type="button" data-degrees="270" aria-pressed="false">
+                <span class="rotation-option-icon is-three-quarter" aria-hidden="true">↻</span>
+                <strong>270°</strong>
+              </button>
+              <button class="rotation-option" type="button" data-degrees="360" aria-pressed="false">
+                <span class="rotation-option-icon is-full" aria-hidden="true">↻</span>
+                <strong>360°</strong>
+              </button>
+            </div>
+            <p class="rotation-note" id="rotation-note">90° 和 270° 会交换画面宽高；其他视频与音频参数尽量保持不变。</p>
+          </div>
+
           <div class="preview-panel" id="preview-panel">
-            <div class="preview-frame">
+            <div class="preview-frame" id="preview-frame">
               <video id="preview-video" controls playsinline preload="metadata" hidden></video>
               <div class="preview-placeholder" id="preview-placeholder">
                 <div class="preview-placeholder-icon" aria-hidden="true">
@@ -238,7 +268,7 @@
               <svg viewBox="0 0 24 24"><path d="M3.5 7.5A2.5 2.5 0 0 1 6 5h3.7c.5 0 1 .2 1.35.55l.9.9c.35.35.84.55 1.34.55H18a2.5 2.5 0 0 1 2.5 2.5v7A2.5 2.5 0 0 1 18 19H6a2.5 2.5 0 0 1-2.5-2.5v-9Z"/></svg>
             </div>
             <div class="destination-copy">
-              <span class="destination-label">保存到</span>
+              <span class="destination-label" id="destination-label">保存到</span>
               <strong id="output-directory">首次使用，请选择保存目录</strong>
             </div>
             <button class="button button-secondary button-compact" id="select-directory-button" type="button" disabled>

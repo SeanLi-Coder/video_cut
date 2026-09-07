@@ -10,7 +10,9 @@ const state = {
   appReady: false,
   ffmpegReady: false,
   frameExportReady: false,
+  rotationReady: false,
   operation: "clip",
+  rotationDegrees: 90,
   maxFrameSeconds: DEFAULT_MAX_FRAME_SECONDS,
   outputDirectory: "",
   video: null,
@@ -23,6 +25,7 @@ const state = {
   previewMode: "",
   previewUrl: "",
   activeRange: null,
+  activePreviewKey: "",
   mediaLoading: false,
   mediaFallbackAttempted: false,
   playbackFrameId: null,
@@ -49,6 +52,7 @@ const elements = {
   reloadButton: byId("reload-button"),
   modeClipButton: byId("mode-clip-button"),
   modeFramesButton: byId("mode-frames-button"),
+  modeRotateButton: byId("mode-rotate-button"),
   pageTitle: byId("page-title"),
   heroCopy: byId("hero-copy"),
   journeySource: byId("journey-source"),
@@ -72,6 +76,10 @@ const elements = {
   trimHeading: byId("trim-heading"),
   trimDescription: byId("trim-description"),
   durationLabel: byId("duration-label"),
+  timePanel: byId("time-panel"),
+  rotationPanel: byId("rotation-panel"),
+  rotationOptions: Array.from(document.querySelectorAll(".rotation-option")),
+  rotationNote: byId("rotation-note"),
   frameLimitHint: byId("frame-limit-hint"),
   startTime: byId("start-time"),
   endTime: byId("end-time"),
@@ -81,6 +89,7 @@ const elements = {
   rangeReadout: byId("range-readout"),
   rangeTotal: byId("range-total"),
   previewPanel: byId("preview-panel"),
+  previewFrame: byId("preview-frame"),
   previewVideo: byId("preview-video"),
   previewPlaceholder: byId("preview-placeholder"),
   previewLoading: byId("preview-loading"),
@@ -88,6 +97,7 @@ const elements = {
   previewStatusDot: byId("preview-status-dot"),
   previewStatusText: byId("preview-status-text"),
   retryPreviewButton: byId("retry-preview-button"),
+  destinationLabel: byId("destination-label"),
   outputDirectory: byId("output-directory"),
   selectDirectoryButton: byId("select-directory-button"),
   suggestedOutputName: byId("suggested-output-name"),
@@ -320,6 +330,28 @@ function isFrameMode() {
   return state.operation === "frames";
 }
 
+function isRotateMode() {
+  return state.operation === "rotate";
+}
+
+function operationLabel() {
+  if (isFrameMode()) return "截图";
+  if (isRotateMode()) return "旋转";
+  return "导出";
+}
+
+function operationVerb() {
+  if (isFrameMode()) return "截图";
+  if (isRotateMode()) return "旋转";
+  return "导出";
+}
+
+function previewKey(range) {
+  if (!range || !state.video) return "";
+  const degrees = isRotateMode() ? `:${state.rotationDegrees}` : "";
+  return `${state.video.id}:${state.operation}${degrees}:${range.start.toFixed(3)}:${range.end.toFixed(3)}`;
+}
+
 function rangeKey(range) {
   return range ? `${range.start.toFixed(3)}:${range.end.toFixed(3)}` : "";
 }
@@ -334,6 +366,15 @@ function readRange(showErrors = true) {
   };
 
   if (!state.video) {
+    if (showErrors) renderFieldErrors(result);
+    return result;
+  }
+
+  if (isRotateMode()) {
+    const duration = Number(state.video.duration);
+    result.start = 0;
+    result.end = duration;
+    result.valid = Number.isFinite(duration) && duration > 0;
     if (showErrors) renderFieldErrors(result);
     return result;
   }
@@ -382,6 +423,20 @@ function renderFieldErrors(range) {
 
 function renderRangeSummary(range) {
   const duration = state.video ? Number(state.video.duration) : 0;
+  if (isRotateMode()) {
+    elements.clipDuration.textContent = range.valid ? `${state.rotationDegrees}°` : "—";
+    elements.rangeReadout.style.setProperty("--range-start", "0%");
+    elements.rangeReadout.style.setProperty("--range-width", range.valid ? "100%" : "0%");
+    elements.rangeReadout.setAttribute(
+      "aria-label",
+      range.valid ? `整段视频将顺时针永久旋转 ${state.rotationDegrees} 度` : "尚未选择可旋转的视频",
+    );
+    elements.rangeTotal.textContent = duration > 0 ? formatShortTime(duration) : "—";
+    elements.suggestedOutputName.textContent = range.valid
+      ? makeSuggestedOutputName(range)
+      : "选择视频后自动生成";
+    return;
+  }
   if (range.valid) {
     elements.clipDuration.textContent = formatTime(range.end - range.start);
     const startPercent = duration > 0 ? Math.min(100, Math.max(0, (range.start / duration) * 100)) : 0;
@@ -409,6 +464,14 @@ function makeSuggestedOutputName(range) {
   const stem = (hasExtension ? original.slice(0, dotIndex) : original)
     .replace(/[<>:"/\\|?*]/g, "_")
     .trim() || "video";
+  if (isRotateMode()) {
+    const extensions = state.video.rotation_output_extensions || {};
+    const requestedExtension = extensions[String(state.rotationDegrees)] || state.video.rotation_output_extension;
+    const extension = [".mp4", ".mov", ".mkv"].includes(requestedExtension)
+      ? requestedExtension
+      : ".mp4";
+    return `${stem}_rotated_${state.rotationDegrees}${extension}`;
+  }
   const start = formatTime(range.start).replaceAll(":", "-").replace(".", "_");
   const end = formatTime(range.end).replaceAll(":", "-").replace(".", "_");
   if (isFrameMode()) return `${stem}_frames_${start}-${end}`;
@@ -514,6 +577,7 @@ function loadMedia(url, mode, range, options = {}) {
 
   state.previewMode = mode || "direct";
   state.activeRange = { start: range.start, end: range.end };
+  state.activePreviewKey = options.previewKey || previewKey(range);
   elements.previewPlaceholder.hidden = true;
   elements.previewVideo.hidden = false;
 
@@ -585,18 +649,123 @@ function cancelPendingPreview() {
 }
 
 function releaseGeneratedPreview() {
-  if (!isClipPreview(state.previewMode)) return;
-  elements.previewVideo.pause();
-  elements.previewVideo.removeAttribute("src");
-  elements.previewVideo.load();
-  state.previewUrl = "";
+  if (isClipPreview(state.previewMode)) {
+    elements.previewVideo.pause();
+    elements.previewVideo.removeAttribute("src");
+    elements.previewVideo.load();
+    state.previewUrl = "";
+  }
+  state.activePreviewKey = "";
+}
+
+function clearRotationPreview() {
+  const player = elements.previewVideo;
+  elements.previewFrame.classList.remove("is-rotation-preview");
+  player.controls = true;
+  player.style.removeProperty("width");
+  player.style.removeProperty("height");
+  player.style.removeProperty("transform");
+  player.removeAttribute("role");
+  player.removeAttribute("tabindex");
+  player.removeAttribute("aria-label");
+}
+
+function parseAspectRatio(value) {
+  const match = String(value || "").trim().match(/^(\d+)\s*[:/]\s*(\d+)$/);
+  if (!match) return 1;
+  const numerator = Number(match[1]);
+  const denominator = Number(match[2]);
+  if (!(numerator > 0 && denominator > 0)) return 1;
+  return numerator / denominator;
+}
+
+function applyRotationPreview() {
+  if (!isRotateMode() || !state.video || elements.previewVideo.hidden) {
+    clearRotationPreview();
+    return;
+  }
+
+  const player = elements.previewVideo;
+  const frameWidth = elements.previewFrame.clientWidth;
+  const frameHeight = elements.previewFrame.clientHeight;
+  const sourceWidth = Number(state.video.width) || player.videoWidth;
+  const sourceHeight = Number(state.video.height) || player.videoHeight;
+  if (!(frameWidth > 0 && frameHeight > 0 && sourceWidth > 0 && sourceHeight > 0)) return;
+
+  const displayWidth = sourceWidth * parseAspectRatio(state.video.sample_aspect_ratio);
+  const sideways = state.rotationDegrees === 90 || state.rotationDegrees === 270;
+  const rotatedWidth = sideways ? sourceHeight : displayWidth;
+  const rotatedHeight = sideways ? displayWidth : sourceHeight;
+  const scale = Math.min(frameWidth / rotatedWidth, frameHeight / rotatedHeight);
+
+  elements.previewFrame.classList.add("is-rotation-preview");
+  player.controls = false;
+  player.setAttribute("role", "button");
+  player.setAttribute("tabindex", "0");
+  player.setAttribute("aria-label", "旋转预览，点击播放或暂停");
+  player.style.width = `${displayWidth * scale}px`;
+  player.style.height = `${sourceHeight * scale}px`;
+  player.style.transform = `translate(-50%, -50%) rotate(${state.rotationDegrees}deg)`;
+}
+
+function rotationFallbackRange() {
+  const duration = Number(state.video && state.video.duration) || 0;
+  return {
+    valid: duration > 0,
+    start: 0,
+    end: Math.min(duration, state.maxFrameSeconds),
+  };
+}
+
+async function prepareRotationPreview(options = {}) {
+  if (!isRotateMode() || !state.video) return;
+  cancelPendingPreview();
+  releaseGeneratedPreview();
+  const requestSerial = ++state.previewRequestSerial;
+  const videoId = state.video.id;
+  const range = readRange(false);
+  state.previewReady = false;
+  setPreviewLoading(true, "正在读取整段旋转预览…");
+  setPreviewStatus("working", "正在准备旋转预览…");
+  renderControls();
+
+  try {
+    if (!state.video.preview_url) throw new Error("没有可直接播放的预览");
+    await loadMedia(state.video.preview_url, state.video.preview_mode || "original", range, {
+      autoplay: Boolean(options.autoplay),
+      previewKey: previewKey(range),
+    });
+    if (requestSerial !== state.previewRequestSerial || !isRotateMode() || state.video.id !== videoId) return;
+    state.previewReady = true;
+    state.mediaFallbackAttempted = false;
+    applyRotationPreview();
+    setPreviewLoading(false);
+    setPreviewStatus("ready", `已实时预览顺时针 ${state.rotationDegrees}°，点击画面可播放或暂停`);
+  } catch (error) {
+    if (requestSerial !== state.previewRequestSerial || !isRotateMode() || state.video.id !== videoId) return;
+    state.mediaFallbackAttempted = true;
+    const fallbackRange = rotationFallbackRange();
+    if (!fallbackRange.valid) {
+      state.previewReady = false;
+      setPreviewLoading(false);
+      setPreviewStatus("error", error.message || "旋转预览加载失败", true);
+    } else {
+      await requestPreview(fallbackRange, {
+        fallback: true,
+        autoplay: false,
+        previewOperation: "frames",
+      });
+    }
+  } finally {
+    renderControls();
+  }
 }
 
 function schedulePreview(range) {
   cancelPendingPreview();
   if (!range.valid || !state.video) return;
 
-  if (rangeKey(range) === rangeKey(state.activeRange) && state.previewReady) {
+  if (previewKey(range) === state.activePreviewKey && state.previewReady) {
     setPreviewStatus("ready", "预览范围已更新");
     renderControls();
     return;
@@ -633,7 +802,7 @@ async function requestPreview(range, options = {}) {
         start: range.start,
         end: range.end,
         compatibility: Boolean(options.fallback),
-        operation: state.operation,
+        operation: options.previewOperation || (isRotateMode() ? "frames" : state.operation),
       },
       controller.signal,
     );
@@ -641,7 +810,7 @@ async function requestPreview(range, options = {}) {
     if (!result.preview_url) throw new Error("本地服务没有返回预览地址");
 
     const generation = result.generation ?? result.generation_id ?? "";
-    if (result.suggested_output_name) {
+    if (result.suggested_output_name && !isRotateMode()) {
       elements.suggestedOutputName.textContent = result.suggested_output_name;
     }
     await loadMedia(result.preview_url, result.mode || "proxy", range, {
@@ -652,7 +821,10 @@ async function requestPreview(range, options = {}) {
 
     state.previewReady = true;
     state.mediaFallbackAttempted = isClipPreview(result.mode || "proxy");
-    const readyMessage = state.video.is_hdr
+    if (isRotateMode()) applyRotationPreview();
+    const readyMessage = isRotateMode()
+      ? `兼容预览已就绪，当前顺时针 ${state.rotationDegrees}°；最终会处理整段视频`
+      : state.video.is_hdr
       ? isClipPreview(result.mode)
         ? "HDR 兼容预览仅供定位，颜色请以原片和最终成片为准"
         : "HDR 原片预览已更新，正在循环所选范围"
@@ -675,45 +847,75 @@ async function requestPreview(range, options = {}) {
 
 function renderModeCopy() {
   const frames = isFrameMode();
-  elements.modeClipButton.setAttribute("aria-pressed", frames ? "false" : "true");
+  const rotate = isRotateMode();
+  elements.modeClipButton.setAttribute("aria-pressed", !frames && !rotate ? "true" : "false");
   elements.modeFramesButton.setAttribute("aria-pressed", frames ? "true" : "false");
-  elements.pageTitle.textContent = frames ? "把这一小段逐帧保存" : "留下想要的这一段";
-  elements.heroCopy.textContent = frames
-    ? `选好不超过 ${state.maxFrameSeconds} 秒的范围，预览满意后，把其中每一帧按原始尺寸保存成无损图片。`
-    : "选一个视频，填好起点和终点，预览满意后直接保存。原视频始终不会被修改。";
-  elements.journeyRangeLabel.textContent = frames ? "设置范围" : "设置片段";
-  elements.journeyExportLabel.textContent = frames ? "确认截图" : "确认导出";
-  elements.trimHeading.textContent = frames ? "设置截图范围" : "设置剪辑范围";
-  elements.trimDescription.textContent = frames
-    ? "仍然只填起始时间和结束时间；修改后预览会自动更新。"
-    : "只需填写起始时间和结束时间，预览会自动更新。";
-  elements.durationLabel.textContent = frames ? "截图时长" : "片段时长";
+  elements.modeRotateButton.setAttribute("aria-pressed", rotate ? "true" : "false");
+  elements.timePanel.hidden = rotate;
+  elements.rotationPanel.hidden = !rotate;
+  elements.pageTitle.textContent = rotate
+    ? "把正确方向永久写进视频"
+    : frames
+      ? "把这一小段逐帧保存"
+      : "留下想要的这一段";
+  elements.heroCopy.textContent = rotate
+    ? "选一个视频和旋转角度，确认预览后生成同级新文件。原视频始终不会被修改。"
+    : frames
+      ? `选好不超过 ${state.maxFrameSeconds} 秒的范围，预览满意后，把其中每一帧按原始尺寸保存成无损图片。`
+      : "选一个视频，填好起点和终点，预览满意后直接保存。原视频始终不会被修改。";
+  elements.journeyRangeLabel.textContent = rotate ? "选择角度" : frames ? "设置范围" : "设置片段";
+  elements.journeyExportLabel.textContent = rotate ? "确认旋转" : frames ? "确认截图" : "确认导出";
+  elements.trimHeading.textContent = rotate ? "选择永久旋转角度" : frames ? "设置截图范围" : "设置剪辑范围";
+  elements.trimDescription.textContent = rotate
+    ? "不需要填写时间；整段视频都会处理，点击角度后预览立即更新。"
+    : frames
+      ? "仍然只填起始时间和结束时间；修改后预览会自动更新。"
+      : "只需填写起始时间和结束时间，预览会自动更新。";
+  elements.durationLabel.textContent = rotate ? "旋转角度" : frames ? "截图时长" : "片段时长";
   elements.frameLimitHint.textContent = `逐帧截图一次最多 ${state.maxFrameSeconds} 秒；图片按视频原尺寸无损保存。`;
   elements.frameLimitHint.hidden = !frames;
-  elements.exportHeading.textContent = frames ? "确认并逐帧截图" : "确认并导出";
-  elements.exportDescription.textContent = frames
-    ? "截图会放进一个独立文件夹，原视频不会有任何变化。"
-    : "导出为新文件，原视频不会有任何变化。";
-  elements.qualityChipText.textContent = frames
-    ? "原始宽高 · 无损图片"
-    : "保持原分辨率与高品质音频";
+  elements.exportHeading.textContent = rotate ? "确认并永久旋转" : frames ? "确认并逐帧截图" : "确认并导出";
+  elements.exportDescription.textContent = rotate
+    ? "生成在原视频同级目录；方向会真正写入画面，原视频不变。"
+    : frames
+      ? "截图会放进一个独立文件夹，原视频不会有任何变化。"
+      : "导出为新文件，原视频不会有任何变化。";
+  elements.qualityChipText.textContent = rotate
+    ? "完整时长 · 原音频直拷"
+    : frames
+      ? "原始宽高 · 无损图片"
+      : "保持原分辨率与高品质音频";
   elements.outputNameLabel.textContent = frames ? "文件夹名" : "文件名";
-  elements.outputNameNote.textContent = frames
-    ? "图片按 frame_000001 开始顺序编号"
-    : "如遇同名文件会自动添加编号";
-  if (!state.exportCompleted) {
-    elements.completionSummary.textContent = frames
-      ? "截图完成，原视频未被修改"
-      : "剪辑完成，原视频未被修改";
+  elements.outputNameNote.textContent = rotate
+    ? "如遇同名文件会自动添加编号"
+    : frames
+      ? "图片按 frame_000001 开始顺序编号"
+      : "如遇同名文件会自动添加编号";
+  elements.destinationLabel.textContent = rotate ? "固定保存到原视频同级目录" : "保存到";
+  elements.rotationNote.textContent = state.rotationDegrees === 360
+    ? "360° 看起来方向不变，但仍会重新生成一份已固化、已清除旋转标记的新视频。"
+    : state.rotationDegrees === 90 || state.rotationDegrees === 270
+      ? "90° 和 270° 会交换画面宽高；帧率、色彩信息和原音频会尽量保持不变。"
+      : "180° 不会交换画面宽高；帧率、色彩信息和原音频会尽量保持不变。";
+  for (const option of elements.rotationOptions) {
+    option.setAttribute("aria-pressed", Number(option.dataset.degrees) === state.rotationDegrees ? "true" : "false");
   }
-  elements.continueButton.textContent = frames ? "继续截图" : "继续剪辑";
+  if (!state.exportCompleted) {
+    elements.completionSummary.textContent = rotate
+      ? "永久旋转完成，原视频未被修改"
+      : frames
+        ? "截图完成，原视频未被修改"
+        : "剪辑完成，原视频未被修改";
+  }
+  elements.continueButton.textContent = rotate ? "继续旋转" : frames ? "继续截图" : "继续剪辑";
+  renderOutputDirectory();
 }
 
 function changeOperation(operation) {
   if (
     state.exporting
     || state.selectingVideo
-    || !["clip", "frames"].includes(operation)
+    || !["clip", "frames", "rotate"].includes(operation)
     || operation === state.operation
   ) {
     return;
@@ -721,16 +923,19 @@ function changeOperation(operation) {
   cancelPendingPreview();
   stopExportPolling();
   resetExportResult();
+  releaseGeneratedPreview();
+  clearRotationPreview();
   state.operation = operation;
+  state.previewReady = false;
+  state.activePreviewKey = "";
 
   renderModeCopy();
   const range = readRange(true);
   renderRangeSummary(range);
   if (range.valid && state.video) {
-    if (rangeKey(range) === rangeKey(state.activeRange) && state.previewReady) {
-      setPreviewStatus("ready", "预览范围已就绪");
+    if (isRotateMode()) {
+      prepareRotationPreview();
     } else {
-      releaseGeneratedPreview();
       schedulePreview(range);
     }
   } else if (state.video) {
@@ -738,7 +943,13 @@ function changeOperation(operation) {
     setPreviewStatus("error", "请修正时间后更新预览");
   }
   renderControls();
-  showToast(isFrameMode() ? `已切换到逐帧截图，单次最多 ${state.maxFrameSeconds} 秒` : "已切换到视频剪辑");
+  showToast(
+    isRotateMode()
+      ? `已切换到永久旋转，当前顺时针 ${state.rotationDegrees}°`
+      : isFrameMode()
+        ? `已切换到逐帧截图，单次最多 ${state.maxFrameSeconds} 秒`
+        : "已切换到视频剪辑",
+  );
 }
 
 function resetExportResult() {
@@ -754,7 +965,7 @@ function resetExportResult() {
 }
 
 function handleTimeInput() {
-  if (!state.video || state.exporting) return;
+  if (!state.video || state.exporting || isRotateMode()) return;
   if (state.exportCompleted || state.exportError) resetExportResult();
   releaseGeneratedPreview();
 
@@ -772,11 +983,13 @@ function handleTimeInput() {
 }
 
 function handleTimeBlur(event) {
+  if (isRotateMode()) return;
   const value = parseTime(event.currentTarget.value);
   if (value !== null) event.currentTarget.value = formatTime(value);
 }
 
 function handleTimeKeydown(event) {
+  if (isRotateMode()) return;
   if (event.key !== "Enter") return;
   event.preventDefault();
   event.currentTarget.blur();
@@ -799,6 +1012,7 @@ function renderVideoDetails() {
   const fps = Number(video.fps);
   elements.videoFps.textContent = Number.isFinite(fps) && fps > 0 ? `${fps.toFixed(fps % 1 ? 2 : 0)} fps` : "—";
   elements.videoCodecs.textContent = `${normalizeCodec(video.video_codec)} · ${normalizeCodec(video.audio_codec)}`;
+  renderOutputDirectory();
 }
 
 async function selectVideo() {
@@ -821,6 +1035,7 @@ async function selectVideo() {
     state.previewReady = false;
     state.previewMode = result.video.preview_mode || "direct";
     state.previewUrl = "";
+    state.activePreviewKey = "";
 
     const duration = Number(result.video.duration);
     const suggestedStart = parseTime(result.suggested_start);
@@ -834,24 +1049,28 @@ async function selectVideo() {
     renderVideoDetails();
     const range = readRange(true);
     renderRangeSummary(range);
-    setPreviewLoading(true, "正在读取视频预览…");
-    setPreviewStatus("working", "正在读取视频…");
-    renderControls();
+    if (isRotateMode()) {
+      await prepareRotationPreview();
+    } else {
+      setPreviewLoading(true, "正在读取视频预览…");
+      setPreviewStatus("working", "正在读取视频…");
+      renderControls();
 
-    try {
-      if (!result.video.preview_url) throw new Error("没有可直接播放的预览");
-      await loadMedia(result.video.preview_url, result.video.preview_mode || "direct", range, { autoplay: false });
-      state.previewReady = true;
-      setPreviewLoading(false);
-      setPreviewStatus(
-        "ready",
-        state.video.is_hdr
-          ? "HDR 原片预览已就绪；修改时间后仍会使用原片定位"
-          : "预览已就绪，播放时将循环所选范围",
-      );
-    } catch (_mediaError) {
-      state.mediaFallbackAttempted = true;
-      await requestPreview(range, { fallback: true, autoplay: false });
+      try {
+        if (!result.video.preview_url) throw new Error("没有可直接播放的预览");
+        await loadMedia(result.video.preview_url, result.video.preview_mode || "direct", range, { autoplay: false });
+        state.previewReady = true;
+        setPreviewLoading(false);
+        setPreviewStatus(
+          "ready",
+          state.video.is_hdr
+            ? "HDR 原片预览已就绪；修改时间后仍会使用原片定位"
+            : "预览已就绪，播放时将循环所选范围",
+        );
+      } catch (_mediaError) {
+        state.mediaFallbackAttempted = true;
+        await requestPreview(range, { fallback: true, autoplay: false });
+      }
     }
 
     showToast(`已选择“${result.video.name || "视频"}”`);
@@ -868,7 +1087,7 @@ async function selectVideo() {
 }
 
 async function selectOutputDirectory() {
-  if (!state.appReady || state.selectingDirectory || state.exporting) return;
+  if (!state.appReady || state.selectingDirectory || state.exporting || isRotateMode()) return;
   state.selectingDirectory = true;
   setButtonBusy(elements.selectDirectoryButton, true, "正在打开 Finder…");
   renderControls();
@@ -891,6 +1110,13 @@ async function selectOutputDirectory() {
 }
 
 function renderOutputDirectory() {
+  elements.selectDirectoryButton.hidden = isRotateMode();
+  if (isRotateMode()) {
+    const directory = state.video && state.video.directory_display;
+    elements.outputDirectory.textContent = directory || "选择视频后自动使用同级目录";
+    elements.outputDirectory.title = directory || "";
+    return;
+  }
   if (state.outputDirectory) {
     elements.outputDirectory.textContent = state.outputDirectory;
     elements.outputDirectory.title = state.outputDirectory;
@@ -913,7 +1139,9 @@ function normalizeProgress(value) {
 }
 
 function exportApiBase() {
-  return isFrameMode() ? "/api/frame-exports" : "/api/exports";
+  if (isFrameMode()) return "/api/frame-exports";
+  if (isRotateMode()) return "/api/rotations";
+  return "/api/exports";
 }
 
 function setExportProgress(value) {
@@ -931,12 +1159,18 @@ function showExportProgress() {
   elements.exportProgressPanel.classList.remove("is-error");
   elements.cancelExportButton.hidden = false;
   elements.cancelExportButton.disabled = false;
-  elements.cancelExportButton.textContent = isFrameMode() ? "取消截图" : "取消导出";
+  elements.cancelExportButton.textContent = `取消${operationVerb()}`;
   elements.exportProgressKicker.textContent = "正在准备";
-  elements.exportProgressTitle.textContent = isFrameMode() ? "正在逐帧截图…" : "正在导出视频…";
-  elements.exportProgressMessage.textContent = isFrameMode()
-    ? "正在准备独立截图文件夹，请不要关闭此页面。"
-    : "正在安全地创建新文件，请不要关闭此页面。";
+  elements.exportProgressTitle.textContent = isRotateMode()
+    ? "正在永久旋转视频…"
+    : isFrameMode()
+      ? "正在逐帧截图…"
+      : "正在导出视频…";
+  elements.exportProgressMessage.textContent = isRotateMode()
+    ? "正在准备同级目录中的新视频，请不要关闭此页面。"
+    : isFrameMode()
+      ? "正在准备独立截图文件夹，请不要关闭此页面。"
+      : "正在安全地创建新文件，请不要关闭此页面。";
   elements.exportElapsed.textContent = "";
   setExportProgress(0);
 }
@@ -957,18 +1191,17 @@ async function startExport() {
   renderControls();
 
   try {
-    const result = await post(exportApiBase(), {
-      video_id: state.video.id,
-      start: range.start,
-      end: range.end,
-    });
+    const body = isRotateMode()
+      ? { video_id: state.video.id, degrees: state.rotationDegrees }
+      : { video_id: state.video.id, start: range.start, end: range.end };
+    const result = await post(exportApiBase(), body);
     if (!result.job_id) throw new Error("本地服务没有创建导出任务");
     state.exportJobId = result.job_id;
     state.exportOutputName = result.output_name || makeSuggestedOutputName(range);
     await pollExport(pollSerial);
   } catch (error) {
     if (pollSerial !== state.exportPollSerial) return;
-    finishExportWithError(error.message || (isFrameMode() ? "截图任务启动失败" : "导出任务启动失败"));
+    finishExportWithError(error.message || `${operationLabel()}任务启动失败`);
   }
 }
 
@@ -994,7 +1227,11 @@ async function pollExport(pollSerial) {
 
     if (["queued", "pending", "waiting"].includes(status)) {
       elements.exportProgressKicker.textContent = "等待处理";
-      elements.exportProgressTitle.textContent = isFrameMode() ? "正在准备截图…" : "正在准备导出…";
+      elements.exportProgressTitle.textContent = isRotateMode()
+        ? "正在准备旋转…"
+        : isFrameMode()
+          ? "正在准备截图…"
+          : "正在准备导出…";
       elements.exportProgressMessage.textContent = job.message || "正在检查视频和保存位置。";
       scheduleExportPoll(pollSerial, 800);
       return;
@@ -1002,10 +1239,16 @@ async function pollExport(pollSerial) {
 
     if (["running", "processing", "exporting"].includes(status)) {
       elements.exportProgressKicker.textContent = "本机处理中";
-      elements.exportProgressTitle.textContent = isFrameMode() ? "正在逐帧截图…" : "正在导出视频…";
-      elements.exportProgressMessage.textContent = job.message || (isFrameMode()
-        ? "正在按原始宽高保存无损图片。"
-        : "正在保持原分辨率与高品质音频创建新文件。");
+      elements.exportProgressTitle.textContent = isRotateMode()
+        ? "正在永久旋转视频…"
+        : isFrameMode()
+          ? "正在逐帧截图…"
+          : "正在导出视频…";
+      elements.exportProgressMessage.textContent = job.message || (isRotateMode()
+        ? "正在将方向写入画面并原样复制音频。"
+        : isFrameMode()
+          ? "正在按原始宽高保存无损图片。"
+          : "正在保持原分辨率与高品质音频创建新文件。");
       scheduleExportPoll(pollSerial);
       return;
     }
@@ -1022,7 +1265,7 @@ async function pollExport(pollSerial) {
 
     if (["error", "failed", "failure"].includes(status)) {
       finishExportWithError(
-        job.error || job.message || (isFrameMode() ? "截图失败，请重试。" : "导出失败，请重试。"),
+        job.error || job.message || `${operationLabel()}失败，请重试。`,
         job,
       );
       return;
@@ -1054,22 +1297,35 @@ function finishExportSuccessfully(job) {
   state.cancellingExport = false;
   state.exportCompleted = true;
   state.exportError = "";
-  state.exportOutputName = job.output_name || state.exportOutputName || (isFrameMode() ? "逐帧截图" : "剪辑视频");
+  state.exportOutputName = job.output_name || state.exportOutputName || (isRotateMode()
+    ? "永久旋转视频"
+    : isFrameMode()
+      ? "逐帧截图"
+      : "剪辑视频");
 
   setExportProgress(100);
   elements.exportProgressPanel.hidden = true;
   elements.exportSetup.hidden = true;
   elements.exportCompletePanel.hidden = false;
   elements.completedOutputName.textContent = state.exportOutputName;
-  elements.completedOutputPath.textContent = job.output_path || state.outputDirectory;
-  elements.completedOutputPath.title = job.output_path || state.outputDirectory;
+  const completedPath = job.output_path || (isRotateMode()
+    ? state.video && state.video.directory_display
+    : state.outputDirectory) || "";
+  elements.completedOutputPath.textContent = completedPath;
+  elements.completedOutputPath.title = completedPath;
   const frameCount = Number(job.frame_count);
-  elements.completionSummary.textContent = isFrameMode()
-    ? Number.isFinite(frameCount) && frameCount > 0
-      ? `截图完成，共保存 ${frameCount} 张原尺寸图片`
-      : "截图完成，原视频未被修改"
-    : "剪辑完成，原视频未被修改";
-  showToast(isFrameMode() ? "逐帧截图完成，已保存到独立文件夹" : "剪辑完成，已保存为新文件");
+  elements.completionSummary.textContent = isRotateMode()
+    ? `永久旋转 ${state.rotationDegrees}° 完成，原视频未被修改`
+    : isFrameMode()
+      ? Number.isFinite(frameCount) && frameCount > 0
+        ? `截图完成，共保存 ${frameCount} 张原尺寸图片`
+        : "截图完成，原视频未被修改"
+      : "剪辑完成，原视频未被修改";
+  showToast(isRotateMode()
+    ? "永久旋转完成，已在原视频同级目录生成新文件"
+    : isFrameMode()
+      ? "逐帧截图完成，已保存到独立文件夹"
+      : "剪辑完成，已保存为新文件");
   renderControls();
 }
 
@@ -1082,7 +1338,11 @@ function finishCancelledExport() {
   state.exportJobId = "";
   elements.exportProgressPanel.hidden = true;
   elements.exportSetup.hidden = false;
-  showToast(isFrameMode() ? "已取消截图，未完成图片已清理" : "已取消导出，原视频未被修改");
+  showToast(isRotateMode()
+    ? "已取消旋转，未完成视频已清理"
+    : isFrameMode()
+      ? "已取消截图，未完成图片已清理"
+      : "已取消导出，原视频未被修改");
   renderControls();
 }
 
@@ -1097,8 +1357,8 @@ function finishExportWithError(message, job = null) {
   elements.exportProgressPanel.hidden = false;
   elements.exportProgressPanel.classList.add("is-error");
   elements.cancelExportButton.hidden = true;
-  elements.exportProgressKicker.textContent = isFrameMode() ? "截图未完成" : "导出未完成";
-  elements.exportProgressTitle.textContent = isFrameMode() ? "截图失败" : "导出失败";
+  elements.exportProgressKicker.textContent = `${operationLabel()}未完成`;
+  elements.exportProgressTitle.textContent = `${operationLabel()}失败`;
   elements.exportProgressMessage.textContent = `${state.exportError} 原视频未被修改。`;
   if (job && Number.isFinite(Number(job.elapsed_seconds))) {
     elements.exportElapsed.textContent = formatElapsed(job.elapsed_seconds);
@@ -1112,9 +1372,11 @@ async function cancelExport() {
   state.cancellingExport = true;
   elements.cancelExportButton.disabled = true;
   elements.cancelExportButton.textContent = "正在取消…";
-  elements.exportProgressMessage.textContent = isFrameMode()
-    ? "正在安全停止截图并清理未完成图片…"
-    : "正在安全停止导出并清理未完成文件…";
+  elements.exportProgressMessage.textContent = isRotateMode()
+    ? "正在安全停止旋转并清理未完成视频…"
+    : isFrameMode()
+      ? "正在安全停止截图并清理未完成图片…"
+      : "正在安全停止导出并清理未完成文件…";
 
   try {
     await post(`${exportApiBase()}/${encodeURIComponent(state.exportJobId)}/cancel`);
@@ -1122,7 +1384,7 @@ async function cancelExport() {
   } catch (error) {
     state.cancellingExport = false;
     elements.cancelExportButton.disabled = false;
-    elements.cancelExportButton.textContent = isFrameMode() ? "取消截图" : "取消导出";
+    elements.cancelExportButton.textContent = `取消${operationVerb()}`;
     showToast(error.message || "取消失败，请稍后重试", "error");
   }
 }
@@ -1132,9 +1394,15 @@ async function revealOutput() {
   elements.revealOutputButton.disabled = true;
   try {
     await post(`${exportApiBase()}/${encodeURIComponent(state.exportJobId)}/reveal`);
-    showToast(isFrameMode() ? "已在 Finder 中显示截图文件夹" : "已在 Finder 中显示导出文件");
+    showToast(isRotateMode()
+      ? "已在 Finder 中显示旋转后的视频"
+      : isFrameMode()
+        ? "已在 Finder 中显示截图文件夹"
+        : "已在 Finder 中显示导出文件");
   } catch (error) {
-    showToast(error.message || (isFrameMode() ? "无法在 Finder 中显示截图文件夹" : "无法在 Finder 中显示文件"), "error");
+    showToast(error.message || (isFrameMode()
+      ? "无法在 Finder 中显示截图文件夹"
+      : "无法在 Finder 中显示文件"), "error");
   } finally {
     elements.revealOutputButton.disabled = false;
   }
@@ -1149,19 +1417,25 @@ function continueEditing() {
   elements.exportProgressPanel.hidden = true;
   elements.exportSetup.hidden = false;
   renderControls();
-  elements.startTime.focus();
+  if (isRotateMode()) elements.rotationOptions.find((option) => option.getAttribute("aria-pressed") === "true")?.focus();
+  else elements.startTime.focus();
   elements.trimCard.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function canExport(range = readRange(false)) {
-  const exporterReady = isFrameMode() ? state.frameExportReady : state.ffmpegReady;
+  const exporterReady = isRotateMode()
+    ? state.rotationReady
+    : isFrameMode()
+      ? state.frameExportReady
+      : state.ffmpegReady;
+  const destinationReady = isRotateMode() ? Boolean(state.video && state.video.directory_display) : Boolean(state.outputDirectory);
   return Boolean(
     state.appReady
       && exporterReady
       && state.video
       && range.valid
       && state.previewReady
-      && state.outputDirectory
+      && destinationReady
       && !state.selectingVideo
       && !state.selectingDirectory
       && !state.exporting,
@@ -1172,31 +1446,35 @@ function renderReadyNote(range) {
   elements.readyNote.classList.remove("is-ready", "is-error");
   if (state.exportError) {
     elements.readyNote.classList.add("is-error");
-    elements.readyNoteText.textContent = isFrameMode()
-      ? "上次截图未完成，检查提示后可重试"
-      : "上次导出未完成，检查提示后可重试";
+    elements.readyNoteText.textContent = `上次${operationLabel()}未完成，检查提示后可重试`;
   } else if (!state.appReady) {
     elements.readyNoteText.textContent = "正在连接本地服务…";
   } else if (!state.video) {
-    elements.readyNoteText.textContent = isFrameMode()
-      ? "请先选择视频并设置截图范围"
-      : "请先选择视频并设置剪辑范围";
+    elements.readyNoteText.textContent = isRotateMode()
+      ? "请先选择视频和旋转角度"
+      : isFrameMode()
+        ? "请先选择视频并设置截图范围"
+        : "请先选择视频并设置剪辑范围";
   } else if (!range.valid) {
     elements.readyNoteText.textContent = "请先修正起始时间和结束时间";
   } else if (!state.previewReady) {
     elements.readyNoteText.textContent = "请等待新预览准备完成";
-  } else if (!state.outputDirectory) {
+  } else if (!isRotateMode() && !state.outputDirectory) {
     elements.readyNoteText.textContent = "请选择一个保存目录";
-  } else if (!(isFrameMode() ? state.frameExportReady : state.ffmpegReady)) {
+  } else if (!(isRotateMode() ? state.rotationReady : isFrameMode() ? state.frameExportReady : state.ffmpegReady)) {
     elements.readyNote.classList.add("is-error");
-    elements.readyNoteText.textContent = isFrameMode()
-      ? "当前 FFmpeg 缺少逐帧截图所需编码器"
-      : "未检测到 FFmpeg，暂时无法导出";
+    elements.readyNoteText.textContent = isRotateMode()
+      ? "当前 FFmpeg 缺少永久旋转所需编码器"
+      : isFrameMode()
+        ? "当前 FFmpeg 缺少逐帧截图所需编码器"
+        : "未检测到 FFmpeg，暂时无法导出";
   } else {
     elements.readyNote.classList.add("is-ready");
-    elements.readyNoteText.textContent = isFrameMode()
-      ? "已就绪，将按原始尺寸保存所选范围内的每一帧"
-      : `已就绪，将导出 ${formatTime(range.end - range.start)} 的片段`;
+    elements.readyNoteText.textContent = isRotateMode()
+      ? `已就绪，将把整段视频顺时针永久旋转 ${state.rotationDegrees}°`
+      : isFrameMode()
+        ? "已就绪，将按原始尺寸保存所选范围内的每一帧"
+        : `已就绪，将导出 ${formatTime(range.end - range.start)} 的片段`;
   }
 }
 
@@ -1237,23 +1515,31 @@ function renderControls() {
 
   elements.modeClipButton.disabled = controlsLocked || state.selectingVideo;
   elements.modeFramesButton.disabled = controlsLocked || state.selectingVideo;
+  elements.modeRotateButton.disabled = controlsLocked || state.selectingVideo;
+  for (const option of elements.rotationOptions) {
+    option.disabled = !state.video || controlsLocked || state.selectingVideo;
+  }
   elements.selectVideoButton.disabled = !state.appReady || state.selectingVideo || controlsLocked;
   elements.replaceVideoButton.disabled = !state.appReady || state.selectingVideo || controlsLocked;
-  elements.startTime.disabled = !state.video || controlsLocked || state.selectingVideo;
-  elements.endTime.disabled = !state.video || controlsLocked || state.selectingVideo;
-  elements.selectDirectoryButton.disabled = !state.appReady || !state.video || state.selectingDirectory || controlsLocked;
+  elements.startTime.disabled = !state.video || controlsLocked || state.selectingVideo || isRotateMode();
+  elements.endTime.disabled = !state.video || controlsLocked || state.selectingVideo || isRotateMode();
+  elements.selectDirectoryButton.disabled = isRotateMode() || !state.appReady || !state.video || state.selectingDirectory || controlsLocked;
   elements.exportButton.disabled = !canExport(range);
   elements.exportButton.setAttribute("aria-busy", state.exporting ? "true" : "false");
 
   const exportLabel = elements.exportButton.querySelector(".button-label");
   if (exportLabel) {
     exportLabel.textContent = state.exportError
-      ? isFrameMode()
-        ? "重新截图"
-        : "重新导出"
-      : isFrameMode()
-        ? "确定并截图"
-        : "确定并导出";
+      ? isRotateMode()
+        ? "重新旋转"
+        : isFrameMode()
+          ? "重新截图"
+          : "重新导出"
+      : isRotateMode()
+        ? "确定并旋转"
+        : isFrameMode()
+          ? "确定并截图"
+          : "确定并导出";
   }
 
   renderReadyNote(range);
@@ -1271,6 +1557,7 @@ async function bootstrap() {
     state.appReady = Boolean(state.appToken);
     state.ffmpegReady = Boolean(result.ffmpeg_ready);
     state.frameExportReady = Boolean(result.frame_export_ready);
+    state.rotationReady = Boolean(result.rotation_ready);
     const maxFrameSeconds = Number(result.max_frame_seconds);
     state.maxFrameSeconds = Number.isFinite(maxFrameSeconds) && maxFrameSeconds > 0
       ? maxFrameSeconds
@@ -1286,8 +1573,10 @@ async function bootstrap() {
 
     if (!state.appToken) {
       showSystemBanner("本地服务响应异常", "请刷新页面；如果仍未恢复，请重新双击 start.command。", "error");
-    } else if (!state.ffmpegReady) {
+    } else if (!state.ffmpegReady && !state.frameExportReady && !state.rotationReady) {
       showSystemBanner("未检测到 FFmpeg", "可以先选择和预览视频，但需要按启动窗口提示安装 FFmpeg 后才能导出。", "warning");
+    } else if (!state.ffmpegReady || !state.frameExportReady || !state.rotationReady) {
+      showSystemBanner("部分功能暂不可用", "当前 FFmpeg 只支持页面中的部分操作；不可用的功能会在确认按钮旁提示。", "warning");
     } else {
       hideSystemBanner();
     }
@@ -1304,6 +1593,7 @@ elements.selectVideoButton.addEventListener("click", selectVideo);
 elements.replaceVideoButton.addEventListener("click", selectVideo);
 elements.modeClipButton.addEventListener("click", () => changeOperation("clip"));
 elements.modeFramesButton.addEventListener("click", () => changeOperation("frames"));
+elements.modeRotateButton.addEventListener("click", () => changeOperation("rotate"));
 elements.selectDirectoryButton.addEventListener("click", selectOutputDirectory);
 elements.exportButton.addEventListener("click", startExport);
 elements.cancelExportButton.addEventListener("click", cancelExport);
@@ -1311,9 +1601,33 @@ elements.revealOutputButton.addEventListener("click", revealOutput);
 elements.continueButton.addEventListener("click", continueEditing);
 elements.reloadButton.addEventListener("click", () => window.location.reload());
 elements.retryPreviewButton.addEventListener("click", () => {
+  if (isRotateMode()) {
+    prepareRotationPreview({ autoplay: true });
+    return;
+  }
   const range = readRange(true);
   if (range.valid) requestPreview(range, { fallback: true, autoplay: true });
 });
+
+for (const option of elements.rotationOptions) {
+  option.addEventListener("click", () => {
+    if (!isRotateMode() || state.exporting || state.selectingVideo) return;
+    const degrees = Number(option.dataset.degrees);
+    if (![90, 180, 270, 360].includes(degrees) || degrees === state.rotationDegrees) return;
+    if (state.exportCompleted || state.exportError) resetExportResult();
+    state.rotationDegrees = degrees;
+    if (state.activeRange) state.activePreviewKey = previewKey(state.activeRange);
+    renderModeCopy();
+    const range = readRange(false);
+    renderRangeSummary(range);
+    applyRotationPreview();
+    if (state.previewReady) {
+      setPreviewStatus("ready", `已实时预览顺时针 ${degrees}°，点击画面可播放或暂停`);
+    }
+    renderControls();
+    showToast(`已改为顺时针 ${degrees}°`);
+  });
+}
 
 for (const input of [elements.startTime, elements.endTime]) {
   input.addEventListener("input", handleTimeInput);
@@ -1332,11 +1646,31 @@ elements.previewVideo.addEventListener("play", () => {
 elements.previewVideo.addEventListener("pause", stopPlaybackMonitor);
 elements.previewVideo.addEventListener("timeupdate", enforcePreviewBounds);
 elements.previewVideo.addEventListener("ended", () => seekToPreviewStart(true));
+elements.previewVideo.addEventListener("loadedmetadata", applyRotationPreview);
+elements.previewVideo.addEventListener("click", () => {
+  if (!isRotateMode()) return;
+  if (elements.previewVideo.paused) {
+    const playPromise = elements.previewVideo.play();
+    if (playPromise && typeof playPromise.catch === "function") playPromise.catch(() => {});
+  } else {
+    elements.previewVideo.pause();
+  }
+});
+elements.previewVideo.addEventListener("keydown", (event) => {
+  if (!isRotateMode() || !["Enter", " "].includes(event.key)) return;
+  event.preventDefault();
+  elements.previewVideo.click();
+});
 elements.previewVideo.addEventListener("error", () => {
   if (state.mediaLoading || !state.video || !state.activeRange) return;
   if (!state.mediaFallbackAttempted && !isClipPreview(state.previewMode)) {
     state.mediaFallbackAttempted = true;
-    requestPreview({ ...state.activeRange, valid: true }, { fallback: true, autoplay: false });
+    const range = isRotateMode() ? rotationFallbackRange() : { ...state.activeRange, valid: true };
+    requestPreview(range, {
+      fallback: true,
+      autoplay: false,
+      previewOperation: isRotateMode() ? "frames" : undefined,
+    });
   } else {
     state.previewReady = false;
     setPreviewLoading(false);
@@ -1344,6 +1678,8 @@ elements.previewVideo.addEventListener("error", () => {
     renderControls();
   }
 });
+
+window.addEventListener("resize", applyRotationPreview);
 
 window.addEventListener("beforeunload", (event) => {
   if (!state.exporting) return;

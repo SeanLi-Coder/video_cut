@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.main import ApplicationState, create_app
+from app.media import probe_video
 
 
 def test_local_workflow_and_range_streaming(
@@ -106,6 +107,84 @@ def test_cancelled_native_dialog_is_not_an_error(
         response = client.post("/api/videos/select", headers={"X-App-Token": token})
         assert response.status_code == 200
         assert response.json() == {"cancelled": True}
+
+
+def test_rotation_api_requires_token_validates_angle_and_creates_a_new_sibling_file(
+    monkeypatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    monkeypatch.setattr(main_module, "select_video_file", lambda: sample_video)
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    with TestClient(create_app(state)) as client:
+        bootstrap = client.get("/api/bootstrap").json()
+        assert bootstrap["rotation_ready"] is True
+        assert bootstrap["output_directory"] is None
+        headers = {"X-App-Token": bootstrap["app_token"]}
+        selected = client.post("/api/videos/select", headers=headers)
+        assert selected.status_code == 200, selected.text
+        video = selected.json()["video"]
+        assert video["sample_aspect_ratio"] == "1:1"
+        assert video["rotation_output_extension"] == ".mp4"
+        assert video["rotation_output_extensions"] == {
+            "90": ".mp4",
+            "180": ".mp4",
+            "270": ".mp4",
+            "360": ".mp4",
+        }
+        assert video["directory_display"]
+
+        unauthorized = client.post(
+            "/api/rotations",
+            json={"video_id": video["id"], "degrees": 360},
+        )
+        assert unauthorized.status_code == 403
+        invalid_angle = client.post(
+            "/api/rotations",
+            headers=headers,
+            json={"video_id": video["id"], "degrees": 45},
+        )
+        assert invalid_angle.status_code == 422
+
+        response = client.post(
+            "/api/rotations",
+            headers=headers,
+            json={"video_id": video["id"], "degrees": 360},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["output_name"].endswith("_rotated_360.mp4")
+        job_id = response.json()["job_id"]
+        assert client.get(f"/api/rotations/{job_id}").status_code == 403
+
+        deadline = time.monotonic() + 60
+        snapshot = {}
+        while time.monotonic() < deadline:
+            status = client.get(f"/api/rotations/{job_id}", headers=headers)
+            assert status.status_code == 200
+            snapshot = status.json()
+            if snapshot["status"] not in {"queued", "running"}:
+                break
+            time.sleep(0.05)
+
+        assert snapshot["status"] == "completed", snapshot
+        assert snapshot["operation"] == "rotate"
+        assert snapshot["degrees"] == 360
+        output_path = Path(snapshot["output_path"])
+        assert output_path.is_file()
+        assert output_path != sample_video
+        assert output_path.parent == sample_video.parent
+        assert sample_video.is_file()
+        result = probe_video(output_path, ffprobe=ffprobe)
+        assert (result["width"], result["height"]) == (320, 180)
+        assert result["rotation"] == 0
+        assert result["display_matrix"] is None
+        assert result["audio_codec"] == "aac"
 
 
 def test_frame_export_api_enforces_limit_and_creates_original_size_pngs(

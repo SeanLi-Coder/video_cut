@@ -30,6 +30,7 @@ from .media import (
     ExportManager,
     FrameExtractionManager,
     MediaError,
+    RotationManager,
     VideoSource,
     default_frame_directory_name,
     default_output_name,
@@ -59,6 +60,13 @@ class TimeRangeRequest(BaseModel):
 class PreviewRequest(TimeRangeRequest):
     compatibility: bool = False
     operation: Literal["clip", "frames"] = "clip"
+
+
+class RotationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    video_id: str
+    degrees: Literal[90, 180, 270, 360]
 
 
 @dataclass(frozen=True)
@@ -114,6 +122,25 @@ def _user_media_error(exc: MediaError) -> str:
         "No video frames were found in the selected range": (
             "所选范围内没有找到可截图的视频帧，请调整起止时间。"
         ),
+        "Unsupported rotation angle": "请选择 90°、180°、270° 或 360°。",
+        "The original video directory is not writable": (
+            "原视频所在文件夹不可写，无法在同级目录生成新视频。"
+        ),
+        "There is not enough free space beside the original video": (
+            "原视频所在磁盘空间不足，无法生成永久旋转的新视频。"
+        ),
+        "Interlaced video rotation is not supported": (
+            "该视频是隔行扫描素材，暂时不能在保持原参数的前提下永久旋转。"
+        ),
+        "HDR metadata could not be inspected safely": (
+            "无法完整检查该 HDR 视频的显示元数据，已停止旋转以避免静默改变画质。"
+        ),
+        "Dynamic HDR metadata cannot be preserved safely": (
+            "该视频包含 Dolby Vision 或 HDR10+ 动态元数据，永久旋转可能改变显示效果，已安全停止。"
+        ),
+        "Variable static HDR metadata cannot be preserved safely": (
+            "该视频的 HDR 显示元数据会随画面变化，当前无法原样保留，已安全停止旋转。"
+        ),
         "Required FFmpeg encoders are not available": "当前 FFmpeg 缺少必要的高质量编码器。",
         "Export job was not found": "找不到这次导出任务，请刷新页面后重试。",
     }
@@ -144,6 +171,7 @@ class ApplicationState:
         self.ffprobe = ffprobe
         self.exports: ExportManager | None = None
         self.frame_exports: FrameExtractionManager | None = None
+        self.rotations: RotationManager | None = None
         try:
             resolved_ffmpeg = ffmpeg or executable_path("ffmpeg")
             resolved_ffprobe = ffprobe or executable_path("ffprobe")
@@ -159,6 +187,8 @@ class ApplicationState:
                 ffprobe=resolved_ffprobe,
                 encoders=self.exports.encoders if self.exports is not None else None,
             )
+        with contextlib.suppress(MediaError):
+            self.rotations = RotationManager(ffmpeg=resolved_ffmpeg, ffprobe=resolved_ffprobe)
 
     def output_directory(self) -> Path | None:
         value = self.settings.load().get("output_directory")
@@ -269,6 +299,8 @@ class ApplicationState:
             self.exports.cancel_all()
         if self.frame_exports is not None:
             self.frame_exports.cancel_all()
+        if self.rotations is not None:
+            self.rotations.cancel_all()
 
 
 def _video_payload(source: VideoSource) -> dict[str, Any]:
@@ -281,11 +313,18 @@ def _video_payload(source: VideoSource) -> dict[str, Any]:
         "duration_display": format_timecode(metadata["duration"]),
         "width": metadata["width"],
         "height": metadata["height"],
+        "sample_aspect_ratio": metadata.get("sample_aspect_ratio") or "1:1",
         "fps": metadata["fps"],
         "video_codec": metadata["video_codec"],
         "audio_codec": metadata["audio_codec"],
         "is_hdr": metadata["is_hdr"],
         "output_extension": ExportManager.output_suffix(source),
+        "rotation_output_extension": RotationManager.output_suffix(source),
+        "rotation_output_extensions": {
+            str(degrees): RotationManager.output_suffix(source, degrees)
+            for degrees in (90, 180, 270, 360)
+        },
+        "directory_display": _display_path(source.path.parent),
         "preview_url": f"/api/videos/{source.id}/content",
         "preview_mode": "original",
     }
@@ -383,6 +422,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "server_pid": os.getpid(),
             "ffmpeg_ready": state.exports is not None,
             "frame_export_ready": state.frame_exports is not None,
+            "rotation_ready": state.rotations is not None,
         }
 
     @app.get("/api/bootstrap")
@@ -394,6 +434,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "app_token": state.app_token,
             "ffmpeg_ready": state.exports is not None,
             "frame_export_ready": state.frame_exports is not None,
+            "rotation_ready": state.rotations is not None,
             "max_frame_seconds": MAX_FRAME_EXTRACTION_SECONDS,
             "output_directory": _display_path(directory) if directory else None,
         }
@@ -626,6 +667,17 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
         return {"job_id": job.id, "output_name": job.output_path.name}
 
+    @app.post("/api/rotations", dependencies=[Depends(require_app_token)])
+    def create_rotation(request: RotationRequest) -> dict[str, Any]:
+        try:
+            if state.rotations is None:
+                raise MediaError("ffmpeg was not found")
+            source = state.video(request.video_id)
+            job = state.rotations.create(source, degrees=request.degrees)
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
+        return {"job_id": job.id, "output_name": job.output_path.name}
+
     def export_job(job_id: str):
         if state.exports is None:
             raise HTTPException(status_code=503, detail="FFmpeg 尚未就绪。")
@@ -640,6 +692,14 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         job = state.frame_exports.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="找不到这次截图任务。")
+        return job
+
+    def rotation_job(job_id: str):
+        if state.rotations is None:
+            raise HTTPException(status_code=503, detail="FFmpeg 尚未就绪。")
+        job = state.rotations.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="找不到这次旋转任务。")
         return job
 
     @app.get("/api/exports/{job_id}", dependencies=[Depends(require_app_token)])
@@ -706,6 +766,45 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:
             raise HTTPException(status_code=500, detail="无法打开截图所在文件夹。") from exc
+        return {"ok": True}
+
+    @app.get("/api/rotations/{job_id}", dependencies=[Depends(require_app_token)])
+    def rotation_status(job_id: str) -> dict[str, Any]:
+        snapshot = rotation_job(job_id).snapshot()
+        if snapshot.get("error"):
+            snapshot["error"] = _user_media_error(MediaError(str(snapshot["error"])))
+        return snapshot
+
+    @app.post(
+        "/api/rotations/{job_id}/cancel",
+        dependencies=[Depends(require_app_token)],
+    )
+    def cancel_rotation(job_id: str) -> dict[str, Any]:
+        try:
+            assert state.rotations is not None
+            return state.rotations.cancel(job_id).snapshot()
+        except (MediaError, AssertionError) as exc:
+            raise HTTPException(status_code=404, detail="找不到这次旋转任务。") from exc
+
+    @app.post(
+        "/api/rotations/{job_id}/reveal",
+        dependencies=[Depends(require_app_token)],
+    )
+    def reveal_rotation(job_id: str) -> dict[str, bool]:
+        job = rotation_job(job_id)
+        snapshot = job.snapshot()
+        if snapshot["status"] != "completed" or not job.output_path.is_file():
+            raise HTTPException(status_code=409, detail="旋转尚未完成。")
+        if sys.platform == "darwin":
+            command = ["/usr/bin/open", "-R", str(job.output_path)]
+        elif sys.platform == "win32":
+            command = ["explorer", "/select,", str(job.output_path)]
+        else:
+            command = ["xdg-open", str(job.output_path.parent)]
+        try:
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="无法打开旋转视频所在位置。") from exc
         return {"ok": True}
 
     @app.post("/api/runtime/stop")

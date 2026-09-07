@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import subprocess
 import threading
 import time
@@ -14,15 +15,18 @@ from app.media import (
     ExportManager,
     FrameExtractionManager,
     MediaError,
+    RotationManager,
     VideoSource,
     available_output_path,
     default_frame_directory_name,
     default_output_name,
+    default_rotation_output_name,
     format_timecode,
     parse_timecode,
     probe_video,
     safe_output_stem,
     validate_frame_range,
+    validate_rotation_degrees,
     validate_time_range,
 )
 
@@ -92,6 +96,45 @@ def test_default_frame_directory_name_is_safe_and_predictable() -> None:
     source = Path("旅行/不可能:name.mp4")
     name = default_frame_directory_name(source, 1.25, 2.75)
     assert name == "不可能_name_frames_00-00-01_250-00-00-02_750"
+
+
+def test_default_rotation_output_name_is_safe_and_predictable() -> None:
+    source = Path("旅行/不可能:name.mp4")
+    assert (
+        default_rotation_output_name(source, 270, suffix=".mkv")
+        == "不可能_name_rotated_270.mkv"
+    )
+
+
+def test_rotation_output_suffix_accounts_for_quarter_turn_chroma_geometry() -> None:
+    source = VideoSource(
+        "prores-422",
+        Path("source.mov"),
+        {
+            "video_codec": "prores",
+            "video_bit_depth": 10,
+            "pixel_components": 3,
+            "pixel_log2_chroma_w": 1,
+            "pixel_log2_chroma_h": 0,
+            "is_rgb": False,
+        },
+    )
+
+    assert RotationManager.output_suffix(source, 90) == ".mkv"
+    assert RotationManager.output_suffix(source, 180) == ".mov"
+    assert RotationManager.output_suffix(source, 270) == ".mkv"
+    assert RotationManager.output_suffix(source, 360) == ".mov"
+
+
+@pytest.mark.parametrize("degrees", [90, 180, 270, 360])
+def test_validate_rotation_degrees_accepts_only_supported_angles(degrees: int) -> None:
+    assert validate_rotation_degrees(degrees) == degrees
+
+
+@pytest.mark.parametrize("degrees", [True, 0, 45, 90.5, 720, "clockwise"])
+def test_validate_rotation_degrees_rejects_other_values(degrees: object) -> None:
+    with pytest.raises(MediaError, match="Unsupported rotation angle"):
+        validate_rotation_degrees(degrees)
 
 
 def test_available_output_path_never_overwrites(tmp_path: Path) -> None:
@@ -188,6 +231,253 @@ def _wait_for_job(job, timeout: float = 60) -> dict:
             return snapshot
         time.sleep(0.05)
     raise AssertionError("export did not finish")
+
+
+def _create_rotation_source(tmp_path: Path, ffmpeg: str) -> Path:
+    source_path = tmp_path / "orientation source.mkv"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=96x64:rate=8:duration=1.125",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=937:sample_rate=48000:duration=1.125",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-pix_fmt",
+            "bgr0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-shortest",
+            str(source_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return source_path
+
+
+def _audio_packet_hashes(path: Path, ffprobe: str) -> list[str]:
+    completed = subprocess.run(
+        [
+            ffprobe,
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_packets",
+            "-show_entries",
+            "packet=data_hash",
+            "-show_data_hash",
+            "sha256",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    payload = json.loads(completed.stdout)
+    return [packet["data_hash"] for packet in payload["packets"]]
+
+
+def _decoded_video_sha256(path: Path, ffmpeg: str, *, inverse_filter: str | None) -> str:
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-map",
+        "0:v:0",
+        "-an",
+    ]
+    if inverse_filter is not None:
+        command.extend(["-vf", inverse_filter])
+    command.extend(["-pix_fmt", "bgr0", "-f", "rawvideo", "pipe:1"])
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    return hashlib.sha256(completed.stdout).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("degrees", "expected_dimensions", "inverse_filter"),
+    [
+        (90, (64, 96), "transpose=cclock"),
+        (180, (96, 64), "hflip,vflip"),
+        (270, (64, 96), "transpose=clock"),
+        (360, (96, 64), None),
+    ],
+)
+def test_permanent_rotation_bakes_each_angle_and_copies_audio_packets(
+    degrees: int,
+    expected_dimensions: tuple[int, int],
+    inverse_filter: str | None,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = _create_rotation_source(tmp_path, ffmpeg)
+    original_digest = _sha256(source_path)
+    source_metadata = probe_video(source_path, ffprobe=ffprobe)
+    source = VideoSource("rotation-source", source_path, source_metadata)
+    manager = RotationManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+
+    job = manager.create(source, degrees=degrees)
+    snapshot = _wait_for_job(job)
+
+    assert snapshot["status"] == "completed", snapshot
+    assert snapshot["operation"] == "rotate"
+    assert snapshot["degrees"] == degrees
+    assert snapshot["progress"] == 100
+    assert job.output_path.parent == source_path.parent
+    assert job.output_path != source_path
+    assert job.output_path.name == f"orientation source_rotated_{degrees}.mkv"
+    assert job.output_path.is_file()
+    assert _sha256(source_path) == original_digest
+
+    result = probe_video(job.output_path, ffprobe=ffprobe)
+    assert (result["width"], result["height"]) == expected_dimensions
+    assert result["rotation"] == 0
+    assert result["display_matrix"] is None
+    assert result["video_codec"] == source_metadata["video_codec"] == "ffv1"
+    assert result["pix_fmt"] == source_metadata["pix_fmt"] == "bgr0"
+    assert result["video_bit_depth"] == source_metadata["video_bit_depth"]
+    assert result["is_rgb"] is source_metadata["is_rgb"] is True
+    assert result["has_alpha"] is source_metadata["has_alpha"] is False
+    assert result["fps"] == source_metadata["fps"]
+    assert result["duration"] == pytest.approx(source_metadata["duration"], abs=0.13)
+    assert result["audio_codec"] == source_metadata["audio_codec"] == "aac"
+    assert result["audio_sample_rate"] == source_metadata["audio_sample_rate"] == 48_000
+    assert result["audio_channels"] == source_metadata["audio_channels"]
+    assert result["audio_channel_layout"] == source_metadata["audio_channel_layout"]
+    assert _audio_packet_hashes(job.output_path, ffprobe) == _audio_packet_hashes(
+        source_path,
+        ffprobe,
+    )
+    assert _decoded_video_sha256(
+        job.output_path,
+        ffmpeg,
+        inverse_filter=inverse_filter,
+    ) == _decoded_video_sha256(source_path, ffmpeg, inverse_filter=None)
+
+
+def test_rotation_output_collision_uses_a_numbered_name_without_overwriting(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source_path = _create_rotation_source(tmp_path, ffmpeg)
+    source = VideoSource(
+        "rotation-collision",
+        source_path,
+        probe_video(source_path, ffprobe=ffprobe),
+    )
+    occupied = tmp_path / "orientation source_rotated_360.mkv"
+    occupied.write_bytes(b"existing output")
+    manager = RotationManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+
+    job = manager.create(source, degrees=360)
+    snapshot = _wait_for_job(job)
+
+    assert snapshot["status"] == "completed", snapshot
+    assert occupied.read_bytes() == b"existing output"
+    assert job.output_path == tmp_path / "orientation source_rotated_360_2.mkv"
+    assert job.output_path.is_file()
+
+
+def test_rotation_bakes_existing_display_rotation_and_removes_the_matrix(
+    sample_video: Path,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    tagged_path = tmp_path / "display-rotated.mp4"
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-display_rotation",
+            "90",
+            "-i",
+            str(sample_video),
+            "-c",
+            "copy",
+            str(tagged_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"This FFmpeg build cannot set display rotation: {completed.stderr}")
+    source_metadata = probe_video(tagged_path, ffprobe=ffprobe)
+    assert source_metadata["rotation"] == 90
+    assert source_metadata["display_matrix"] is not None
+    assert (source_metadata["width"], source_metadata["height"]) == (180, 320)
+    original_digest = _sha256(tagged_path)
+    manager = RotationManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+
+    job = manager.create(
+        VideoSource("display-rotated", tagged_path, source_metadata),
+        degrees=90,
+    )
+    snapshot = _wait_for_job(job)
+
+    assert snapshot["status"] == "completed", snapshot
+    result = probe_video(job.output_path, ffprobe=ffprobe)
+    assert (result["width"], result["height"]) == (320, 180)
+    assert result["rotation"] == 0
+    assert result["display_matrix"] is None
+    assert result["fps"] == source_metadata["fps"]
+    assert result["duration"] == pytest.approx(source_metadata["duration"], abs=0.08)
+    assert _audio_packet_hashes(job.output_path, ffprobe) == _audio_packet_hashes(
+        tagged_path,
+        ffprobe,
+    )
+    assert _sha256(tagged_path) == original_digest
+
+
+def test_rotation_rejects_interlaced_video_before_starting_a_job(
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    metadata = {**probe_video(sample_video, ffprobe=ffprobe), "field_order": "tt"}
+    manager = RotationManager(ffmpeg=ffmpeg, ffprobe=ffprobe)
+
+    with pytest.raises(MediaError, match="Interlaced video rotation is not supported"):
+        manager.create(VideoSource("interlaced", sample_video, metadata), degrees=90)
 
 
 def test_frame_extraction_keeps_every_frame_and_original_dimensions(

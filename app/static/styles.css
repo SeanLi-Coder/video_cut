@@ -239,8 +239,8 @@ video {
 
 .mode-switch {
   display: grid;
-  width: min(560px, 100%);
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  width: min(760px, 100%);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
   padding: 6px;
   border: 1px solid rgba(213, 218, 229, 0.9);
@@ -815,6 +815,95 @@ video:focus-visible {
   background: var(--surface-soft);
 }
 
+.rotation-panel {
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface-soft);
+}
+
+.rotation-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 15px;
+}
+
+.rotation-heading strong {
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.rotation-heading span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.rotation-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.rotation-option {
+  display: flex;
+  min-height: 64px;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  outline: none;
+  background: white;
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease, color 150ms ease, transform 150ms ease;
+}
+
+.rotation-option:hover:not(:disabled) {
+  border-color: rgba(90, 84, 232, 0.46);
+  transform: translateY(-1px);
+}
+
+.rotation-option:focus-visible {
+  box-shadow: 0 0 0 3px rgba(90, 84, 232, 0.13);
+}
+
+.rotation-option[aria-pressed="true"] {
+  border-color: rgba(90, 84, 232, 0.58);
+  background: linear-gradient(135deg, #efefff, #ffffff);
+  box-shadow: 0 7px 18px rgba(73, 68, 190, 0.12);
+  color: var(--accent-deep);
+}
+
+.rotation-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.rotation-option-icon {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.rotation-option strong {
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rotation-note {
+  margin: 14px 1px 0;
+  padding: 10px 11px;
+  border: 1px solid #dcdaf8;
+  border-radius: 9px;
+  background: var(--accent-pale);
+  color: #5c5982;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
 .time-field label {
   display: inline-block;
   margin-bottom: 8px;
@@ -994,6 +1083,24 @@ video:focus-visible {
   height: 100%;
   background: #090b10;
   object-fit: contain;
+}
+
+.preview-frame.is-rotation-preview video {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: auto;
+  height: auto;
+  max-width: none;
+  max-height: none;
+  outline: none;
+  object-fit: fill;
+  cursor: pointer;
+  transform-origin: center;
+}
+
+.preview-frame.is-rotation-preview video:focus-visible {
+  box-shadow: 0 0 0 3px rgba(123, 117, 244, 0.7);
 }
 
 .preview-placeholder,
@@ -1511,6 +1618,36 @@ video:focus-visible {
   .time-format-hint {
     margin-bottom: 5px;
   }
+
+  .rotation-panel {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    gap: 14px 20px;
+  }
+
+  .rotation-heading {
+    display: block;
+    margin: 0;
+  }
+
+  .rotation-heading span {
+    display: block;
+    margin-top: 5px;
+  }
+
+  .rotation-options {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .rotation-option {
+    min-height: 58px;
+  }
+
+  .rotation-note {
+    grid-column: 1 / -1;
+    margin-top: 0;
+  }
 }
 
 @media (max-width: 650px) {
@@ -1614,6 +1751,23 @@ video:focus-visible {
 
   .time-panel {
     display: block;
+  }
+
+  .rotation-panel {
+    display: block;
+  }
+
+  .rotation-heading {
+    display: flex;
+    margin-bottom: 14px;
+  }
+
+  .rotation-options {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .rotation-note {
+    margin-top: 13px;
   }
 
   .time-connector {
