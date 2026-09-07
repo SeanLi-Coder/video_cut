@@ -98,6 +98,31 @@ def _request_json(request: Request, timeout: float = 1.0) -> dict[str, Any] | No
     return payload if isinstance(payload, dict) else None
 
 
+def _verified_health(
+    *,
+    port: int,
+    instance_id: str,
+    server_pid: int,
+    timeout: float = 5.0,
+) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout
+    health: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        health = _request_json(
+            Request(f"http://127.0.0.1:{port}/api/health"),
+            min(1.0, max(0.1, deadline - time.monotonic())),
+        )
+        if (
+            health
+            and health.get("app_id") == APP_ID
+            and health.get("instance_id") == instance_id
+            and health.get("server_pid") == server_pid
+        ):
+            return health
+        time.sleep(0.15)
+    return health
+
+
 def main() -> int:
     try:
         record = json.loads(RECORD_PATH.read_text(encoding="utf-8"))
@@ -138,14 +163,25 @@ def main() -> int:
     except (KeyError, TypeError, ValueError):
         print("The runtime record is incomplete.")
         return 1
-    health = _request_json(Request(f"http://127.0.0.1:{port}/api/health"))
+    health = _verified_health(
+        port=port,
+        instance_id=instance_id,
+        server_pid=server_pid,
+    )
+    if not health:
+        print("The saved Local Video Cutter health endpoint did not respond.")
+        return 1
     if (
-        not health
-        or health.get("app_id") != APP_ID
+        health.get("app_id") != APP_ID
         or health.get("instance_id") != instance_id
         or health.get("server_pid") != server_pid
     ):
-        print("Local Video Cutter is not running, or the saved runtime identity is stale.")
+        print(
+            "The saved runtime identity did not match the responding server "
+            f"(app={health.get('app_id') == APP_ID}, "
+            f"instance={health.get('instance_id') == instance_id}, "
+            f"pid={health.get('server_pid') == server_pid})."
+        )
         return 1
     response = _request_json(
         Request(

@@ -496,6 +496,31 @@ def test_stop_pid_check_uses_windows_process_api(monkeypatch) -> None:
     assert not stop._pid_is_alive(124)
 
 
+def test_verified_health_retries_transient_local_failure(monkeypatch) -> None:
+    responses = iter(
+        (
+            None,
+            {
+                "app_id": stop.APP_ID,
+                "instance_id": "windows-instance",
+                "server_pid": 202,
+            },
+        )
+    )
+    monkeypatch.setattr(stop, "_request_json", lambda *_args, **_kwargs: next(responses))
+    monkeypatch.setattr(stop.time, "sleep", lambda _seconds: None)
+
+    assert stop._verified_health(
+        port=8_777,
+        instance_id="windows-instance",
+        server_pid=202,
+    ) == {
+        "app_id": stop.APP_ID,
+        "instance_id": "windows-instance",
+        "server_pid": 202,
+    }
+
+
 def test_running_stop_notifies_windows_launcher_control_channel(
     monkeypatch,
     tmp_path: Path,
