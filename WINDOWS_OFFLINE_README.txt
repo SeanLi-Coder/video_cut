@@ -1,4 +1,4 @@
-Local Video Cutter v1.10.2 — Windows 11 / RTX 5090 完全离线 U 盘使用说明
+Local Video Cutter v1.10.3 — Windows 11 / RTX 5090 完全离线 U 盘使用说明
 
 这份说明用于没有网络的 Windows 11 + NVIDIA GeForce RTX 5090 电脑。普通 Windows 便携 ZIP 只包含程序和本说明，不包含体积很大的 Python、FFmpeg、Microsoft Visual C++ Runtime、AI runtime、wheel 或模型文件；完整离线资源由 offline 和 data\ai 两部分组成，必须另外取得，并且必须与程序版本匹配。
 

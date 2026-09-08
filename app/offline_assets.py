@@ -56,14 +56,30 @@ def _stat_signature(value: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
+def _cross_api_stat_signature(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    # CPython 3.12 exposes the NTFS change time as st_ctime for fstat(), but
+    # preserves the legacy creation-time value for path-based stat() on Windows.
+    # st_birthtime_ns has the same meaning in both results and is therefore safe
+    # for checking that the path still identifies the file held open below.
+    birthtime_ns = getattr(value, "st_birthtime_ns", value.st_ctime_ns)
+    return (
+        value.st_size,
+        value.st_dev,
+        value.st_ino,
+        value.st_mtime_ns,
+        birthtime_ns,
+    )
+
+
 def _stable_sha256(path: Path) -> tuple[str, os.stat_result]:
     with path.open("rb") as handle:
         before = os.fstat(handle.fileno())
         digest = _sha256_stream(handle)
         after = os.fstat(handle.fileno())
-    current = path.stat()
-    if not (
-        _stat_signature(before) == _stat_signature(after) == _stat_signature(current)
+        current = path.stat()
+    if (
+        _stat_signature(before) != _stat_signature(after)
+        or _cross_api_stat_signature(after) != _cross_api_stat_signature(current)
     ):
         raise OfflineBundleError(f"The offline asset changed during verification: {path}")
     return digest, current

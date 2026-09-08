@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -141,6 +142,96 @@ def test_uncached_verification_detects_same_size_replacement(
         match="asset (?:failed verification|changed during verification)",
     ):
         offline.verify_offline_asset_now(relative_path)
+
+
+def test_verification_tolerates_windows_fstat_ctime_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bundle = _configure_root(monkeypatch, tmp_path)
+    _write_bundle(tmp_path, bundle)
+    lockfile = bundle / "locks" / "app.txt"
+    original_path_stat = Path.stat
+    original_fstat = offline.os.fstat
+    birthtime_ns = 1_700_000_000_000_000_000
+
+    class WindowsStat:
+        def __init__(self, value: os.stat_result, *, ctime_ns: int) -> None:
+            self._value = value
+            self.st_ctime_ns = ctime_ns
+            self.st_birthtime_ns = birthtime_ns
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._value, name)
+
+    def windows_handle_stat(descriptor: int) -> os.stat_result:
+        # CPython 3.12's Windows fstat reports ChangeTime through st_ctime.
+        return WindowsStat(  # type: ignore[return-value]
+            original_fstat(descriptor),
+            ctime_ns=birthtime_ns + 1_000_000_000,
+        )
+
+    def divergent_path_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+        value = original_path_stat(path, *args, **kwargs)
+        if path == lockfile:
+            # Path stat reports CreationTime through st_ctime, while birthtime
+            # and every actual file-identity/content field still match fstat.
+            return WindowsStat(value, ctime_ns=birthtime_ns)  # type: ignore[return-value]
+        return value
+
+    monkeypatch.setattr(offline.os, "fstat", windows_handle_stat)
+    monkeypatch.setattr(Path, "stat", divergent_path_stat)
+
+    with lockfile.open("rb") as handle:
+        handle_stat = offline.os.fstat(handle.fileno())
+    path_stat = lockfile.stat()
+    assert (
+        handle_stat.st_size,
+        handle_stat.st_dev,
+        handle_stat.st_ino,
+        handle_stat.st_mtime_ns,
+        handle_stat.st_birthtime_ns,
+    ) == (
+        path_stat.st_size,
+        path_stat.st_dev,
+        path_stat.st_ino,
+        path_stat.st_mtime_ns,
+        path_stat.st_birthtime_ns,
+    )
+    assert handle_stat.st_ctime_ns != path_stat.st_ctime_ns
+
+    profile = offline.offline_install_profile("app")
+
+    assert profile is not None
+    assert profile.lockfile == lockfile
+
+
+def test_verification_rejects_path_replacement_after_hashing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bundle = _configure_root(monkeypatch, tmp_path)
+    asset, _, _ = _write_bundle(tmp_path, bundle)
+    relative_path = "offline/windows-rtx5090/python/python.exe"
+    original_sha256_stream = offline._sha256_stream
+    replacement_written = False
+
+    def replace_after_hash(handle: object) -> str:
+        nonlocal replacement_written
+        digest = original_sha256_stream(handle)
+        if Path(handle.name) == asset and not replacement_written:  # type: ignore[attr-defined]
+            replacement_written = True
+            replacement = asset.with_name("replacement.exe")
+            replacement.write_bytes(b"x" * len(b"verified asset"))
+            previous = os.stat(asset)
+            os.utime(replacement, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+            replacement.replace(asset)
+        return digest
+
+    monkeypatch.setattr(offline, "_sha256_stream", replace_after_hash)
+
+    with pytest.raises(OfflineBundleError, match="asset changed during verification"):
+        offline.verify_offline_asset_details_now(relative_path)
 
 
 def test_declared_asset_rechecks_ready_and_manifest_metadata(
