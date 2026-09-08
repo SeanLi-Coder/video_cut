@@ -47,6 +47,14 @@ from .media import (
     probe_video,
     safe_output_stem,
 )
+from .offline_assets import (
+    OfflineBundleError,
+    OfflineInstallProfile,
+    declared_offline_asset,
+    offline_bundle_present,
+    offline_install_profile,
+    verify_offline_asset_details_now,
+)
 from .paths import APPLICATION_ROOT, RESOURCE_ROOT
 
 PROJECT_ROOT = RESOURCE_ROOT
@@ -917,6 +925,11 @@ class AIEnhancementManager:
         self._jobs: dict[str, AIEnhancementJob] = {}
         self._model_download_jobs: dict[str, AIModelDownloadJob] = {}
         self._lock = threading.RLock()
+        self._model_validation_lock = threading.RLock()
+        self._offline_validated_model_files: dict[
+            str,
+            dict[str, tuple[int, int, int, int, int]],
+        ] = {}
         self._active_job_id: str | None = None
         self._latest_model_download_job_id: str | None = None
         self._latest_model_download_job_ids: dict[str, str] = {}
@@ -1165,6 +1178,22 @@ class AIEnhancementManager:
         return cache if isinstance(cache, dict) else {}
 
     @staticmethod
+    def _model_file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
+        if path.is_symlink() or not path.is_file():
+            return None
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (
+            stat.st_size,
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
+
+    @staticmethod
     def _model_cache_entry_matches(
         path: Path,
         entry: object,
@@ -1183,22 +1212,117 @@ class AIEnhancementManager:
             and isinstance(entry, dict)
             and entry.get("hash") == sha256
             and entry.get("size") == size
-            and isinstance(entry.get("mtime"), (int, float))
-            and float(entry["mtime"]) == stat.st_mtime
+            and entry.get("device") == stat.st_dev
+            and entry.get("inode") == stat.st_ino
+            and entry.get("mtime_ns") == stat.st_mtime_ns
+            and entry.get("ctime_ns") == stat.st_ctime_ns
         )
 
-    def _models_downloaded(self, model_id: str = DEFAULT_AI_MODEL_ID) -> bool:
-        cache = self._model_validation_cache(model_id)
+    def _offline_model_file_cached(
+        self,
+        model_id: str,
+        filename: str,
+        path: Path,
+    ) -> bool:
+        signature = self._model_file_signature(path)
+        return bool(
+            signature is not None
+            and self._offline_validated_model_files.get(model_id, {}).get(filename) == signature
+        )
+
+    def _models_cached(self, model_id: str = DEFAULT_AI_MODEL_ID) -> bool:
         model_root = self._model_root_for(model_id)
-        for filename, size, sha256, _url in self._model_files_for(model_id):
-            path = model_root.joinpath(*PurePosixPath(filename).parts)
-            if not self._model_cache_entry_matches(
-                path,
+        model_files = self._model_files_for(model_id)
+        if sys.platform == "win32" and offline_bundle_present():
+            return all(
+                self._offline_model_file_cached(
+                    model_id,
+                    filename,
+                    model_root.joinpath(*PurePosixPath(filename).parts),
+                )
+                for filename, _size, _sha256, _url in model_files
+            )
+        cache = self._model_validation_cache(model_id)
+        return all(
+            self._model_cache_entry_matches(
+                model_root.joinpath(*PurePosixPath(filename).parts),
                 cache.get(filename),
                 size=size,
                 sha256=sha256,
-            ):
-                return False
+            )
+            for filename, size, sha256, _url in model_files
+        )
+
+    def _models_downloaded(self, model_id: str = DEFAULT_AI_MODEL_ID) -> bool:
+        with self._model_validation_lock:
+            return self._models_downloaded_locked(model_id)
+
+    def _models_downloaded_locked(self, model_id: str) -> bool:
+        cache = self._model_validation_cache(model_id)
+        model_root = self._model_root_for(model_id)
+        model_files = self._model_files_for(model_id)
+        cache_matches = self._models_cached(model_id)
+        if sys.platform != "win32" or not offline_bundle_present():
+            return cache_matches
+
+        try:
+            declared_paths: dict[str, Path] = {}
+            for filename, size, sha256, _url in model_files:
+                path = model_root.joinpath(*PurePosixPath(filename).parts)
+                relative_path = path.resolve().relative_to(APPLICATION_ROOT.resolve()).as_posix()
+                declared = declared_offline_asset(
+                    relative_path,
+                    expected_size=size,
+                    expected_sha256=sha256,
+                )
+                if declared is None or declared.resolve() != path.resolve():
+                    raise OfflineBundleError(
+                        f"The offline manifest does not provide {relative_path}"
+                    )
+                declared_paths[filename] = declared
+        except (OfflineBundleError, OSError, ValueError) as exc:
+            raise MediaError(
+                f"Windows 离线 AI 模型缺失或校验失败，已停止且不会联网：{exc}"
+            ) from exc
+
+        if cache_matches:
+            return True
+
+        try:
+            validated_signatures: dict[str, tuple[int, int, int, int, int]] = {}
+            for filename, size, sha256, _url in model_files:
+                path = declared_paths[filename]
+                relative_path = path.resolve().relative_to(APPLICATION_ROOT.resolve()).as_posix()
+                verification = verify_offline_asset_details_now(
+                    relative_path,
+                    expected_size=size,
+                    expected_sha256=sha256,
+                )
+                if verification is None or verification.path.resolve() != path.resolve():
+                    raise OfflineBundleError(
+                        f"The offline manifest does not provide {relative_path}"
+                    )
+                signature = self._model_file_signature(path)
+                if signature != verification.signature:
+                    raise OfflineBundleError(
+                        f"The offline model changed after verification: {relative_path}"
+                    )
+                validated_signatures[filename] = verification.signature
+                stat = path.stat()
+                cache[filename] = {
+                    "size": stat.st_size,
+                    "device": stat.st_dev,
+                    "inode": stat.st_ino,
+                    "mtime_ns": stat.st_mtime_ns,
+                    "ctime_ns": stat.st_ctime_ns,
+                    "hash": sha256,
+                }
+        except (OfflineBundleError, OSError, ValueError) as exc:
+            raise MediaError(
+                f"Windows 离线 AI 模型缺失或校验失败，已停止且不会联网：{exc}"
+            ) from exc
+        self._offline_validated_model_files[model_id] = validated_signatures
+        self._write_model_validation_cache(cache, model_id)
         return True
 
     def _available_model_bytes(self, model_id: str = DEFAULT_AI_MODEL_ID) -> int:
@@ -1269,7 +1393,12 @@ class AIEnhancementManager:
             return None
         return value if value > 0 else None
 
-    def runtime_status(self, model_id: str = DEFAULT_AI_MODEL_ID) -> dict[str, Any]:
+    def runtime_status(
+        self,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+        *,
+        verify_models: bool = True,
+    ) -> dict[str, Any]:
         spec = get_ai_model(model_id)
         model_id = spec.id
         injected = self.inference_runner is not None and model_id == DEFAULT_AI_MODEL_ID
@@ -1278,11 +1407,20 @@ class AIEnhancementManager:
             if model_id == DEFAULT_AI_MODEL_ID
             else self._runtime_installed(model_id)
         )
-        models_downloaded = injected or (
-            self._models_downloaded()
-            if model_id == DEFAULT_AI_MODEL_ID
-            else self._models_downloaded(model_id)
-        )
+        if injected:
+            models_downloaded = True
+        elif verify_models:
+            models_downloaded = (
+                self._models_downloaded()
+                if model_id == DEFAULT_AI_MODEL_ID
+                else self._models_downloaded(model_id)
+            )
+        else:
+            models_downloaded = (
+                self._models_cached()
+                if model_id == DEFAULT_AI_MODEL_ID
+                else self._models_cached(model_id)
+            )
         compatible, compatibility_reason = model_compatibility(spec, self.compute_backend)
         memory = self._memory_bytes()
         if not self.platform_supported:
@@ -1370,6 +1508,7 @@ class AIEnhancementManager:
             "color_pipeline_error": self.color_pipeline_error,
             "first_download_gb": round(spec.total_download_bytes / 1_000_000_000, 1),
             "download_size_bytes": self._model_total_bytes(model_id),
+            "offline_managed": bool(sys.platform == "win32" and offline_bundle_present()),
             "minimum_runtime_free_gb": (
                 MINIMUM_SWIFTVR_RUNTIME_FREE_BYTES
                 if model_id == SWIFTVR_5B_BF16_ID
@@ -1381,6 +1520,17 @@ class AIEnhancementManager:
             "memory_gb": round(memory / 1024**3) if memory else None,
             "message": message,
         }
+
+    def capability_ready(self, model_id: str = DEFAULT_AI_MODEL_ID) -> bool:
+        spec = get_ai_model(model_id)
+        compatible, _reason = model_compatibility(spec, self.compute_backend)
+        return bool(
+            self.platform_supported
+            and self.driver_supported
+            and self.encoder_available
+            and self.color_pipeline_available
+            and compatible
+        )
 
     def _active_job_locked(self) -> AIWorkerJob | None:
         if self._active_job_id is None:
@@ -1560,6 +1710,7 @@ class AIEnhancementManager:
                     "prepared": bool(runtime["prepared"]),
                     "installed": bool(runtime["installed"]),
                     "download_status": snapshot["status"],
+                    "offline_managed": bool(runtime["offline_managed"]),
                     "runtime": runtime,
                 }
             )
@@ -1741,6 +1892,11 @@ class AIEnhancementManager:
     def delete_model(self, model_id: str = DEFAULT_AI_MODEL_ID) -> dict[str, Any]:
         spec = get_ai_model(model_id)
         model_id = spec.id
+        if sys.platform == "win32" and offline_bundle_present():
+            raise MediaError(
+                "当前模型由完整离线包管理，为防止误删 U 盘源文件，网页删除已禁用。"
+                "如需释放空间，请退出程序后删除整个离线程序文件夹。"
+            )
         with self._lock:
             if self._active_job_locked() is not None:
                 raise MediaError("The selected AI model is currently in use")
@@ -1771,6 +1927,11 @@ class AIEnhancementManager:
     ) -> dict[str, Any]:
         spec = get_ai_model(model_id)
         model_id = spec.id
+        if restart and sys.platform == "win32" and offline_bundle_present():
+            raise MediaError(
+                "当前模型由完整离线包管理，为防止误删离线源文件，不能从零重下。"
+                "请重新复制完整离线程序文件夹。"
+            )
         compatible, reason = model_compatibility(spec, self.compute_backend)
         if not self.platform_supported:
             raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
@@ -2140,6 +2301,8 @@ class AIEnhancementManager:
         path: Path,
         sha256: str,
         model_id: str = DEFAULT_AI_MODEL_ID,
+        *,
+        offline_signature: tuple[int, int, int, int, int] | None = None,
     ) -> None:
         stat = path.stat()
         model_root = self._model_root_for(model_id)
@@ -2147,10 +2310,27 @@ class AIEnhancementManager:
             cache_key = path.resolve().relative_to(model_root.resolve()).as_posix()
         except ValueError as exc:
             raise MediaError("The AI model file is outside its isolated directory") from exc
+        signature = self._model_file_signature(path)
+        if signature is None:
+            raise MediaError("The validated AI model file disappeared")
+        if (
+            sys.platform == "win32"
+            and offline_bundle_present()
+            and offline_signature is not None
+        ):
+            if signature != offline_signature:
+                raise MediaError("The offline AI model changed after integrity verification")
+            with self._model_validation_lock:
+                self._offline_validated_model_files.setdefault(model_id, {})[
+                    cache_key
+                ] = offline_signature
         cache = self._model_validation_cache(model_id)
         cache[cache_key] = {
             "size": stat.st_size,
-            "mtime": stat.st_mtime,
+            "device": stat.st_dev,
+            "inode": stat.st_ino,
+            "mtime_ns": stat.st_mtime_ns,
+            "ctime_ns": stat.st_ctime_ns,
             "hash": sha256,
         }
         self._write_model_validation_cache(cache, model_id)
@@ -2272,6 +2452,45 @@ class AIEnhancementManager:
     ) -> None:
         destination = self._model_destination(model_id, filename)
         cache = self._model_validation_cache(model_id)
+        if sys.platform == "win32" and offline_bundle_present():
+            try:
+                relative_path = (
+                    destination.resolve().relative_to(APPLICATION_ROOT.resolve()).as_posix()
+                )
+                declared_model = declared_offline_asset(
+                    relative_path,
+                    expected_size=expected_size,
+                    expected_sha256=expected_sha256,
+                )
+            except (OfflineBundleError, ValueError) as exc:
+                raise MediaError(
+                    f"Windows 离线 AI 模型缺失或校验失败，已停止下载且不会联网：{exc}"
+                ) from exc
+            if declared_model is None or declared_model.resolve() != destination.resolve():
+                raise MediaError("Windows 离线 AI 模型不可用，已停止下载且不会联网")
+            if self._offline_model_file_cached(model_id, filename, destination):
+                self._set_model_download_bytes(job, completed_bytes + expected_size)
+                return
+            try:
+                verification = verify_offline_asset_details_now(
+                    relative_path,
+                    expected_size=expected_size,
+                    expected_sha256=expected_sha256,
+                )
+            except OfflineBundleError as exc:
+                raise MediaError(
+                    f"Windows 离线 AI 模型缺失或校验失败，已停止下载且不会联网：{exc}"
+                ) from exc
+            if verification is None or verification.path.resolve() != destination.resolve():
+                raise MediaError("Windows 离线 AI 模型不可用，已停止下载且不会联网")
+            self._record_validated_model(
+                destination,
+                expected_sha256,
+                model_id,
+                offline_signature=verification.signature,
+            )
+            self._set_model_download_bytes(job, completed_bytes + expected_size)
+            return
         if self._model_cache_entry_matches(
             destination,
             cache.get(filename),
@@ -2809,6 +3028,36 @@ class AIEnhancementManager:
         )
 
     @staticmethod
+    def _windows_offline_install_profile(name: str) -> OfflineInstallProfile | None:
+        if sys.platform != "win32":
+            return None
+        try:
+            return offline_install_profile(name)
+        except OfflineBundleError as exc:
+            raise MediaError(f"Windows 离线 AI 包校验失败，已停止安装且不会联网：{exc}") from exc
+
+    @staticmethod
+    def _offline_pip_install_command(
+        python: Path,
+        profile: OfflineInstallProfile,
+    ) -> list[str]:
+        return [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--no-input",
+            "--no-cache-dir",
+            "--no-index",
+            "--find-links",
+            str(profile.wheelhouse),
+            "--require-hashes",
+            "-r",
+            str(profile.lockfile),
+        ]
+
+    @staticmethod
     def _swiftvr_runtime_probe_script() -> str:
         return (
             "import accelerate, decord, diffusers, numpy, safetensors, swiftvr, "
@@ -2852,9 +3101,15 @@ class AIEnhancementManager:
         if self._file_sha256(AI_COLOR_PATCH_PATH) != RUNNER_COLOR_PATCH_SHA256:
             raise MediaError("The bundled AI color patch failed integrity verification")
 
+        offline_profile = self._windows_offline_install_profile("seedvr2")
+
         archive = self.runtime_root / f"runner-{RUNNER_REVISION}.zip"
         if not archive.is_file() or self._file_sha256(archive) != RUNNER_ARCHIVE_SHA256:
             archive.unlink(missing_ok=True)
+            if offline_profile is not None:
+                raise MediaError(
+                    "Windows 离线 AI 包中的 SeedVR2 运行器缺失或损坏，已停止安装且不会联网。"
+                )
             self._set_job(job, stage="setup", progress=1, message="正在下载固定版本的 AI 运行器")
             self._download_archive(job, archive)
 
@@ -2899,7 +3154,14 @@ class AIEnhancementManager:
                 "--no-input",
             ]
             download_environment = self._download_process_environment(job, staging)
-            if self.compute_backend == "cuda":
+            if offline_profile is not None:
+                self._run_process(
+                    job,
+                    self._offline_pip_install_command(python, offline_profile),
+                    env=download_environment,
+                )
+                dependency_path = None
+            elif self.compute_backend == "cuda":
                 pip_options.append("--no-cache-dir")
                 self._run_process(
                     job,
@@ -2913,15 +3175,16 @@ class AIEnhancementManager:
                 dependency_path = AI_COMMON_REQUIREMENTS_PATH
             else:
                 dependency_path = AI_REQUIREMENTS_PATH
-            self._run_process(
-                job,
-                [
-                    *pip_options,
-                    "-r",
-                    str(dependency_path),
-                ],
-                env=download_environment,
-            )
+            if dependency_path is not None:
+                self._run_process(
+                    job,
+                    [
+                        *pip_options,
+                        "-r",
+                        str(dependency_path),
+                    ],
+                    env=download_environment,
+                )
             self._verify_compute_runtime(job, python)
             self._run_process(
                 job,
@@ -2977,6 +3240,8 @@ class AIEnhancementManager:
         if not AI_SWIFTVR_REQUIREMENTS_PATH.is_file() or not AI_SWIFTVR_RUNNER_PATH.is_file():
             raise MediaError("The bundled SwiftVR runtime files are missing")
 
+        offline_profile = self._windows_offline_install_profile("swiftvr")
+
         staging = runtime_root / f"setup-{job.id}"
         staging_venv = staging / "venv"
         if staging.exists():
@@ -3000,9 +3265,10 @@ class AIEnhancementManager:
                 progress=5,
                 message="正在安装固定版本的 SwiftVR、PyTorch 与 CUDA 13.0 依赖",
             )
-            self._run_process(
-                job,
-                [
+            install_command = (
+                self._offline_pip_install_command(python, offline_profile)
+                if offline_profile is not None
+                else [
                     str(python),
                     "-m",
                     "pip",
@@ -3012,7 +3278,11 @@ class AIEnhancementManager:
                     "--no-cache-dir",
                     "-r",
                     str(AI_SWIFTVR_REQUIREMENTS_PATH),
-                ],
+                ]
+            )
+            self._run_process(
+                job,
+                install_command,
                 env=self._download_process_environment(job, staging),
             )
             self._verify_compute_runtime(job, python)

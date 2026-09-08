@@ -4,6 +4,8 @@ cd /d "%~dp0"
 
 echo Starting Local Video Cutter...
 
+if exist "LocalVideoCutter.exe" goto launch_executable
+
 if exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -I -c "import sys; raise SystemExit(sys.version_info[:2] != (3, 12))" >nul 2>&1
   if not errorlevel 1 goto launch_venv
@@ -85,6 +87,10 @@ goto finished
 :failed
 set "TASK_EXIT_CODE=1"
 goto show_error
+
+:launch_executable
+"LocalVideoCutter.exe"
+exit /b %ERRORLEVEL%
 
 :finished
 if "%TASK_EXIT_CODE%"=="0" exit /b 0

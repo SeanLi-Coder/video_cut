@@ -8,6 +8,7 @@ release/
 build/
 dist/
 *.spec
+/offline/
 
 data/settings.json
 data/runtime/*

@@ -891,6 +891,7 @@ function normalizeAiModel(value, fallback = {}) {
     partial_bytes: Math.max(0, Number(raw.partial_bytes) || 0),
     downloaded: typeof raw.downloaded === "boolean" ? raw.downloaded : null,
     prepared: typeof raw.prepared === "boolean" ? raw.prepared : null,
+    offline_managed: raw.offline_managed === true || raw.runtime?.offline_managed === true,
     compatibility_reason: String(
       raw.blocked_reason || raw.compatibility_reason || raw.unavailable_reason || "",
     ),
@@ -2435,9 +2436,11 @@ function renderModelManager() {
     || state.modelDownloadStarting
     || state.modelDownloadCancelling
     || aiEnhancementIsActive();
+  const offlineManaged = model?.offline_managed === true || runtime?.offline_managed === true;
   elements.modelDeleteButton.disabled = checking
     || anyModelDeleting
     || deleteBlockedByTask
+    || offlineManaged
     || !state.multiModelApiAvailable
     || !installedFiles;
   elements.modelDeleteButton.setAttribute(
@@ -2449,6 +2452,8 @@ function renderModelManager() {
     ? `正在删除 ${model?.name || "所选模型"} 的本地文件，请不要关闭页面。`
     : deleteBlockedByTask
       ? "模型下载或 AI 超清任务进行期间不能删除模型。"
+      : offlineManaged
+        ? "这个模型由完整离线包管理，已禁止单独删除，避免破坏离线包。"
       : !state.multiModelApiAvailable
         ? "当前本地服务版本不支持在网页中删除模型。"
         : !installedFiles
@@ -2761,6 +2766,7 @@ async function deleteSelectedAiModel() {
     || state.modelDownloadCancelling
     || modelDownloadIsActive()
     || aiEnhancementIsActive()
+    || model.offline_managed === true
     || !modelHasInstalledFiles(model)
   ) {
     return;

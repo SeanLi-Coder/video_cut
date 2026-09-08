@@ -35,10 +35,15 @@ class FakeAPI:
         self.requests: list[Request] = []
 
     def __call__(self, request: Request, *, timeout: float) -> FakeResponse:
-        assert timeout == launcher_models.HTTP_TIMEOUT_SECONDS
-        self.requests.append(request)
         actual_method = request.get_method()
         actual_path = urlsplit(request.full_url).path
+        expected_timeout = (
+            launcher_models.MODEL_CATALOG_TIMEOUT_SECONDS
+            if actual_method == "GET" and actual_path == "/api/ai-models"
+            else launcher_models.HTTP_TIMEOUT_SECONDS
+        )
+        assert timeout == expected_timeout
+        self.requests.append(request)
         if (
             actual_method == "GET"
             and actual_path == launcher_models.DOWNLOAD_PROXY_PATH
@@ -101,6 +106,7 @@ def _model(
     partial_bytes: int = 0,
     download_status: str = "idle",
     requires_runtime_update: bool = False,
+    offline_managed: bool = False,
 ) -> dict[str, Any]:
     return {
         "id": model_id,
@@ -113,6 +119,7 @@ def _model(
         "partial_bytes": partial_bytes,
         "download_status": download_status,
         "requires_runtime_update": requires_runtime_update,
+        "offline_managed": offline_managed,
     }
 
 
@@ -160,6 +167,46 @@ def test_local_api_default_opener_explicitly_disables_environment_proxies() -> N
     assert launcher_models.urlopen.__self__ is launcher_models._DIRECT_LOCAL_OPENER
     assert isinstance(launcher_models._DIRECT_PROXY_HANDLER, ProxyHandler)
     assert launcher_models._DIRECT_PROXY_HANDLER.proxies == {}
+
+
+def test_offline_managed_models_skip_proxy_configuration(monkeypatch) -> None:
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            (
+                "GET",
+                "/api/ai-models",
+                {
+                    "models": [
+                        _model(
+                            downloaded=True,
+                            requires_runtime_update=True,
+                            offline_managed=True,
+                        )
+                    ]
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=io.StringIO("n\n"),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    text = output.getvalue()
+    assert "Offline AI models can be verified and prepared" in text
+    assert "AI download proxy" not in text
+    assert "Prepare this offline model now?" in text
+    assert [urlsplit(request.full_url).path for request in api.requests] == [
+        "/api/bootstrap",
+        "/api/ai-models",
+    ]
 
 
 def test_proxy_prompt_displays_scrubbed_setting_and_enter_keeps_it(monkeypatch) -> None:

@@ -20,6 +20,11 @@ from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.request import ProxyHandler, Request, build_opener
 
+from app.offline_assets import (
+    OfflineBundleError,
+    offline_install_profile,
+    verified_offline_asset,
+)
 from app.paths import APPLICATION_ROOT, is_frozen
 from launcher_models import prompt_for_missing_models
 
@@ -40,6 +45,10 @@ APP_ID = "com.seanli.local-video-cutter"
 DEFAULT_PORT = 8777
 PYTHON_PACKAGE_ID = "Python.Python.3.12"
 FFMPEG_PACKAGE_ID = "Gyan.FFmpeg"
+OFFLINE_PYTHON_INSTALLER = "offline/windows-rtx5090/python/python-3.12.10-amd64.exe"
+OFFLINE_VC_RUNTIME_INSTALLER = "offline/windows-rtx5090/runtime/vc_redist.x64.exe"
+OFFLINE_FFMPEG = "offline/windows-rtx5090/ffmpeg/ffmpeg-9.0.1-full_build/bin/ffmpeg.exe"
+OFFLINE_FFPROBE = "offline/windows-rtx5090/ffmpeg/ffmpeg-9.0.1-full_build/bin/ffprobe.exe"
 FFMPEG_FULL_SMOKE_FILTER = (
     "setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:"
     "colorspace=bt2020nc,"
@@ -262,6 +271,35 @@ def _resolve_base_python(
     python = _find_python_312(initial)
     if python is not None:
         return python
+    if sys.platform == "win32":
+        try:
+            offline_installer = verified_offline_asset(OFFLINE_PYTHON_INSTALLER)
+        except OfflineBundleError as exc:
+            raise LauncherError(str(exc)) from exc
+        if offline_installer is not None:
+            print("Python 3.12 is missing. Installing it from the verified offline bundle...")
+            return_code = _run_owned(
+                [
+                    str(offline_installer),
+                    "/quiet",
+                    "InstallAllUsers=0",
+                    "PrependPath=0",
+                    "Include_launcher=0",
+                    "Include_pip=1",
+                    "Include_test=0",
+                    "Include_doc=0",
+                    "Include_dev=0",
+                    "Shortcuts=0",
+                ],
+                stop_requested=stop_requested,
+            )
+            python = _find_python_312()
+            if python is None:
+                raise LauncherError(
+                    "The verified offline Python 3.12 installer did not provide a usable "
+                    f"interpreter (exit code {return_code})"
+                )
+            return python
     print("Python 3.12 is missing. Installing it with Windows Package Manager...")
     install_error: LauncherError | None = None
     try:
@@ -279,6 +317,54 @@ def _resolve_base_python(
             "Local Video Cutter again."
         )
     return python
+
+
+def _visual_cpp_runtime_available(base_python: Path) -> bool:
+    if sys.platform != "win32":
+        return True
+    probe = (
+        "import ctypes; "
+        "[ctypes.WinDLL(name) for name in "
+        "('MSVCP140.dll','VCRUNTIME140.dll','VCRUNTIME140_1.dll')]"
+    )
+    try:
+        completed = subprocess.run(
+            [str(base_python), "-I", "-c", probe],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _prepare_visual_cpp_runtime(
+    base_python: Path,
+    *,
+    stop_requested: threading.Event,
+) -> None:
+    if sys.platform != "win32" or _visual_cpp_runtime_available(base_python):
+        return
+    try:
+        installer = verified_offline_asset(OFFLINE_VC_RUNTIME_INSTALLER)
+    except OfflineBundleError as exc:
+        raise LauncherError(str(exc)) from exc
+    if installer is None:
+        return
+
+    print("Installing the Microsoft Visual C++ runtime from the verified offline bundle...")
+    return_code = _run_owned(
+        [str(installer), "/install", "/quiet", "/norestart"],
+        stop_requested=stop_requested,
+    )
+    if not _visual_cpp_runtime_available(base_python):
+        restart_hint = " Restart Windows and try again." if return_code == 3010 else ""
+        raise LauncherError(
+            "The Microsoft Visual C++ runtime is still unavailable after offline setup "
+            f"(exit code {return_code}).{restart_hint}"
+        )
 
 
 def _prepare_environment(
@@ -314,7 +400,24 @@ def _prepare_environment(
         stderr=subprocess.DEVNULL,
     )
     if marker != digest or dependency_check.returncode != 0:
-        print("Installing local application dependencies...")
+        try:
+            offline_profile = offline_install_profile("app") if sys.platform == "win32" else None
+        except OfflineBundleError as exc:
+            raise LauncherError(str(exc)) from exc
+        if offline_profile is not None:
+            print("Installing local application dependencies from the offline bundle...")
+            install_source = [
+                "--no-cache-dir",
+                "--no-index",
+                "--find-links",
+                str(offline_profile.wheelhouse),
+                "--require-hashes",
+                "-r",
+                str(offline_profile.lockfile),
+            ]
+        else:
+            print("Installing local application dependencies...")
+            install_source = ["-q", "-r", str(REQUIREMENTS_PATH)]
         return_code = _run_owned(
             [
                 str(python),
@@ -322,9 +425,8 @@ def _prepare_environment(
                 "pip",
                 "install",
                 "--disable-pip-version-check",
-                "-q",
-                "-r",
-                str(REQUIREMENTS_PATH),
+                "--no-input",
+                *install_source,
             ],
             stop_requested=stop_requested,
         )
@@ -336,6 +438,14 @@ def _prepare_environment(
 
 def _candidate_ffmpeg_pairs() -> list[tuple[Path, Path]]:
     candidates: list[tuple[Path, Path]] = []
+    if sys.platform == "win32":
+        try:
+            offline_ffmpeg = verified_offline_asset(OFFLINE_FFMPEG)
+            offline_ffprobe = verified_offline_asset(OFFLINE_FFPROBE)
+        except OfflineBundleError as exc:
+            raise LauncherError(str(exc)) from exc
+        if offline_ffmpeg is not None and offline_ffprobe is not None:
+            candidates.append((offline_ffmpeg, offline_ffprobe))
     path_ffmpeg = shutil.which("ffmpeg")
     path_ffprobe = shutil.which("ffprobe")
     if path_ffmpeg and path_ffprobe:
@@ -801,6 +911,10 @@ def launch(
             )
             resolved_python = _resolve_base_python(
                 base_python,
+                stop_requested=stop_requested,
+            )
+            _prepare_visual_cpp_runtime(
+                resolved_python,
                 stop_requested=stop_requested,
             )
             python = _prepare_environment(resolved_python, stop_requested=stop_requested)

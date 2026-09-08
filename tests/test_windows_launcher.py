@@ -10,11 +10,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.request import ProxyHandler
 
+import pytest
+
 import launcher_windows
 import stop
 import windows_exe
 from app import dialogs
 from app import paths as app_paths
+from app.offline_assets import OfflineBundleError, OfflineInstallProfile
 
 
 def test_windows_local_control_requests_disable_system_proxies() -> None:
@@ -125,6 +128,88 @@ def test_resolve_base_python_installs_python_312(monkeypatch, tmp_path: Path) ->
     assert packages == [launcher_windows.PYTHON_PACKAGE_ID]
 
 
+def test_resolve_base_python_prefers_verified_offline_installer(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    installer = tmp_path / "python-3.12.10-amd64.exe"
+    installer.touch()
+    installed = tmp_path / "Python312" / "python.exe"
+    results = iter((None, installed))
+    commands: list[list[str]] = []
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.setattr(launcher_windows, "_find_python_312", lambda *_args: next(results))
+    monkeypatch.setattr(
+        launcher_windows,
+        "verified_offline_asset",
+        lambda relative_path: (
+            installer if relative_path == launcher_windows.OFFLINE_PYTHON_INSTALLER else None
+        ),
+    )
+    monkeypatch.setattr(
+        launcher_windows,
+        "_run_owned",
+        lambda command, **_kwargs: commands.append(command) or 0,
+    )
+    monkeypatch.setattr(
+        launcher_windows,
+        "_install_winget_package",
+        lambda *_args, **_kwargs: pytest.fail("WinGet must not run for an offline install"),
+    )
+
+    result = launcher_windows._resolve_base_python(
+        None,
+        stop_requested=threading.Event(),
+    )
+
+    assert result == installed
+    assert commands[0][0] == str(installer)
+    assert "/quiet" in commands[0]
+    assert "Include_launcher=0" in commands[0]
+    assert "Include_pip=1" in commands[0]
+
+
+def test_resolve_base_python_accepts_nonzero_offline_installer_when_python_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    installer = tmp_path / "python-3.12.10-amd64.exe"
+    installer.touch()
+    installed = tmp_path / "Python312" / "python.exe"
+    results = iter((None, installed))
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.setattr(launcher_windows, "_find_python_312", lambda *_args: next(results))
+    monkeypatch.setattr(launcher_windows, "verified_offline_asset", lambda _path: installer)
+    monkeypatch.setattr(launcher_windows, "_run_owned", lambda *_args, **_kwargs: 1638)
+
+    assert (
+        launcher_windows._resolve_base_python(None, stop_requested=threading.Event()) == installed
+    )
+
+
+def test_resolve_base_python_does_not_bypass_damaged_offline_bundle(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.setattr(launcher_windows, "_find_python_312", lambda *_args: None)
+    monkeypatch.setattr(
+        launcher_windows,
+        "verified_offline_asset",
+        lambda _relative_path: (_ for _ in ()).throw(OfflineBundleError("bad READY")),
+    )
+    monkeypatch.setattr(
+        launcher_windows,
+        "_install_winget_package",
+        lambda *_args, **_kwargs: pytest.fail("WinGet must not bypass a damaged bundle"),
+    )
+
+    with pytest.raises(launcher_windows.LauncherError, match="bad READY"):
+        launcher_windows._resolve_base_python(
+            None,
+            stop_requested=threading.Event(),
+        )
+
+
 def test_resolve_base_python_accepts_winget_already_installed_result(
     monkeypatch,
     tmp_path: Path,
@@ -182,6 +267,115 @@ def test_winget_package_install_is_noninteractive_and_user_scoped(monkeypatch) -
     ]
 
 
+def test_prepare_visual_cpp_runtime_skips_installer_when_dlls_are_available(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    python = tmp_path / "python.exe"
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.setattr(
+        launcher_windows,
+        "_visual_cpp_runtime_available",
+        lambda executable: executable == python,
+    )
+    monkeypatch.setattr(
+        launcher_windows,
+        "verified_offline_asset",
+        lambda _path: pytest.fail("an installed runtime must not read the offline installer"),
+    )
+
+    launcher_windows._prepare_visual_cpp_runtime(
+        python,
+        stop_requested=threading.Event(),
+    )
+
+
+def test_visual_cpp_runtime_probe_runs_in_external_python(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    python = tmp_path / "python.exe"
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs) -> SimpleNamespace:
+        commands.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.setattr(launcher_windows.subprocess, "run", run)
+
+    assert launcher_windows._visual_cpp_runtime_available(python) is True
+    assert commands[0][:3] == [str(python), "-I", "-c"]
+    assert "MSVCP140.dll" in commands[0][3]
+    assert "VCRUNTIME140_1.dll" in commands[0][3]
+
+
+def test_prepare_visual_cpp_runtime_uses_verified_offline_installer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    installer = tmp_path / "vc_redist.x64.exe"
+    installer.touch()
+    probes = iter((False, True))
+    commands: list[list[str]] = []
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.setattr(
+        launcher_windows,
+        "_visual_cpp_runtime_available",
+        lambda executable: executable == tmp_path / "python.exe" and next(probes),
+    )
+    monkeypatch.setattr(launcher_windows, "verified_offline_asset", lambda _path: installer)
+    monkeypatch.setattr(
+        launcher_windows,
+        "_run_owned",
+        lambda command, **_kwargs: commands.append(command) or 1638,
+    )
+
+    launcher_windows._prepare_visual_cpp_runtime(
+        tmp_path / "python.exe",
+        stop_requested=threading.Event(),
+    )
+
+    assert commands == [[str(installer), "/install", "/quiet", "/norestart"]]
+
+
+def test_prepare_visual_cpp_runtime_fails_closed_for_damaged_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.setattr(launcher_windows, "_visual_cpp_runtime_available", lambda _python: False)
+    monkeypatch.setattr(
+        launcher_windows,
+        "verified_offline_asset",
+        lambda _path: (_ for _ in ()).throw(OfflineBundleError("bad runtime")),
+    )
+
+    with pytest.raises(launcher_windows.LauncherError, match="bad runtime"):
+        launcher_windows._prepare_visual_cpp_runtime(
+            tmp_path / "python.exe",
+            stop_requested=threading.Event(),
+        )
+
+
+def test_prepare_visual_cpp_runtime_requires_successful_dll_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    installer = tmp_path / "vc_redist.x64.exe"
+    installer.touch()
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.setattr(launcher_windows, "_visual_cpp_runtime_available", lambda _python: False)
+    monkeypatch.setattr(launcher_windows, "verified_offline_asset", lambda _path: installer)
+    monkeypatch.setattr(launcher_windows, "_run_owned", lambda *_args, **_kwargs: 3010)
+
+    with pytest.raises(launcher_windows.LauncherError, match="Restart Windows"):
+        launcher_windows._prepare_visual_cpp_runtime(
+            tmp_path / "python.exe",
+            stop_requested=threading.Event(),
+        )
+
+
 def test_windows_process_tree_stop_uses_taskkill(monkeypatch) -> None:
     commands: list[list[str]] = []
 
@@ -212,6 +406,101 @@ def test_windows_process_tree_stop_uses_taskkill(monkeypatch) -> None:
     launcher_windows._stop_process_tree(process)
 
     assert commands == [["taskkill", "/PID", "12345", "/T", "/F"]]
+
+
+def test_prepare_environment_installs_from_hashed_offline_wheelhouse(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    venv_root = tmp_path / ".venv"
+    python = venv_root / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("fastapi==1\n", encoding="utf-8")
+    wheelhouse = tmp_path / "offline" / "wheels" / "app"
+    wheelhouse.mkdir(parents=True)
+    lockfile = tmp_path / "offline" / "locks" / "app.txt"
+    lockfile.parent.mkdir(parents=True)
+    lockfile.write_text("fastapi==1 --hash=sha256:" + "0" * 64 + "\n", encoding="utf-8")
+    profile = OfflineInstallProfile(wheelhouse=wheelhouse, lockfile=lockfile)
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.setattr(launcher_windows, "VENV_ROOT", venv_root)
+    monkeypatch.setattr(launcher_windows, "MARKER_PATH", venv_root / ".requirements.sha256")
+    monkeypatch.setattr(launcher_windows, "REQUIREMENTS_PATH", requirements)
+    monkeypatch.setattr(launcher_windows, "_python_312_supported", lambda _path: True)
+    monkeypatch.setattr(
+        launcher_windows,
+        "offline_install_profile",
+        lambda name: profile if name == "app" else None,
+    )
+    monkeypatch.setattr(
+        launcher_windows.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
+    )
+    monkeypatch.setattr(
+        launcher_windows,
+        "_run_owned",
+        lambda command, **_kwargs: commands.append(command) or 0,
+    )
+
+    assert (
+        launcher_windows._prepare_environment(
+            tmp_path / "base-python.exe",
+            stop_requested=threading.Event(),
+        )
+        == python
+    )
+
+    assert len(commands) == 1
+    install = commands[0]
+    assert install[:4] == [str(python), "-m", "pip", "install"]
+    assert "--no-index" in install
+    assert install[install.index("--find-links") + 1] == str(wheelhouse)
+    assert "--require-hashes" in install
+    assert install[install.index("-r") + 1] == str(lockfile)
+
+
+def test_candidate_ffmpeg_pairs_prefers_verified_offline_build(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    offline_bin = tmp_path / "offline"
+    path_bin = tmp_path / "path"
+    offline_bin.mkdir()
+    path_bin.mkdir()
+    offline_ffmpeg = offline_bin / "ffmpeg.exe"
+    offline_ffprobe = offline_bin / "ffprobe.exe"
+    path_ffmpeg = path_bin / "ffmpeg.exe"
+    path_ffprobe = path_bin / "ffprobe.exe"
+    for executable in (offline_ffmpeg, offline_ffprobe, path_ffmpeg, path_ffprobe):
+        executable.touch()
+
+    monkeypatch.setattr(launcher_windows.sys, "platform", "win32")
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.delenv("PROGRAMDATA", raising=False)
+    monkeypatch.delenv("PROGRAMFILES", raising=False)
+    monkeypatch.setattr(
+        launcher_windows,
+        "verified_offline_asset",
+        lambda relative_path: {
+            launcher_windows.OFFLINE_FFMPEG: offline_ffmpeg,
+            launcher_windows.OFFLINE_FFPROBE: offline_ffprobe,
+        }[relative_path],
+    )
+    monkeypatch.setattr(
+        launcher_windows.shutil,
+        "which",
+        lambda name: str({"ffmpeg": path_ffmpeg, "ffprobe": path_ffprobe}[name]),
+    )
+
+    assert launcher_windows._candidate_ffmpeg_pairs() == [
+        (offline_ffmpeg.resolve(), offline_ffprobe.resolve()),
+        (path_ffmpeg.resolve(), path_ffprobe.resolve()),
+    ]
 
 
 def test_candidate_ffmpeg_pairs_finds_winget_portable_package(
@@ -362,6 +651,7 @@ def test_windows_launch_uses_port_and_parent_pid_mode(monkeypatch, tmp_path: Pat
     captured_command: list[str] = []
     captured_environment: dict[str, str] = {}
     records: list[dict[str, object]] = []
+    startup_steps: list[str] = []
     fake_lock = io.BytesIO(b"\0")
 
     class BackendProcess:
@@ -395,8 +685,22 @@ def test_windows_launch_uses_port_and_parent_pid_mode(monkeypatch, tmp_path: Pat
     monkeypatch.setattr(launcher_windows, "_close_control_channel", lambda *_args: None)
     monkeypatch.setattr(launcher_windows, "_write_record", records.append)
     monkeypatch.setattr(launcher_windows, "_read_record", lambda: None)
-    monkeypatch.setattr(launcher_windows, "_resolve_base_python", lambda *_args, **_kwargs: python)
-    monkeypatch.setattr(launcher_windows, "_prepare_environment", lambda *_args, **_kwargs: python)
+    def resolve_python(*_args, **_kwargs) -> Path:
+        startup_steps.append("resolve-python")
+        return python
+
+    def prepare_vc(executable: Path, **_kwargs) -> None:
+        assert executable == python
+        startup_steps.append("probe-vc-runtime")
+
+    def prepare_environment(executable: Path, **_kwargs) -> Path:
+        assert executable == python
+        startup_steps.append("prepare-environment")
+        return python
+
+    monkeypatch.setattr(launcher_windows, "_resolve_base_python", resolve_python)
+    monkeypatch.setattr(launcher_windows, "_prepare_visual_cpp_runtime", prepare_vc)
+    monkeypatch.setattr(launcher_windows, "_prepare_environment", prepare_environment)
     monkeypatch.setattr(
         launcher_windows,
         "_media_executables",
@@ -436,6 +740,7 @@ def test_windows_launch_uses_port_and_parent_pid_mode(monkeypatch, tmp_path: Pat
     assert records[-1]["server_pid"] == 52_525
     assert records[-1]["control_port"] == 42_425
     assert captured_environment["VIDEO_CUT_AI_BASE_PYTHON"] == str(python)
+    assert startup_steps == ["resolve-python", "probe-vc-runtime", "prepare-environment"]
 
 
 def test_frozen_launcher_resolves_python_without_executable_recursion(monkeypatch) -> None:

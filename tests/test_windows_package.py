@@ -32,6 +32,35 @@ def test_windows_portable_includes_multi_model_launcher_files() -> None:
     assert '@("app", "vendor")' in build_script
 
 
+def test_windows_start_batch_prefers_packaged_executable() -> None:
+    start_batch = _read("start.bat")
+
+    executable_index = start_batch.index('if exist "LocalVideoCutter.exe"')
+    python_index = start_batch.index('if exist ".venv\\Scripts\\python.exe"')
+    assert executable_index < python_index
+    executable_branch = start_batch[
+        start_batch.index(":launch_executable") : start_batch.index(":finished")
+    ]
+    assert "exit /b %ERRORLEVEL%" in executable_branch
+    assert "pause" not in executable_branch
+
+
+def test_windows_portable_includes_offline_instructions_but_not_payloads() -> None:
+    build_script = _read("scripts/build_windows_portable.ps1")
+    offline_readme = _read("WINDOWS_OFFLINE_README.txt")
+    gitignore = _read(".gitignore")
+
+    assert '"WINDOWS_OFFLINE_README.txt"' in build_script
+    assert '@("offline", "data")' in build_script
+    assert "must not include generated asset directory" in build_script
+    assert "/offline/" in gitignore
+    assert "<程序文件夹>\\offline\\windows-rtx5090\\" in offline_readme
+    assert "<程序文件夹>\\data\\ai\\" in offline_readme
+    assert "offline 和 data\\ai 两部分" in offline_readme
+    assert "exFAT 或 NTFS" in offline_readme
+    assert "NVIDIA GeForce RTX 5090" in offline_readme
+
+
 def test_windows_portable_smoke_checks_model_files_before_starting() -> None:
     smoke_script = _read("scripts/smoke_windows_portable.ps1")
     start_index = smoke_script.index("$LauncherProcess = Start-Process")

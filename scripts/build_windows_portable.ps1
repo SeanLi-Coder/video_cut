@@ -80,6 +80,7 @@ try {
         "requirements-ai-swiftvr-cuda.txt",
         "README.md",
         "WINDOWS_README.txt",
+        "WINDOWS_OFFLINE_README.txt",
         "LICENSE"
     )
     foreach ($FileName in $SourceFiles) {
@@ -92,6 +93,14 @@ try {
         Remove-Item -Recurse -Force
     Get-ChildItem $StageDirectory -File -Include "*.pyc", "*.pyo" -Recurse |
         Remove-Item -Force
+
+    # Runtime data and multi-gigabyte offline payloads are distributed separately.
+    foreach ($ExcludedDirectoryName in @("offline", "data")) {
+        $ExcludedPath = Join-Path $StageDirectory $ExcludedDirectoryName
+        if (Test-Path $ExcludedPath) {
+            throw "Portable package must not include generated asset directory: $ExcludedPath"
+        }
+    }
 
     Compress-Archive -Path $StageDirectory -DestinationPath $ArchivePath -CompressionLevel Optimal
     $Hash = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()

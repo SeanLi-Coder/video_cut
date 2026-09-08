@@ -739,7 +739,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "ai_enhance_ready": bool(
                 state.ai_features_enabled
                 and state.ai_enhancements
-                and state.ai_enhancements.runtime_status()["ready"]
+                and state.ai_enhancements.capability_ready()
             ),
         }
 
@@ -747,7 +747,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
     def bootstrap() -> dict[str, Any]:
         directory = state.output_directory()
         ai_runtime = (
-            state.ai_enhancements.runtime_status()
+            state.ai_enhancements.runtime_status(verify_models=False)
             if state.ai_features_enabled and state.ai_enhancements is not None
             else {
                 "supported": False,
@@ -1035,7 +1035,10 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
     def ai_models() -> dict[str, Any]:
         if state.ai_enhancements is None:
             raise HTTPException(status_code=503, detail="AI 超清尚未就绪。")
-        return state.ai_enhancements.model_catalog_status()
+        try:
+            return state.ai_enhancements.model_catalog_status()
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
 
     @app.get("/api/ai-download-proxy", dependencies=ai_api_dependencies)
     def ai_download_proxy(response: Response) -> dict[str, Any]:

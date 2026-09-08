@@ -7,8 +7,46 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import app.main as main_module
+from app.ai_enhance import AIEnhancementManager
 from app.main import ApplicationState, create_app
 from app.media import probe_video
+
+
+def test_health_and_bootstrap_do_not_trigger_full_model_verification(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        ai_features_enabled=True,
+    )
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    manager.inference_runner = None
+
+    def unexpected_verification(*_args, **_kwargs) -> bool:
+        raise AssertionError("health/bootstrap must not hash full model files")
+
+    monkeypatch.setattr(manager, "_models_downloaded", unexpected_verification)
+    monkeypatch.setattr(manager, "_models_cached", lambda *_args, **_kwargs: False)
+    state.ai_enhancements = manager
+
+    with TestClient(create_app(state)) as client:
+        health = client.get("/api/health")
+        bootstrap = client.get("/api/bootstrap")
+
+    assert health.status_code == 200
+    assert bootstrap.status_code == 200
+    assert bootstrap.json()["ai_runtime"]["models_downloaded"] is False
 
 
 def test_local_workflow_and_range_streaming(

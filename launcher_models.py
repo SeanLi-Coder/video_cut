@@ -16,6 +16,7 @@ from urllib.parse import quote
 from urllib.request import ProxyHandler, Request, build_opener
 
 HTTP_TIMEOUT_SECONDS = 15
+MODEL_CATALOG_TIMEOUT_SECONDS = 10 * 60
 POLL_INTERVAL_SECONDS = 0.25
 MAX_STATUS_POLL_FAILURES = 3
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -44,6 +45,7 @@ class StartupModel:
     downloaded: bool
     download_status: str
     requires_runtime_update: bool
+    offline_managed: bool
 
     @property
     def active(self) -> bool:
@@ -74,6 +76,7 @@ def _request_json(
     method: str = "GET",
     token: str | None = None,
     json_body: Mapping[str, Any] | None = None,
+    timeout: float = HTTP_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     headers = {
         "Accept": "application/json",
@@ -96,7 +99,7 @@ def _request_json(
         method=method,
     )
     try:
-        with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+        with urlopen(request, timeout=timeout) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except HTTPError as exc:
         detail = str(exc)
@@ -196,6 +199,7 @@ def _startup_models(
                 raw_model.get("requires_runtime_update") is True
                 or (downloaded and raw_model.get("prepared") is not True)
             ),
+            offline_managed=raw_model.get("offline_managed") is True,
         )
         if recovery_only and not model.recoverable:
             continue
@@ -669,9 +673,11 @@ def _read_download_choice(
     input_stream: TextIO,
     output_stream: TextIO,
     stop_requested: threading.Event,
+    *,
+    prompt: str = "Download this model now? [y/N]: ",
 ) -> bool | None:
     while True:
-        _write(output_stream, "Download this model now? [y/N]: ")
+        _write(output_stream, prompt)
         try:
             answer = _readline_until_stopped(input_stream, stop_requested)
         except EOFError:
@@ -741,22 +747,38 @@ def prompt_for_missing_models(
         if not isinstance(token_value, str) or not token_value:
             raise ModelPromptError("local API did not provide an application token")
         token = token_value
+        _write(
+            output,
+            "Verifying local AI model files for this launch; an offline scan "
+            "may take several minutes.\n",
+        )
         models = _startup_models(
-            _request_json(port, "/api/ai-models", token=token),
+            _request_json(
+                port,
+                "/api/ai-models",
+                token=token,
+                timeout=MODEL_CATALOG_TIMEOUT_SECONDS,
+            ),
             recovery_only=recovery_only,
         )
         if not models:
             return
 
+        all_offline = all(model.offline_managed for model in models)
         _write(
             output,
             (
                 "Recoverable AI model downloads were found.\n"
                 if recovery_only
+                else "Offline AI models can be verified and prepared before the app opens.\n"
+                if all_offline
                 else "Optional AI models can be downloaded before the app opens.\n"
             ),
         )
-        if any(not model.active for model in models) and not _prompt_for_download_proxy(
+        needs_network_proxy = any(
+            not model.active and not model.offline_managed for model in models
+        )
+        if needs_network_proxy and not _prompt_for_download_proxy(
             port,
             token,
             source,
@@ -788,7 +810,16 @@ def prompt_for_missing_models(
                     output,
                     "Model files are complete, but the AI runtime needs repair.\n",
                 )
-                choice = _read_download_choice(source, output, stop_requested)
+                choice = _read_download_choice(
+                    source,
+                    output,
+                    stop_requested,
+                    prompt=(
+                        "Prepare this offline model now? [y/N]: "
+                        if model.offline_managed
+                        else "Download this model now? [y/N]: "
+                    ),
+                )
                 if choice is None:
                     if stop_requested.is_set():
                         return
@@ -816,7 +847,16 @@ def prompt_for_missing_models(
                     continue
                 action = recovery_choice
             else:
-                choice = _read_download_choice(source, output, stop_requested)
+                choice = _read_download_choice(
+                    source,
+                    output,
+                    stop_requested,
+                    prompt=(
+                        "Prepare this offline model now? [y/N]: "
+                        if model.offline_managed
+                        else "Download this model now? [y/N]: "
+                    ),
+                )
                 if choice is None:
                     if stop_requested.is_set():
                         return

@@ -6,7 +6,7 @@
 
 ### 1. 下载并解压
 
-本仓库是 private 仓库。打开 Releases、下载 Release 文件或使用 **Code → Download ZIP** 前，必须先登录已获本仓库访问权限的 GitHub 账号。Windows 11 / RTX 5090 用户建议打开 [GitHub Releases](https://github.com/SeanLi-Coder/video_cut/releases/latest)，下载名称以 `LocalVideoCutter-Windows-RTX5090` 开头的 ZIP；macOS 或需要源码的用户可以在项目页面点击 **Code → Download ZIP**。如果 RTX 5090 电脑不方便登录 GitHub，请先在有权限的电脑上下载并核对文件，再把完整 ZIP 复制到 Windows 电脑。
+本仓库是 private 仓库。打开 Releases、下载 Release 文件或使用 **Code → Download ZIP** 前，必须先登录已获本仓库访问权限的 GitHub 账号。Windows 11 / RTX 5090 用户建议打开 [GitHub Releases](https://github.com/SeanLi-Coder/video_cut/releases/latest)，下载名称以 `LocalVideoCutter-Windows-RTX5090` 开头的 ZIP；macOS 或需要源码的用户可以在项目页面点击 **Code → Download ZIP**。如果 RTX 5090 电脑不方便登录 GitHub，请先在有权限的电脑上下载并核对文件，再把完整 ZIP 复制到 Windows 电脑。普通 Windows 便携 ZIP 不包含数十 GB 的离线依赖和模型；完全离线部署还需要取得同版本的完整 `offline` 和 `data` 文件夹，并按下文固定路径放置。
 
 不要直接在 ZIP 压缩包预览窗口里运行，也不要只复制其中的 EXE；请先把整个文件夹解压到“下载”或“桌面”等普通可写目录。
 
@@ -26,7 +26,7 @@
 - 检查 FFmpeg 和 FFprobe；
 - 启动仅供本机访问的网页，并自动在浏览器中打开。
 
-第一次安装需要联网，可能持续几分钟。启动时打开的 Terminal 或 Windows Console 窗口在工具运行期间需要保持打开。
+普通安装第一次需要联网，可能持续几分钟；Windows 使用完整且校验通过的离线资源时可以不联网准备依赖和模型。启动时打开的 Terminal 或 Windows Console 窗口在工具运行期间需要保持打开。
 
 ### 3. Windows 提前下载 AI 模型（可选）
 
@@ -228,7 +228,7 @@ ffprobe -version
 
 推荐使用 Releases 中的 Windows 便携包：完整解压后双击 `LocalVideoCutter.exe`。只需要复制这个解压后的完整文件夹，不需要 Git，也不需要手动执行命令。源码包仍可双击 `start.bat` 启动。
 
-便携版 EXE 是一键启动器，旁边的 `app`、`vendor` 和 requirements 文件是程序本体的一部分，不能只单独复制 EXE。启动器会查找兼容的 Python，建立项目内独立环境，并检查 FFmpeg、FFprobe、`nvidia-smi` 和 RTX 5090。缺少 Python 3.12 或 FFmpeg 时会在可用的情况下通过 WinGet 自动安装；请保留启动窗口，按其中提示处理系统确认。模型不会打进 ZIP。
+便携版 EXE 是一键启动器，旁边的 `app`、`vendor` 和 requirements 文件是程序本体的一部分，不能只单独复制 EXE。启动器会查找兼容的 Python，建立项目内独立环境，并检查 FFmpeg、FFprobe、`nvidia-smi` 和 RTX 5090。缺少 Python 3.12 或 FFmpeg 时会优先使用完整离线资源，否则在可用的情况下通过 WinGet 自动安装；请保留启动窗口，按其中提示处理系统确认。模型和其他巨大离线资源不会打进普通便携 ZIP。
 
 本地网页服务就绪后，启动窗口会依次询问是否准备尚未完整就绪的 SeedVR2 和实验版 SwiftVR。输入 `y` 安装环境、下载缺少文件并在窗口中查看进度，输入 `n` 或直接按 Enter 跳过；跳过后浏览器仍会正常打开。以后可随时在网页“AI 模型管理”中逐个下载、继续下载、取消并查看进度。网页下载失败、取消或留下部分文件后，再次运行 `LocalVideoCutter.exe` 会显示 `Continue, restart from zero, or skip? [c/r/N]`：`c` 断点续传，`r` 只清理该模型权重后从零重下，`n` 或直接按 Enter 跳过。清理不会动 runtime 或其他模型；即使网页服务已经在运行，再次双击启动器也会显示恢复提示。如果需要无人值守启动，可在 PowerShell 中运行 `LocalVideoCutter.exe --skip-model-prompt`，但普通用户直接双击即可。
 
@@ -244,6 +244,30 @@ ffmpeg -version
 
 `nvidia-smi` 应明确列出 `NVIDIA GeForce RTX 5090`。进入网页的“AI 模型管理”后，“运行设备”也应显示 RTX 5090、CUDA 后端和显存；如果页面仍显示不可用，先不要运行长片。当前 Windows CUDA 适配尚未在真实 RTX 5090 上完成验收，尤其是 experimental 的 SwiftVR，请先用几秒钟短片测试，不能把网页显示“兼容”理解为已在这台显卡上验证成片。
 
+#### 完全离线 U 盘部署
+
+标准 Windows 便携 ZIP 会包含 [`WINDOWS_OFFLINE_README.txt`](WINDOWS_OFFLINE_README.txt)，但不会把本机生成的 `offline/`、`data/`、模型、wheel、Python 或 FFmpeg 大文件打进发布包。取得与当前程序版本严格匹配的完整 `offline` 和 `data` 文件夹后，必须保持原目录结构，把两者都放在 `LocalVideoCutter.exe` 同级位置：
+
+```text
+<程序文件夹>\offline\windows-rtx5090\
+├── manifest.json
+├── READY
+└── ...（manifest 中列出的全部文件与子目录）
+
+<程序文件夹>\data\ai\
+├── models\...（SeedVR2 权重）
+├── engines\swiftvr-5b-bf16\models\...（SwiftVR 权重）
+└── runner-...zip
+```
+
+不要把 `windows-rtx5090` 或 `data/ai` 内的文件摊平到程序根目录，也不要混用其他版本。组装完成后，应把包含 EXE、`app`、`vendor`、requirements、说明文件、`offline` 和 `data` 的**整个程序文件夹**一起复制；不能只复制 EXE、某个模型或某个 wheel。目标 Windows 上应先从 U 盘完整复制到本地 SSD 的一个全新空目录，再启动程序；不要覆盖已经运行过的旧程序目录，程序运行期间也不要移动、覆盖或同步程序文件夹。
+
+完整离线模式会在每次程序重新启动时对本地 AI 模型做一次完整性校验，同一进程内才复用校验结果，以免 U 盘传输损坏被旧缓存掩盖。校验期间只有本地 SSD 读取，不会联网；模型较大时需要耐心等待启动窗口继续。
+
+传输 U 盘必须使用 **exFAT 或 NTFS**。FAT32 无法保存离线包中超过 4 GB 的单个文件；APFS/HFS+ 也不适合作为普通 Windows 传输盘。从 Mac 制作时推荐 exFAT。格式化会清空 U 盘，只有确实需要更换文件系统时才格式化，并先备份已有内容。
+
+离线资源已包含 Microsoft Visual C++ Runtime、Python 3.12、FFmpeg Full、三套固定 hash 的 wheel 依赖和两个模型，但不包含 NVIDIA 驱动。目标电脑仍必须是 Windows 11 x64、配有 NVIDIA GeForce RTX 5090，并已经安装 R580 或更新分支的驱动；断网前应准备好官方驱动安装程序，启动本工具前用 `nvidia-smi` 确认显卡与驱动。程序会先核对 `READY`、manifest、应用版本和目标平台，再在使用每项资源前核对文件大小和 SHA-256；任何文件缺失、损坏或版本不匹配都会停止使用该离线包，而不是静默接受。离线模型会自动被识别为已下载并受到保护，网页不会允许单独删除它们；如需释放全部空间，应退出程序后删除整个离线程序文件夹。
+
 ## 停止工具
 
 正常情况下，在启动工具的终端窗口按 `Control + C`。如果已经找不到那个窗口，macOS 双击 `stop.command`，Windows 双击 `stop.bat`；Windows 便携版也支持在命令行执行 `LocalVideoCutter.exe --stop`。
@@ -256,7 +280,7 @@ ffmpeg -version
 - 所选视频直接从原位置读取，不会上传到服务器，也不会复制到项目目录。
 - 预览、最终剪辑、逐帧截图和永久旋转都由本机 FFmpeg 完成；Windows AI 超清由本机已选择的 SeedVR2 或 SwiftVR、对应的 PyTorch CUDA 环境以及 FFmpeg 完成。
 - 剪辑与逐帧截图的保存目录设置记录在项目内的 `data/settings.json`；永久旋转和 Windows AI 超清始终使用原视频同级目录。视频内容不会写入该配置。
-- 首次安装依赖时会访问 Homebrew、WinGet 或 PyPI；Windows 第一次 AI 任务还会从固定 GitHub/Hugging Face 地址下载运行器和模型，但视频素材始终不会上传。
+- 普通联网安装首次准备依赖时会访问 Homebrew、WinGet 或 PyPI；Windows 第一次 AI 任务还会从固定 GitHub/Hugging Face 地址下载运行器和模型。Windows 使用完整且校验通过的离线资源时改为读取本地文件；两种方式下视频素材都不会上传。
 
 请只处理你本人拥有、已获授权或法律允许使用的视频。
 
@@ -297,8 +321,8 @@ brew install python ffmpeg
 当前 GitHub Release 没有商业代码签名证书，Windows 可能在第一次运行时显示 SmartScreen 提示。请只使用本仓库 Releases 中的 ZIP，并同时下载同页对应的 `.zip.sha256` 文件；确认来源后点击“更多信息”再选择“仍要运行”。SHA-256 可以在 PowerShell 中检查：
 
 ```powershell
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.1.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.1.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.2.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.2.zip.sha256
 ```
 
 第一条命令输出中的 `Hash` 必须与 `.zip.sha256` 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行该文件，应重新下载并再次核对。
@@ -361,6 +385,7 @@ video_cut/
 ├── stop.command              # 安全停止本地服务
 ├── start.bat                 # Windows 双击启动入口
 ├── stop.bat                  # Windows 安全停止入口
+├── WINDOWS_OFFLINE_README.txt # Windows RTX 5090 离线 U 盘部署说明
 ├── windows_exe.py            # Windows 便携 EXE 的最小入口
 ├── launcher.py               # macOS Python 环境、依赖、FFmpeg 与进程管理
 ├── launcher_windows.py       # Windows 环境、依赖、FFmpeg 与进程管理
@@ -396,4 +421,4 @@ video_cut/
 
 [MIT](LICENSE)
 
-SeedVR2 与 SwiftVR 的上游代码和模型使用各自项目声明的 Apache License 2.0。本仓库不把大模型权重打进源码包或 Windows 便携 ZIP；它们由用户选择后从固定 revision 下载并校验。适配器、许可副本、固定来源和修改说明见 [`vendor/`](vendor/)。
+SeedVR2 与 SwiftVR 的上游代码和模型使用各自项目声明的 Apache License 2.0。本仓库不把大模型权重打进源码包或普通 Windows 便携 ZIP；它们由用户选择后从固定 revision 下载并校验，或通过另行准备且同样校验的离线资源提供。适配器、许可副本、固定来源和修改说明见 [`vendor/`](vendor/)。
