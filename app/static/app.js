@@ -855,6 +855,10 @@ function isEnhanceMode() {
   return state.operation === "enhance";
 }
 
+function usesSourceDirectory() {
+  return isRotateMode() || isEnhanceMode();
+}
+
 function normalizeAiModel(value, fallback = {}) {
   const raw = value && typeof value === "object" ? { ...fallback, ...value } : { ...fallback };
   const id = String(raw.id || "").trim().toLowerCase();
@@ -1777,6 +1781,7 @@ function renderModeCopy() {
   const frames = isFrameMode();
   const rotate = isRotateMode();
   const enhance = isEnhanceMode();
+  const sourceDirectory = rotate || enhance;
   const aiModel = selectedAiModel();
   const aiModelName = aiModel?.name || "AI 模型";
   const aiRuntime = selectedAiRuntime();
@@ -1816,7 +1821,7 @@ function renderModeCopy() {
   elements.frameLimitHint.hidden = !frames;
   elements.exportHeading.textContent = enhance ? "确认并开始 AI 超清" : rotate ? "确认并永久旋转" : frames ? "确认并逐帧截图" : "确认并导出";
   elements.exportDescription.textContent = enhance
-    ? "整段视频会在本机完成 AI 计算并保存为新文件；原视频不会被修改。"
+    ? "整段视频会在本机完成 AI 计算，并在原视频同级目录保存为新文件；原视频不会被修改。"
     : rotate
       ? "生成在原视频同级目录；方向会真正写入画面，原视频不变。"
       : frames
@@ -1837,7 +1842,7 @@ function renderModeCopy() {
       : frames
         ? "图片按 frame_000001 开始顺序编号"
         : "如遇同名文件会自动添加编号";
-  elements.destinationLabel.textContent = rotate ? "固定保存到原视频同级目录" : "保存到";
+  elements.destinationLabel.textContent = sourceDirectory ? "固定保存到原视频同级目录" : "保存到";
   elements.rotationNote.textContent = state.rotationDegrees === 360
     ? "360° 看起来方向不变，但仍会重新生成一份已固化、已清除旋转标记的新视频。"
     : state.rotationDegrees === 90 || state.rotationDegrees === 270
@@ -2050,7 +2055,7 @@ async function selectVideo() {
 }
 
 async function selectOutputDirectory() {
-  if (!state.appReady || state.selectingDirectory || state.exporting || isRotateMode()) return;
+  if (!state.appReady || state.selectingDirectory || state.exporting || usesSourceDirectory()) return;
   state.selectingDirectory = true;
   setButtonBusy(elements.selectDirectoryButton, true, "正在打开文件夹选择窗口…");
   renderControls();
@@ -2073,10 +2078,11 @@ async function selectOutputDirectory() {
 }
 
 function renderOutputDirectory() {
-  elements.selectDirectoryButton.hidden = isRotateMode();
-  if (isRotateMode()) {
+  const sourceDirectory = usesSourceDirectory();
+  elements.selectDirectoryButton.hidden = sourceDirectory;
+  if (sourceDirectory) {
     const directory = state.video && state.video.directory_display;
-    elements.outputDirectory.textContent = directory || "选择视频后自动使用同级目录";
+    elements.outputDirectory.textContent = directory || "选择视频后自动使用原视频同级目录";
     elements.outputDirectory.title = directory || "";
     return;
   }
@@ -3151,7 +3157,7 @@ function finishExportSuccessfully(job) {
   elements.exportSetup.hidden = true;
   elements.exportCompletePanel.hidden = false;
   elements.completedOutputName.textContent = state.exportOutputName;
-  const completedPath = job.output_path || (isRotateMode()
+  const completedPath = job.output_path || (usesSourceDirectory()
     ? state.video && state.video.directory_display
     : state.outputDirectory) || "";
   elements.completedOutputPath.textContent = completedPath;
@@ -3167,7 +3173,7 @@ function finishExportSuccessfully(job) {
         : "截图完成，原视频未被修改"
       : "剪辑完成，原视频未被修改";
   showToast(isEnhanceMode()
-    ? "AI 超清完成，已保存为新视频"
+    ? "AI 超清完成，已在原视频同级目录保存为新视频"
     : isRotateMode()
     ? "永久旋转完成，已在原视频同级目录生成新文件"
     : isFrameMode()
@@ -3299,7 +3305,11 @@ function canExport(range = readRange(false)) {
     : isFrameMode()
       ? state.frameExportReady
       : state.ffmpegReady;
-  const destinationReady = isRotateMode() ? Boolean(state.video && state.video.directory_display) : Boolean(state.outputDirectory);
+  const destinationReady = isEnhanceMode()
+    ? Boolean(state.video)
+    : isRotateMode()
+      ? Boolean(state.video && state.video.directory_display)
+      : Boolean(state.outputDirectory);
   const targetReady = aiSelectionReady();
   return Boolean(
     state.appReady
@@ -3351,7 +3361,7 @@ function renderReadyNote(range) {
     elements.readyNoteText.textContent = "请先修正起始时间和结束时间";
   } else if (!state.previewReady) {
     elements.readyNoteText.textContent = "请等待新预览准备完成";
-  } else if (!isRotateMode() && !state.outputDirectory) {
+  } else if (!usesSourceDirectory() && !state.outputDirectory) {
     elements.readyNoteText.textContent = "请选择一个保存目录";
   } else if (!(isEnhanceMode() ? aiModelReadyToEnhance(aiModel) : isRotateMode() ? state.rotationReady : isFrameMode() ? state.frameExportReady : state.ffmpegReady)) {
     elements.readyNote.classList.add("is-error");
@@ -3366,8 +3376,8 @@ function renderReadyNote(range) {
     elements.readyNote.classList.add("is-ready");
     elements.readyNoteText.textContent = isEnhanceMode()
       ? state.video.is_hdr
-        ? `已就绪；将 HDR 映射为 BT.709 SDR 后，再用 ${aiModel?.name || "所选模型"} 增强到 ${aiTargetLabel()}；原片不会修改`
-        : `已就绪，将用 ${aiModel?.name || "所选模型"} 把整段视频增强到 ${aiTargetLabel()}`
+        ? `已就绪；将 HDR 映射为 BT.709 SDR 后，再用 ${aiModel?.name || "所选模型"} 增强到 ${aiTargetLabel()}；成片保存到原视频同级目录，原片不会修改`
+        : `已就绪，将用 ${aiModel?.name || "所选模型"} 把整段视频增强到 ${aiTargetLabel()}，并保存到原视频同级目录`
       : isRotateMode()
       ? `已就绪，将把整段视频顺时针永久旋转 ${state.rotationDegrees}°`
       : isFrameMode()
@@ -3424,7 +3434,7 @@ function renderControls() {
   elements.replaceVideoButton.disabled = !state.appReady || state.selectingVideo || controlsLocked;
   elements.startTime.disabled = !state.video || controlsLocked || state.selectingVideo || isRotateMode() || isEnhanceMode();
   elements.endTime.disabled = !state.video || controlsLocked || state.selectingVideo || isRotateMode() || isEnhanceMode();
-  elements.selectDirectoryButton.disabled = isRotateMode() || !state.appReady || !state.video || state.selectingDirectory || controlsLocked;
+  elements.selectDirectoryButton.disabled = usesSourceDirectory() || !state.appReady || !state.video || state.selectingDirectory || controlsLocked;
   elements.exportButton.disabled = !canExport(range);
   elements.exportButton.setAttribute("aria-busy", state.exporting ? "true" : "false");
   renderAiTargetOptions(controlsLocked);

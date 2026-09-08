@@ -42,12 +42,12 @@
 
 SeedVR2 权重约 7.3 GB，SwiftVR 权重约 20.2 GB，运行环境还会另外占用空间。Apple Silicon 只安装 SeedVR2 建议至少留出约 12 GB，Windows RTX 5090 只安装 SeedVR2 建议至少留出约 18 GB；Windows 同时安装 SeedVR2 与 SwiftVR 建议至少留出约 60 GB。启动时预下载不是强制步骤：SeedVR2 可以在第一次任务时自动准备；SwiftVR 必须先在启动窗口输入 `y`，或稍后到“AI 模型管理”完成准备，网页才会允许开始 SwiftVR 任务。
 
-### 4. 选择视频和保存目录
+### 4. 选择视频和保存位置
 
 1. 在网页中点击“选择视频”，从系统文件选择窗口选取本地视频。
-2. 点击“选择文件夹”，从系统文件夹选择窗口选取成片或截图的保存目录。这个目录会被记住，下次启动仍可使用，也可以随时更换。
+2. 使用“剪辑视频”或“逐帧截图”时，点击“选择文件夹”选取保存目录。这个目录会被记住，下次启动仍可使用，也可以随时更换。
 
-永久旋转不需要选择保存目录：新视频固定生成在原视频同级目录，方便立即找到。
+永久旋转和 AI 超清都不需要、也不会让用户选择保存目录：新视频固定生成在原视频同级目录，页面会在选择原片后显示实际位置。
 
 ### 5. 选择功能
 
@@ -121,7 +121,7 @@ AI 超清的默认文件名为：
 原文件名_ai_4k.mp4
 ```
 
-如果主音轨无法安全放进 MP4，程序会按音频编码自动改用 MOV 或 MKV；同名文件同样自动编号。
+成片固定保存在原视频同级目录。如果主音轨无法安全放进 MP4，程序会按音频编码自动改用 MOV 或 MKV；同名文件同样自动编号，不会覆盖旧文件。
 
 ## AI 超清：模型选择与使用边界
 
@@ -205,7 +205,7 @@ AI 视频从模型输出的 sRGB full-range RGB 显式进行 transfer、matrix�
 - Apple Silicon（M 系列芯片）、足够的统一内存和至少约 12 GB 模型/环境磁盘空间；`libplacebo` 还需要 MoltenVK。此设备只运行 SeedVR2。
 - NVIDIA GeForce RTX 5090，以及 R580 或更新分支的 NVIDIA 驱动。只安装 SeedVR2 建议至少留出约 18 GB；同时安装约 20.2 GB 权重的 SwiftVR 建议至少留出约 60 GB。两个 CUDA 模型使用各自固定的 `cu130` PyTorch 环境，wheel 已包含所需 CUDA 用户态运行库，**不需要另外安装 CUDA Toolkit**。
 
-成片目录需要单独的输出空间。RTX 5090 的驱动不会由本工具自动升级；如果 `nvidia-smi` 不可用或驱动过旧，基础视频功能仍可使用，AI 模型页会显示具体原因。
+AI 成片会写入原视频所在磁盘，该磁盘还需要单独预留成片空间。RTX 5090 的驱动不会由本工具自动升级；如果 `nvidia-smi` 不可用或驱动过旧，基础视频功能仍可使用，AI 模型页会显示具体原因。
 
 ### macOS
 
@@ -262,7 +262,7 @@ ffmpeg -version
 - Web 服务只监听 `127.0.0.1`，不向局域网或公网开放。
 - 所选视频直接从原位置读取，不会上传到服务器，也不会复制到项目目录。
 - 预览、最终剪辑、逐帧截图和永久旋转都由本机 FFmpeg 完成；AI 超清由本机已选择的 SeedVR2 或 SwiftVR、对应的 PyTorch MPS/CUDA 环境，以及 FFmpeg 完成。blocked 的 FlashVSR 不会执行。
-- 保存目录设置记录在项目内的 `data/settings.json`；视频内容不会写入该配置。
+- 剪辑与逐帧截图的保存目录设置记录在项目内的 `data/settings.json`；永久旋转和 AI 超清始终使用原视频同级目录。视频内容不会写入该配置。
 - 首次安装依赖时会访问 Homebrew 或 PyPI；第一次 AI 任务还会从固定 GitHub/Hugging Face 地址下载运行器和模型，但视频素材始终不会上传。
 
 请只处理你本人拥有、已获授权或法律允许使用的视频。
@@ -304,15 +304,15 @@ brew install python ffmpeg-full molten-vk
 当前 GitHub Release 没有商业代码签名证书，Windows 可能在第一次运行时显示 SmartScreen 提示。请只使用本仓库 Releases 中的 ZIP，并同时下载同页对应的 `.zip.sha256` 文件；确认来源后点击“更多信息”再选择“仍要运行”。SHA-256 可以在 PowerShell 中检查：
 
 ```powershell
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.9.1.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.9.1.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.9.2.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.9.2.zip.sha256
 ```
 
 第一条命令输出中的 `Hash` 必须与 `.zip.sha256` 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行该文件，应重新下载并再次核对。
 
-### 无法选择视频或保存目录
+### 无法选择视频或保存位置
 
-macOS 请检查“系统设置 → 隐私与安全性 → 文件与文件夹”，允许 Terminal 访问视频所在目录。Windows 请检查文件是否仍被其他程序独占，以及目标目录是否允许当前账号写入。外接磁盘还需要确认磁盘已挂载且保存目录可写。
+macOS 请检查“系统设置 → 隐私与安全性 → 文件与文件夹”，允许 Terminal 访问视频所在目录。Windows 请检查文件是否仍被其他程序独占，以及目标目录是否允许当前账号写入。外接磁盘还需要确认磁盘已挂载且保存位置可写。AI 超清和永久旋转固定写入原视频所在文件夹；如果原片在只读目录、只读外接盘或无写入权限的网络位置，请先把原片复制到可写目录再处理。
 
 ### 浏览器没有自动打开
 

@@ -153,8 +153,17 @@ def _user_media_error(exc: MediaError) -> str:
         "The output directory does not exist": "保存目录不存在，请重新选择文件夹。",
         "The output directory is not writable": "保存目录不可写，请重新选择文件夹。",
         "The original video was moved or deleted": "原视频已被移动或删除，请重新选择。",
+        "The original video directory does not exist": (
+            "原视频所在文件夹不存在，请重新选择视频。"
+        ),
+        "The original video directory is not writable for AI enhancement": (
+            "原视频所在文件夹不可写，无法在同级目录生成 AI 超清视频。"
+        ),
         "There is not enough free space in the output directory": (
             "保存目录空间不足，请清理空间后重试。"
+        ),
+        "There is not enough free space beside the original video for AI enhancement": (
+            "原视频所在磁盘空间不足，无法在同级目录生成 AI 超清视频。"
         ),
         "The selected range is shorter than one video frame": (
             "所选范围短于一帧，请把结束时间稍微调晚。"
@@ -989,13 +998,9 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             if state.ai_enhancements is None:
                 raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
             source = state.video(request.video_id)
-            output_directory = state.output_directory()
-            if output_directory is None:
-                raise MediaError("The output directory does not exist")
             job = state.ai_enhancements.create(
                 source,
                 target=request.target,
-                output_directory=output_directory,
                 model_id=request.model_id,
             )
         except MediaError as exc:

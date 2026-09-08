@@ -94,6 +94,32 @@ def test_frontend_ai_mode_uses_local_quality_first_workflow() -> None:
     assert "FP16 + SDPA" in javascript
 
 
+def test_frontend_ai_output_is_fixed_to_source_directory() -> None:
+    javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "function usesSourceDirectory()" in javascript
+    assert "return isRotateMode() || isEnhanceMode();" in javascript
+    assert "elements.selectDirectoryButton.hidden = sourceDirectory;" in javascript
+    assert 'sourceDirectory ? "固定保存到原视频同级目录" : "保存到"' in javascript
+    assert "选择视频后自动使用原视频同级目录" in javascript
+    assert "const destinationReady = isEnhanceMode()" in javascript
+    assert "? Boolean(state.video)" in javascript
+    assert "&& !state.selectingDirectory" in javascript
+    assert "!usesSourceDirectory() && !state.outputDirectory" in javascript
+    assert "selectDirectoryButton.disabled = usesSourceDirectory()" in javascript
+    assert "job.output_path || (usesSourceDirectory()" in javascript
+
+    directory_picker = javascript.split("async function selectOutputDirectory()", 1)[1].split(
+        "\nfunction renderOutputDirectory", 1
+    )[0]
+    assert "usesSourceDirectory()" in directory_picker
+
+    start_export = javascript.split("async function startExport()", 1)[1].split(
+        "\nfunction scheduleExportPoll", 1
+    )[0]
+    assert "output_directory" not in start_export
+
+
 def test_frontend_renders_detected_ai_backend_without_platform_hardcoding() -> None:
     javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")

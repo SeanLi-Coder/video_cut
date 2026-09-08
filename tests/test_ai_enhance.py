@@ -1228,6 +1228,169 @@ def test_runtime_download_cancelled_during_retry_is_not_reported_as_failure(
     assert calls == 1
 
 
+def test_ai_api_starts_without_configured_output_directory(
+    monkeypatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    source = state.register_video(sample_video)
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    monkeypatch.setattr(manager, "encoder_available", True)
+    monkeypatch.setattr(manager, "color_pipeline_available", True)
+    monkeypatch.setattr(manager, "_run", lambda job: job.cancel_event.wait(5))
+    state.ai_enhancements = manager
+    assert state.output_directory() is None
+
+    with TestClient(create_app(state)) as client:
+        response = client.post(
+            "/api/ai-enhancements",
+            headers={"X-App-Token": state.app_token},
+            json={"video_id": source.id, "target": "1080p"},
+        )
+        assert response.status_code == 200, response.text
+        job = manager.get(response.json()["job_id"])
+        assert job is not None
+        assert job.output_path.parent == sample_video.parent.resolve()
+        assert response.json()["output_name"] == job.output_path.name
+
+
+def test_ai_create_uses_source_directory_and_allocates_unique_name(
+    monkeypatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source = _source(sample_video, probe_video(sample_video, ffprobe=ffprobe))
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    monkeypatch.setattr(manager, "encoder_available", True)
+    monkeypatch.setattr(manager, "color_pipeline_available", True)
+    monkeypatch.setattr(manager, "_run", lambda job: job.cancel_event.wait(5))
+    occupied = sample_video.parent / default_ai_output_name(sample_video, "1080p")
+    occupied.write_bytes(b"existing")
+
+    job = manager.create(source, target="1080p")
+    try:
+        assert job.output_path.parent == sample_video.parent.resolve()
+        assert job.output_path.name == f"{occupied.stem}_2{occupied.suffix}"
+    finally:
+        manager.cancel(job.id)
+        assert job.worker is not None
+        job.worker.join(timeout=5)
+
+
+def test_ai_create_rejects_missing_source_directory(
+    monkeypatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    missing_path = tmp_path / "removed" / sample_video.name
+    source = _source(missing_path, probe_video(sample_video, ffprobe=ffprobe))
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    monkeypatch.setattr(manager, "encoder_available", True)
+    monkeypatch.setattr(manager, "color_pipeline_available", True)
+    original_is_file = Path.is_file
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda path: True if path == missing_path else original_is_file(path),
+    )
+
+    with pytest.raises(MediaError, match="original video directory does not exist"):
+        manager.create(source, target="1080p")
+
+
+def test_ai_create_rejects_read_only_source_directory(
+    monkeypatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source = _source(sample_video, probe_video(sample_video, ffprobe=ffprobe))
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    monkeypatch.setattr(manager, "encoder_available", True)
+    monkeypatch.setattr(manager, "color_pipeline_available", True)
+    original_access = os.access
+    source_directory = sample_video.parent.resolve()
+    monkeypatch.setattr(
+        ai_module.os,
+        "access",
+        lambda path, mode: (
+            False if Path(path).resolve() == source_directory else original_access(path, mode)
+        ),
+    )
+
+    with pytest.raises(MediaError, match="not writable for AI enhancement"):
+        manager.create(source, target="1080p")
+
+
+def test_ai_create_checks_free_space_beside_source(
+    monkeypatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source = _source(sample_video, probe_video(sample_video, ffprobe=ffprobe))
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        inference_runner=lambda _job, _output: None,
+    )
+    monkeypatch.setattr(manager, "encoder_available", True)
+    monkeypatch.setattr(manager, "color_pipeline_available", True)
+    checked_directories: list[Path] = []
+
+    class DiskUsage:
+        free = 0
+
+    def disk_usage(path: Path) -> DiskUsage:
+        checked_directories.append(Path(path))
+        return DiskUsage()
+
+    monkeypatch.setattr(ai_module.shutil, "disk_usage", disk_usage)
+
+    with pytest.raises(MediaError, match="free space beside the original video"):
+        manager.create(source, target="1080p")
+    assert checked_directories == [sample_video.parent.resolve()]
+
+
 def test_ai_job_can_be_cancelled_without_leaving_partial_output(
     tmp_path: Path,
     sample_video: Path,
@@ -1247,7 +1410,7 @@ def test_ai_job_can_be_cancelled_without_leaving_partial_output(
         platform_supported=True,
         inference_runner=wait_for_cancel,
     )
-    job = manager.create(source, target="1080p", output_directory=tmp_path)
+    job = manager.create(source, target="1080p")
     deadline = time.monotonic() + 5
     while job.snapshot()["status"] == "queued" and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -1281,7 +1444,7 @@ def test_running_ai_enhancement_blocks_model_download(
         platform_supported=True,
         inference_runner=wait_for_cancel,
     )
-    job = manager.create(source, target="1080p", output_directory=tmp_path)
+    job = manager.create(source, target="1080p")
     assert inference_started.wait(5)
     try:
         with pytest.raises(MediaError, match="Another AI enhancement job is already running"):
@@ -1389,7 +1552,7 @@ def test_ai_model_download_api_starts_without_video_and_recovers_progress(
 
         source = _source(sample_video, probe_video(sample_video, ffprobe=ffprobe))
         with pytest.raises(MediaError, match="Another AI enhancement"):
-            manager.create(source, target="1080p", output_directory=tmp_path)
+            manager.create(source, target="1080p")
 
         release_download.set()
         deadline = time.monotonic() + 5
@@ -1595,7 +1758,9 @@ def test_ai_api_creates_verified_10bit_video_and_copies_audio_packets(
         assert snapshot["target"] == "1080p"
         output_path = Path(snapshot["output_path"])
         assert output_path.is_file()
-        assert output_path.parent == output_directory
+        assert output_directory != sample_video.parent
+        assert state.output_directory() == output_directory
+        assert output_path.parent == sample_video.parent
         result = probe_video(output_path, ffprobe=ffprobe)
         assert (result["width"], result["height"]) == (320, 180)
         assert result["video_codec"] == "hevc"
@@ -1603,4 +1768,4 @@ def test_ai_api_creates_verified_10bit_video_and_copies_audio_packets(
         assert result["chroma_location"] == "left"
         assert result["is_hdr"] is False
         assert result["audio_codec"] == "aac"
-        assert not list(output_directory.glob("*.partial-*"))
+        assert not list(sample_video.parent.glob("*.partial-*"))

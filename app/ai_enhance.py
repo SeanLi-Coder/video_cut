@@ -1887,7 +1887,6 @@ class AIEnhancementManager:
         source: VideoSource,
         *,
         target: str,
-        output_directory: Path,
         model_id: str = DEFAULT_AI_MODEL_ID,
     ) -> AIEnhancementJob:
         try:
@@ -1915,17 +1914,24 @@ class AIEnhancementManager:
         ):
             raise MediaError(f"请先在模型管理中下载并准备 {spec.name}。")
         validated_target = validate_ai_source(source, target)
-        directory = output_directory.expanduser().resolve()
+        try:
+            directory = source.path.parent.resolve()
+        except OSError as exc:
+            raise MediaError("The original video directory does not exist") from exc
         if not directory.is_dir():
-            raise MediaError("The output directory does not exist")
+            raise MediaError("The original video directory does not exist")
         if not os.access(directory, os.W_OK | os.X_OK):
-            raise MediaError("The output directory is not writable")
+            raise MediaError(
+                "The original video directory is not writable for AI enhancement"
+            )
         try:
             descriptor, probe_name = tempfile.mkstemp(prefix=".video-cut-ai-write-", dir=directory)
             os.close(descriptor)
             Path(probe_name).unlink(missing_ok=True)
         except OSError as exc:
-            raise MediaError("The output directory is not writable") from exc
+            raise MediaError(
+                "The original video directory is not writable for AI enhancement"
+            ) from exc
 
         expected_width, expected_height = ai_output_dimensions(source, validated_target.id)
         source_pixels = max(1, int(source.metadata["width"]) * int(source.metadata["height"]))
@@ -1936,7 +1942,9 @@ class AIEnhancementManager:
             int(source_size * max(1.0, target_pixels / source_pixels) * 4),
         )
         if shutil.disk_usage(directory).free < estimated_output:
-            raise MediaError("There is not enough free space in the output directory")
+            raise MediaError(
+                "There is not enough free space beside the original video for AI enhancement"
+            )
 
         suffix = ai_output_suffix(source)
         color_plan = ai_input_color_plan(source)

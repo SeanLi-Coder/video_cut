@@ -98,6 +98,18 @@ def _source(path: Path, ffprobe: str) -> VideoSource:
             "SwiftVR 环境和模型需要约 36 GB 可用空间，请清理项目所在磁盘后重试。",
         ),
         (
+            "The original video directory does not exist",
+            "原视频所在文件夹不存在，请重新选择视频。",
+        ),
+        (
+            "The original video directory is not writable for AI enhancement",
+            "原视频所在文件夹不可写，无法在同级目录生成 AI 超清视频。",
+        ),
+        (
+            "There is not enough free space beside the original video for AI enhancement",
+            "原视频所在磁盘空间不足，无法在同级目录生成 AI 超清视频。",
+        ),
+        (
             "The selected AI model runtime is not available",
             "所选 AI 模型的运行环境暂不可用，请到模型管理重新准备。",
         ),
@@ -818,7 +830,6 @@ def test_swiftvr_create_rechecks_model_readiness_inside_registration_lock(
         manager.create(
             _source(sample_video, ffprobe),
             target="1080p",
-            output_directory=tmp_path,
             model_id=SWIFTVR_5B_BF16_ID,
         )
 
@@ -838,7 +849,6 @@ def test_swiftvr_rejects_2k_before_starting_or_downloading(
         manager.create(
             _source(sample_video, ffprobe),
             target="2k",
-            output_directory=tmp_path,
             model_id=SWIFTVR_5B_BF16_ID,
         )
 
