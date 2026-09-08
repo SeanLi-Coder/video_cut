@@ -123,6 +123,22 @@ def _verified_health(
     return health
 
 
+def _wait_for_running_shutdown(
+    *,
+    port: int,
+    server_pid: int,
+    launcher_pid: int,
+    timeout: float = 10.0,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        health = _request_json(Request(f"http://127.0.0.1:{port}/api/health"), 0.25)
+        if health is None and not _pid_is_alive(server_pid) and not _pid_is_alive(launcher_pid):
+            return True
+        time.sleep(0.2)
+    return False
+
+
 def main() -> int:
     try:
         record = json.loads(RECORD_PATH.read_text(encoding="utf-8"))
@@ -169,7 +185,24 @@ def main() -> int:
         server_pid=server_pid,
     )
     if not health:
-        print("The saved Local Video Cutter health endpoint did not respond.")
+        if "control_port" not in record:
+            print("The saved Local Video Cutter health endpoint did not respond.")
+            return 1
+        _, accepted = _request_starting_stop(record)
+        if not accepted:
+            print(
+                "The saved health endpoint did not respond and the launcher did not "
+                "accept the authenticated stop request."
+            )
+            return 1
+        if _wait_for_running_shutdown(
+            port=port,
+            server_pid=server_pid,
+            launcher_pid=launcher_pid,
+        ):
+            print("Local Video Cutter stopped through the launcher control channel.")
+            return 0
+        print("The launcher accepted the stop request but is still shutting down.")
         return 1
     if (
         health.get("app_id") != APP_ID
@@ -192,17 +225,34 @@ def main() -> int:
         )
     )
     if not response or response.get("instance_id") != instance_id:
-        print("The verified server did not accept the stop request.")
+        if "control_port" not in record:
+            print("The verified server did not accept the stop request.")
+            return 1
+        _, accepted = _request_starting_stop(record)
+        if not accepted:
+            print(
+                "Neither the verified server nor the launcher control channel accepted "
+                "the stop request."
+            )
+            return 1
+        if _wait_for_running_shutdown(
+            port=port,
+            server_pid=server_pid,
+            launcher_pid=launcher_pid,
+        ):
+            print("Local Video Cutter stopped through the launcher control channel.")
+            return 0
+        print("The launcher accepted the stop request but is still shutting down.")
         return 1
     if "control_port" in record:
         _request_starting_stop(record)
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        health = _request_json(Request(f"http://127.0.0.1:{port}/api/health"), 0.25)
-        if health is None and not _pid_is_alive(server_pid) and not _pid_is_alive(launcher_pid):
-            print("Local Video Cutter stopped.")
-            return 0
-        time.sleep(0.2)
+    if _wait_for_running_shutdown(
+        port=port,
+        server_pid=server_pid,
+        launcher_pid=launcher_pid,
+    ):
+        print("Local Video Cutter stopped.")
+        return 0
     print("The server accepted the stop request but is still shutting down.")
     return 1
 

@@ -21,6 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from app.paths import APPLICATION_ROOT, is_frozen
+from launcher_models import prompt_for_missing_models
 
 try:
     import msvcrt
@@ -120,9 +121,7 @@ def _python_candidates(initial: Path | None = None) -> list[Path]:
         candidates.append(from_launcher)
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        candidates.append(
-            Path(local_app_data) / "Programs" / "Python" / "Python312" / "python.exe"
-        )
+        candidates.append(Path(local_app_data) / "Programs" / "Python" / "Python312" / "python.exe")
     program_files = os.environ.get("PROGRAMFILES")
     if program_files:
         candidates.append(Path(program_files) / "Python312" / "python.exe")
@@ -451,13 +450,9 @@ def _ffmpeg_required_components_available(ffmpeg: Path) -> bool:
         return False
     if filters.returncode != 0 or encoders.returncode != 0:
         return False
-    has_libplacebo = bool(
-        re.search(r"^\s*[TSC.]+\s+libplacebo\s+", filters.stdout, re.MULTILINE)
-    )
+    has_libplacebo = bool(re.search(r"^\s*[TSC.]+\s+libplacebo\s+", filters.stdout, re.MULTILINE))
     has_zscale = bool(re.search(r"^\s*[TSC.]+\s+zscale\s+", filters.stdout, re.MULTILINE))
-    has_libx265 = bool(
-        re.search(r"^\s*[A-Z.]{6}\s+libx265\b", encoders.stdout, re.MULTILINE)
-    )
+    has_libx265 = bool(re.search(r"^\s*[A-Z.]{6}\s+libx265\b", encoders.stdout, re.MULTILINE))
     return has_libplacebo and has_zscale and has_libx265
 
 
@@ -729,12 +724,21 @@ def _port_argument(value: str) -> int:
     return port
 
 
-def launch(*, base_python: Path | None, preferred_port: int, no_browser: bool) -> int:
+def launch(
+    *,
+    base_python: Path | None,
+    preferred_port: int,
+    no_browser: bool,
+    skip_model_prompt: bool = False,
+) -> int:
     lock_handle = _prepare_lock_file()
     owns_lock = _try_lock(lock_handle)
     try:
         if not owns_lock:
-            if _open_existing_instance(lock_handle=lock_handle, no_browser=no_browser):
+            if _open_existing_instance(
+                lock_handle=lock_handle,
+                no_browser=no_browser,
+            ):
                 return 0
             owns_lock = True
 
@@ -798,9 +802,7 @@ def launch(*, base_python: Path | None, preferred_port: int, no_browser: bool) -
                     "VIDEO_CUT_AI_BASE_PYTHON": str(resolved_python),
                 }
             )
-            environment["PATH"] = os.pathsep.join(
-                [str(ffmpeg.parent), environment.get("PATH", "")]
-            )
+            environment["PATH"] = os.pathsep.join([str(ffmpeg.parent), environment.get("PATH", "")])
             process = subprocess.Popen(
                 [
                     str(python),
@@ -870,6 +872,11 @@ def launch(*, base_python: Path | None, preferred_port: int, no_browser: bool) -
                 }
             )
             print(f"Local Video Cutter is ready at http://127.0.0.1:{port}")
+            prompt_for_missing_models(
+                port,
+                stop_requested,
+                skip=skip_model_prompt,
+            )
             if not no_browser:
                 _open_browser(port)
 
@@ -907,6 +914,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Start the Local Video Cutter on Windows")
     parser.add_argument("--port", type=_port_argument, default=DEFAULT_PORT)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--skip-model-prompt", action="store_true")
     args = parser.parse_args(argv)
     if sys.platform != "win32":
         print("launcher_windows.py can only run on Windows.")
@@ -916,6 +924,7 @@ def main(argv: list[str] | None = None) -> int:
             base_python=None if is_frozen() else Path(sys.executable).resolve(),
             preferred_port=args.port,
             no_browser=args.no_browser,
+            skip_model_prompt=args.skip_model_prompt,
         )
     except (LauncherError, OSError) as exc:
         print(f"Startup failed: {exc}")

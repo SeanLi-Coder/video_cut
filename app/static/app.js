@@ -10,6 +10,48 @@ const AI_TARGETS = {
   "2k": { label: "2K QHD", dimensions: "2560 × 1440" },
   "4k": { label: "4K UHD", dimensions: "3840 × 2160" },
 };
+const DEFAULT_AI_MODEL_ID = "seedvr2-3b-fp16";
+const FALLBACK_AI_MODELS = [
+  {
+    id: DEFAULT_AI_MODEL_ID,
+    name: "SeedVR2 3B FP16",
+    description: "质量优先的时序视频修复模型，兼容 Apple Silicon 与 RTX 5090。",
+    precision: "FP16",
+    status: "stable",
+    stable: true,
+    default: true,
+    compatible: true,
+    runnable: true,
+    supported_targets: ["1080p", "2k", "4k"],
+    download_size_bytes: 7_284_343_622,
+  },
+  {
+    id: "swiftvr-5b-bf16",
+    name: "SwiftVR 5B BF16",
+    description: "面向 RTX 5090 的实验性流式一阶段视频修复模型。",
+    precision: "BF16",
+    status: "experimental",
+    experimental: true,
+    compatible: false,
+    runnable: false,
+    supported_targets: ["1080p"],
+    download_size_bytes: 20_167_236_623,
+    compatibility_reason: "SwiftVR 仅支持 NVIDIA CUDA；正在等待本机能力信息。",
+  },
+  {
+    id: "flashvsr-v1-1-full",
+    name: "FlashVSR v1.1 Full",
+    description: "使用完整 LCSA 路径的 4× 视频超分模型；RTX 50 支持尚待验证。",
+    precision: "BF16",
+    status: "blocked",
+    blocked: true,
+    compatible: false,
+    runnable: false,
+    supported_targets: ["1080p", "2k", "4k"],
+    download_size_bytes: 6_759_375_220,
+    blocked_reason: "FlashVSR 的官方 Block-Sparse-Attention 尚未在 Windows RTX 50 上完成兼容性与质量验证。",
+  },
+];
 
 const state = {
   appToken: "",
@@ -19,8 +61,13 @@ const state = {
   rotationReady: false,
   aiEnhanceReady: false,
   aiRuntime: {},
+  aiModels: FALLBACK_AI_MODELS.map((model) => ({ ...model })),
+  selectedAiModelId: DEFAULT_AI_MODEL_ID,
+  multiModelApiAvailable: false,
+  modelCatalogLoading: true,
   workspace: "video",
   modelDownload: {},
+  modelDownloadModelId: DEFAULT_AI_MODEL_ID,
   modelDownloadStarting: false,
   modelDownloadCancelling: false,
   modelDownloadPollTimer: null,
@@ -105,11 +152,20 @@ const elements = {
   aiPanel: byId("ai-panel"),
   aiTargetOptions: Array.from(document.querySelectorAll(".ai-target-option")),
   aiTargetNote: byId("ai-target-note"),
+  aiModelOptions: byId("ai-model-options"),
+  aiModelNote: byId("ai-model-note"),
+  activeAiModelBadge: byId("active-ai-model-badge"),
   aiRuntimeInlineNote: byId("ai-runtime-inline-note"),
   openModelManagerButton: byId("open-model-manager-button"),
+  modelSelector: byId("model-selector"),
+  modelKicker: byId("model-kicker"),
+  modelManagerHeading: byId("model-manager-heading"),
   modelStatusBadge: byId("model-status-badge"),
   modelSizeValue: byId("model-size-value"),
+  modelPrecisionValue: byId("model-precision-value"),
+  modelTargetsValue: byId("model-targets-value"),
   modelBackendDescription: byId("model-backend-description"),
+  modelCompatibilityNote: byId("model-compatibility-note"),
   modelDeviceValue: byId("model-device-value"),
   modelSpaceValue: byId("model-space-value"),
   runtimeComponentDot: byId("runtime-component-dot"),
@@ -434,6 +490,125 @@ function isEnhanceMode() {
   return state.operation === "enhance";
 }
 
+function normalizeAiModel(value, fallback = {}) {
+  const raw = value && typeof value === "object" ? { ...fallback, ...value } : { ...fallback };
+  const id = String(raw.id || "").trim().toLowerCase();
+  if (!id) return null;
+  const status = raw.blocked === true
+    ? "blocked"
+    : raw.experimental === true
+      ? "experimental"
+      : String(raw.status || "stable").trim().toLowerCase();
+  const supportedTargets = Array.from(new Set(
+    (Array.isArray(raw.supported_targets) ? raw.supported_targets : [])
+      .map((target) => String(target).toLowerCase())
+      .filter((target) => Boolean(AI_TARGETS[target])),
+  ));
+  const blocked = status === "blocked" || raw.blocked === true;
+  const compatible = raw.compatible === true && !blocked;
+  return {
+    ...raw,
+    id,
+    name: String(raw.name || id),
+    description: String(raw.description || "本地视频增强模型。"),
+    precision: String(raw.precision || "—"),
+    status,
+    stable: status === "stable",
+    experimental: status === "experimental",
+    blocked,
+    compatible,
+    runnable: compatible && raw.runnable !== false,
+    supported_targets: supportedTargets,
+    download_size_bytes: Math.max(
+      0,
+      Number(raw.download_size_bytes ?? raw.total_download_bytes) || 0,
+    ),
+    partial_bytes: Math.max(0, Number(raw.partial_bytes) || 0),
+    downloaded: typeof raw.downloaded === "boolean" ? raw.downloaded : null,
+    prepared: typeof raw.prepared === "boolean" ? raw.prepared : null,
+    compatibility_reason: String(
+      raw.blocked_reason || raw.compatibility_reason || raw.unavailable_reason || "",
+    ),
+    runtime: raw.runtime && typeof raw.runtime === "object" ? raw.runtime : null,
+  };
+}
+
+function applyAiModelCatalog(payload) {
+  const received = Array.isArray(payload?.models) ? payload.models : [];
+  const byId = new Map(received.map((model) => [String(model?.id || "").toLowerCase(), model]));
+  const ordered = [];
+  for (const fallback of FALLBACK_AI_MODELS) {
+    ordered.push(normalizeAiModel(byId.get(fallback.id), fallback));
+    byId.delete(fallback.id);
+  }
+  for (const model of byId.values()) ordered.push(normalizeAiModel(model));
+  state.aiModels = ordered.filter(Boolean);
+  const requestedDefault = String(payload?.default_model_id || "").toLowerCase();
+  const defaultModel = state.aiModels.find((model) => model.id === requestedDefault)
+    || state.aiModels.find((model) => model.default)
+    || state.aiModels.find((model) => model.id === DEFAULT_AI_MODEL_ID)
+    || state.aiModels[0];
+  if (!state.aiModels.some((model) => model.id === state.selectedAiModelId)) {
+    state.selectedAiModelId = defaultModel?.id || DEFAULT_AI_MODEL_ID;
+  }
+  state.modelDownloadModelId = state.selectedAiModelId;
+}
+
+function selectedAiModel() {
+  return state.aiModels.find((model) => model.id === state.selectedAiModelId)
+    || state.aiModels.find((model) => model.default)
+    || state.aiModels[0]
+    || null;
+}
+
+function selectedAiRuntime() {
+  const runtime = selectedAiModel()?.runtime;
+  return runtime && typeof runtime === "object" ? runtime : state.aiRuntime;
+}
+
+function aiModelStatusLabel(model = selectedAiModel()) {
+  if (!model) return "未知";
+  if (model.blocked) return "暂不可用";
+  if (model.experimental) return "实验";
+  return "稳定";
+}
+
+function aiModelTargetsLabel(model = selectedAiModel()) {
+  if (!model?.supported_targets?.length) return "暂无";
+  return model.supported_targets.map((target) => AI_TARGETS[target]?.label || target).join(" · ");
+}
+
+function aiModelCompatibilityReason(model = selectedAiModel()) {
+  if (!model) return "尚未选择 AI 模型。";
+  if (model.compatibility_reason) return model.compatibility_reason;
+  if (model.blocked) return "该模型尚未通过当前平台的兼容性与质量验证。";
+  if (!model.compatible || !model.runnable) return `${model.name} 与当前 AI 加速设备不兼容。`;
+  return "";
+}
+
+function aiModelCanRun(model = selectedAiModel()) {
+  if (!model || model.blocked || !model.compatible || !model.runnable) return false;
+  const runtime = model.runtime;
+  return runtime && typeof runtime.ready === "boolean"
+    ? runtime.ready
+    : state.aiEnhanceReady;
+}
+
+function aiModelReadyToEnhance(model = selectedAiModel()) {
+  if (!aiModelCanRun(model)) return false;
+  if (model?.id === DEFAULT_AI_MODEL_ID) return true;
+  return modelRuntimePrepared(model.runtime || selectedAiRuntime(), model);
+}
+
+function aiModelPreparationReason(model = selectedAiModel()) {
+  if (!model || !aiModelCanRun(model) || aiModelReadyToEnhance(model)) return "";
+  return `请先到 AI 模型管理下载并准备 ${model.name || "所选模型"}`;
+}
+
+function selectedModelSupportsTarget(target) {
+  return Boolean(selectedAiModel()?.supported_targets?.includes(String(target || "").toLowerCase()));
+}
+
 function normalizeAiTarget(value) {
   if (typeof value === "string") {
     const target = value.toLowerCase();
@@ -481,14 +656,20 @@ function selectedAiTarget() {
 function aiSelectionReady() {
   return Boolean(
     !isEnhanceMode()
-      || (state.aiEnhanceReady && selectedAiTarget()?.available),
+      || (aiModelReadyToEnhance() && selectedModelSupportsTarget(state.enhanceTarget) && selectedAiTarget()?.available),
   );
 }
 
 function selectDefaultAiTarget() {
   const targets = videoAiTargets();
-  const current = targets.find((item) => item.target === state.enhanceTarget && item.available);
-  state.enhanceTarget = current ? current.target : (targets.find((item) => item.available)?.target || "");
+  const current = targets.find((item) => (
+    item.target === state.enhanceTarget
+    && item.available
+    && selectedModelSupportsTarget(item.target)
+  ));
+  state.enhanceTarget = current
+    ? current.target
+    : (targets.find((item) => item.available && selectedModelSupportsTarget(item.target))?.target || "");
 }
 
 function aiTargetLabel(target = state.enhanceTarget) {
@@ -514,7 +695,7 @@ function previewKey(range) {
   const option = isRotateMode()
     ? `:${state.rotationDegrees}`
     : isEnhanceMode()
-      ? `:${state.enhanceTarget}`
+      ? `:${state.selectedAiModelId}:${state.enhanceTarget}`
       : "";
   return `${state.video.id}:${state.operation}${option}:${range.start.toFixed(3)}:${range.end.toFixed(3)}`;
 }
@@ -667,7 +848,18 @@ function makeSuggestedOutputName(range) {
     return `${stem}_rotated_${state.rotationDegrees}${extension}`;
   }
   if (isEnhanceMode()) {
-    return selectedAiTarget()?.suggestedOutputName || `${stem}_ai_${state.enhanceTarget || "enhanced"}.mp4`;
+    const suggested = selectedAiTarget()?.suggestedOutputName
+      || `${stem}_ai_${state.enhanceTarget || "enhanced"}.mp4`;
+    const model = selectedAiModel();
+    if (!model || model.id === DEFAULT_AI_MODEL_ID) return suggested;
+    const modelSuffix = String(model.id || "").split("-")[0].replace(/[^a-z0-9]/g, "");
+    if (!modelSuffix) return suggested;
+    const extensionIndex = suggested.lastIndexOf(".");
+    const extension = extensionIndex > 0 ? suggested.slice(extensionIndex) : "";
+    let suggestedStem = extensionIndex > 0 ? suggested.slice(0, extensionIndex) : suggested;
+    const colorSuffix = suggestedStem.endsWith("_sdr") ? "_sdr" : "";
+    if (colorSuffix) suggestedStem = suggestedStem.slice(0, -colorSuffix.length);
+    return `${suggestedStem}_${modelSuffix}${colorSuffix}${extension}`;
   }
   const start = formatTime(range.start).replaceAll(":", "-").replace(".", "_");
   const end = formatTime(range.end).replaceAll(":", "-").replace(".", "_");
@@ -1090,22 +1282,95 @@ async function requestPreview(range, options = {}) {
   }
 }
 
+function aiModelChoiceDetail(model, { manager = false } = {}) {
+  const targets = aiModelTargetsLabel(model).replaceAll(" · ", " / ");
+  if (model.blocked) return "完整质量路径保留，等待 RTX 50 兼容验证";
+  const backends = Array.isArray(model.supported_backends)
+    ? model.supported_backends.map((backend) => (
+      String(backend).toLowerCase() === "cuda" ? "RTX" : "Mac"
+    )).join(" / ")
+    : model.id === DEFAULT_AI_MODEL_ID
+      ? "Mac / RTX"
+      : "RTX 5090";
+  const prefix = manager && model.default ? "默认 · " : "";
+  return `${prefix}${backends || "本机"} · ${targets}`;
+}
+
+function createAiModelChoice(model, className, { manager = false } = {}) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.dataset.modelId = model.id;
+  button.dataset.status = model.status;
+  button.setAttribute("aria-pressed", model.id === state.selectedAiModelId ? "true" : "false");
+  const reason = aiModelCompatibilityReason(model);
+  button.title = reason || `切换到 ${model.name}`;
+  button.disabled = Boolean(state.exporting || modelDownloadIsActive() || state.modelCatalogLoading);
+
+  const title = document.createElement("span");
+  const name = document.createElement("strong");
+  name.textContent = model.name;
+  const status = document.createElement("em");
+  status.textContent = aiModelStatusLabel(model);
+  title.append(name, status);
+
+  const detail = document.createElement("small");
+  detail.textContent = aiModelChoiceDetail(model, { manager });
+  button.append(title, detail);
+  return button;
+}
+
+function renderAiModelChoices() {
+  const models = state.aiModels.filter((model) => model && model.id);
+  elements.aiModelOptions.replaceChildren(
+    ...models.map((model) => createAiModelChoice(model, "ai-model-option")),
+  );
+  elements.modelSelector.replaceChildren(
+    ...models.map((model) => createAiModelChoice(
+      model,
+      "model-selector-option",
+      { manager: true },
+    )),
+  );
+  const model = selectedAiModel();
+  if (!model) {
+    elements.activeAiModelBadge.textContent = "尚未选择模型";
+    elements.aiModelNote.textContent = "正在读取可用 AI 模型。";
+    return;
+  }
+  elements.activeAiModelBadge.textContent = `${model.name} · ${aiModelStatusLabel(model)}`;
+  const reason = aiModelCompatibilityReason(model);
+  elements.aiModelNote.textContent = reason
+    ? `${model.name} 暂不能运行：${reason}`
+    : model.experimental
+      ? `${model.name} 是实验模型，目前只开放 ${aiModelTargetsLabel(model)}。`
+      : `${model.name} 是默认稳定模型，支持 ${aiModelTargetsLabel(model)}。`;
+}
+
 function renderAiTargetOptions(controlsLocked = state.exporting) {
   const targets = videoAiTargets();
   const byTarget = new Map(targets.map((item) => [item.target, item]));
   const unavailable = [];
+  const model = selectedAiModel();
+  const modelRunnable = aiModelCanRun(model);
+  const modelReady = aiModelReadyToEnhance(model);
 
   for (const option of elements.aiTargetOptions) {
     const target = String(option.dataset.target || "").toLowerCase();
     const availability = byTarget.get(target);
-    const available = Boolean(state.video && state.aiEnhanceReady && availability?.available);
+    const modelSupportsTarget = selectedModelSupportsTarget(target);
+    const available = Boolean(state.video && modelReady && modelSupportsTarget && availability?.available);
     option.disabled = !available || controlsLocked || state.selectingVideo;
     option.setAttribute("aria-pressed", available && target === state.enhanceTarget ? "true" : "false");
     const reason = availability?.reason
       || (!state.video
         ? "请先选择视频"
-        : !state.aiEnhanceReady
-          ? "当前电脑无法使用 AI 超清"
+        : !modelRunnable
+          ? aiModelCompatibilityReason(model) || "当前电脑无法使用所选 AI 模型"
+          : !modelReady
+            ? aiModelPreparationReason(model)
+          : !modelSupportsTarget
+            ? `${model?.name || "所选模型"} 仅支持 ${aiModelTargetsLabel(model)}`
           : "目标清晰度低于原片，不会降级处理");
     option.title = available ? `增强到 ${AI_TARGETS[target].label}` : reason;
     const dimensions = option.querySelector("[data-ai-dimensions]");
@@ -1117,11 +1382,16 @@ function renderAiTargetOptions(controlsLocked = state.exporting) {
     if (state.video && !available) unavailable.push(`${AI_TARGETS[target].label}：${reason}`);
   }
 
-  const runtimeMessage = String(state.aiRuntime.message || state.aiRuntime.reason || "").trim();
+  const runtime = selectedAiRuntime();
+  const runtimeMessage = String(runtime.message || runtime.reason || "").trim();
   if (!state.video) {
     elements.aiTargetNote.textContent = "选择视频后会自动推荐第一个可用目标清晰度。";
-  } else if (!state.aiEnhanceReady) {
-    elements.aiTargetNote.textContent = runtimeMessage || "当前电脑没有可用的 AI 加速运行环境。";
+  } else if (!modelRunnable) {
+    elements.aiTargetNote.textContent = aiModelCompatibilityReason(model)
+      || runtimeMessage
+      || "当前电脑无法使用所选 AI 模型。";
+  } else if (!modelReady) {
+    elements.aiTargetNote.textContent = `${aiModelPreparationReason(model)}，完成后即可选择目标清晰度。`;
   } else if (!state.enhanceTarget) {
     elements.aiTargetNote.textContent = unavailable.length
       ? `当前没有可用目标：${unavailable.join("；")}`
@@ -1129,7 +1399,7 @@ function renderAiTargetOptions(controlsLocked = state.exporting) {
   } else {
     const suffix = unavailable.length ? ` 其余目标不可用：${unavailable.join("；")}` : "";
     const warning = selectedAiTarget()?.warning ? ` 注意：${selectedAiTarget().warning}。` : "";
-    elements.aiTargetNote.textContent = `将按原比例增强到 ${aiTargetLabel()} 边界，不拉伸画面。${warning}${suffix}`;
+    elements.aiTargetNote.textContent = `将用 ${model?.name || "所选模型"} 按原比例增强到 ${aiTargetLabel()} 边界，不拉伸画面。${warning}${suffix}`;
   }
 }
 
@@ -1137,6 +1407,9 @@ function renderModeCopy() {
   const frames = isFrameMode();
   const rotate = isRotateMode();
   const enhance = isEnhanceMode();
+  const aiModel = selectedAiModel();
+  const aiModelName = aiModel?.name || "AI 模型";
+  const aiRuntime = selectedAiRuntime();
   elements.modeClipButton.setAttribute("aria-pressed", !frames && !rotate && !enhance ? "true" : "false");
   elements.modeFramesButton.setAttribute("aria-pressed", frames ? "true" : "false");
   elements.modeRotateButton.setAttribute("aria-pressed", rotate ? "true" : "false");
@@ -1152,7 +1425,7 @@ function renderModeCopy() {
         ? "把这一小段逐帧保存"
         : "留下想要的这一段";
   elements.heroCopy.textContent = enhance
-    ? `选择 1080p、2K 或 4K，使用 SeedVR2 3B FP16 在${aiDeviceShortName()}本地增强；非标准色彩会自动转换，HDR 会明确映射为 SDR。`
+    ? `选择模型和它支持的目标清晰度，使用 ${aiModelName} 在${aiDeviceShortName(aiRuntime)}本地增强；非标准色彩会自动转换，HDR 会明确映射为 SDR。`
     : rotate
       ? "选一个视频和旋转角度，确认预览后生成同级新文件。原视频始终不会被修改。"
       : frames
@@ -1180,7 +1453,7 @@ function renderModeCopy() {
         ? "截图会放进一个独立文件夹，原视频不会有任何变化。"
         : "导出为新文件，原视频不会有任何变化。";
   elements.qualityChipText.textContent = enhance
-    ? "SeedVR2 · FP16 · 质量优先"
+    ? `${aiModelName} · ${aiModel?.precision || "本机"} · ${aiModelStatusLabel(aiModel)}`
     : rotate
       ? "完整时长 · 原音频直拷"
       : frames
@@ -1203,6 +1476,7 @@ function renderModeCopy() {
   for (const option of elements.rotationOptions) {
     option.setAttribute("aria-pressed", Number(option.dataset.degrees) === state.rotationDegrees ? "true" : "false");
   }
+  renderAiModelChoices();
   renderAiTargetOptions();
   if (!state.exportCompleted) {
     elements.completionSummary.textContent = enhance
@@ -1255,7 +1529,7 @@ function changeOperation(operation) {
   renderControls();
   showToast(
     isEnhanceMode()
-      ? "已切换到 AI 超清，整段视频将使用 SeedVR2 3B FP16 处理"
+      ? `已切换到 AI 超清，整段视频将使用 ${selectedAiModel()?.name || "所选模型"} 处理`
       : isRotateMode()
       ? `已切换到永久旋转，当前顺时针 ${state.rotationDegrees}°`
       : isFrameMode()
@@ -1457,24 +1731,30 @@ function normalizeProgress(value) {
   return Math.min(100, Math.max(0, numeric));
 }
 
-function modelRuntimePrepared(runtime = state.aiRuntime) {
+function modelRuntimePrepared(runtime = selectedAiRuntime(), model = selectedAiModel()) {
   if (!runtime || typeof runtime !== "object") return false;
+  const selectedSnapshot = state.modelDownloadModelId === model?.id ? state.modelDownload : null;
+  if (typeof selectedSnapshot?.prepared === "boolean") return selectedSnapshot.prepared;
+  if (typeof model?.prepared === "boolean") return model.prepared;
   if (typeof runtime.prepared === "boolean") return runtime.prepared;
+  if (model && typeof model.downloaded === "boolean") {
+    return Boolean(runtime.installed && model.downloaded);
+  }
   return Boolean(runtime.installed && runtime.models_downloaded);
 }
 
-function aiBackendLabel(runtime = state.aiRuntime) {
+function aiBackendLabel(runtime = selectedAiRuntime()) {
   const configuredLabel = String(runtime?.backend_label || "").trim();
   if (configuredLabel) return configuredLabel;
   const backend = String(runtime?.backend || "").trim().toUpperCase();
   return backend || "本机 AI 加速";
 }
 
-function aiDeviceShortName(runtime = state.aiRuntime) {
+function aiDeviceShortName(runtime = selectedAiRuntime()) {
   return String(runtime?.device_name || "").trim() || "这台电脑";
 }
 
-function aiDeviceSummary(runtime = state.aiRuntime) {
+function aiDeviceSummary(runtime = selectedAiRuntime()) {
   const deviceName = String(runtime?.device_name || "").trim();
   const backendLabel = aiBackendLabel(runtime);
   const memoryGb = Number(runtime?.device_memory_gb);
@@ -1533,7 +1813,7 @@ function setModelProgress(value, remainingText = "") {
   setProgressAriaValue(elements.modelProgressTrack, percentage, remainingText);
 }
 
-function modelStageCopy(stage, active) {
+function modelStageCopy(stage, active, modelName = selectedAiModel()?.name || "AI 模型") {
   const normalized = String(stage || "").toLowerCase();
   if (["queued", "pending", "waiting"].includes(normalized)) {
     return ["等待开始", "模型准备任务正在排队…"];
@@ -1542,12 +1822,12 @@ function modelStageCopy(stage, active) {
     return ["完整性校验", "正在校验模型文件…"];
   }
   if (normalized.includes("model") || normalized === "download" || normalized === "downloading") {
-    return ["下载模型", "正在下载 SeedVR2 模型…"];
+    return ["下载模型", `正在下载 ${modelName}…`];
   }
   if (normalized.includes("install") || normalized.includes("depend") || normalized === "setup") {
     return ["准备运行环境", "正在安装本地 AI 运行环境…"];
   }
-  if (active) return ["本机准备中", "正在准备 SeedVR2 3B FP16…"];
+  if (active) return ["本机准备中", `正在准备 ${modelName}…`];
   return ["准备状态", "尚未开始下载"];
 }
 
@@ -1558,50 +1838,80 @@ function setComponentState(dot, statusElement, stateName, text) {
 }
 
 function renderModelManager() {
-  const runtime = state.aiRuntime && typeof state.aiRuntime === "object" ? state.aiRuntime : {};
+  const model = selectedAiModel();
+  const runtime = selectedAiRuntime() && typeof selectedAiRuntime() === "object"
+    ? selectedAiRuntime()
+    : {};
   const snapshot = state.modelDownload && typeof state.modelDownload === "object"
     ? state.modelDownload
     : {};
   const status = String(snapshot.status || "idle").toLowerCase();
   const stage = String(snapshot.stage || status).toLowerCase();
   const active = modelDownloadIsActive(snapshot);
-  const prepared = modelRuntimePrepared(runtime);
-  const platformReady = Boolean(runtime.ready ?? state.aiEnhanceReady);
+  const prepared = modelRuntimePrepared(runtime, model);
+  const blocked = Boolean(model?.blocked);
+  const platformReady = aiModelCanRun(model);
   const unavailable = Boolean(snapshot.runtime_unavailable)
     || status === "unavailable"
-    || !platformReady;
+    || !platformReady
+    || blocked;
   const failed = status === "failed" || status === "error" || Boolean(state.modelDownloadRequestError);
   const cancelled = status === "cancelled" || status === "canceled";
   const needsSetup = status === "needs_setup" || Boolean(snapshot.requires_runtime_update);
-  const checking = !state.appReady;
+  const checking = !state.appReady || state.modelCatalogLoading;
   const progress = prepared ? 100 : normalizeProgress(snapshot.progress);
+  const configuredTotal = Number(model?.download_size_bytes);
   const sizeGb = Number(runtime.first_download_gb);
-  const fallbackTotal = Number.isFinite(sizeGb) && sizeGb > 0 ? sizeGb * 1_000_000_000 : 0;
+  const fallbackTotal = Number.isFinite(configuredTotal) && configuredTotal > 0
+    ? configuredTotal
+    : Number.isFinite(sizeGb) && sizeGb > 0
+      ? sizeGb * 1_000_000_000
+      : 0;
   const totalBytes = Number(snapshot.total_bytes) > 0 ? Number(snapshot.total_bytes) : fallbackTotal;
   const downloadedBytes = prepared && totalBytes > 0
     ? totalBytes
-    : Math.max(0, Number(snapshot.downloaded_bytes) || 0);
+    : Math.max(0, Number(snapshot.downloaded_bytes ?? model?.partial_bytes) || 0);
   const modelRemainingText = remainingTimeText(snapshot, {
     cancelling: state.modelDownloadCancelling,
   });
 
   const backendLabel = aiBackendLabel(runtime);
   const deviceName = aiDeviceShortName(runtime);
+  elements.modelManagerHeading.textContent = model?.name || "AI 模型";
+  elements.modelKicker.textContent = blocked
+    ? "完整质量路径 · 等待兼容验证"
+    : model?.experimental
+      ? "实验模型 · 请先用短片验证"
+      : model?.default
+        ? "默认稳定模型"
+        : "稳定模型";
+  elements.modelPrecisionValue.textContent = model?.precision || "—";
+  elements.modelTargetsValue.textContent = aiModelTargetsLabel(model);
   elements.modelDeviceValue.textContent = aiDeviceSummary(runtime);
   const minimumRuntimeGb = Number(runtime.minimum_runtime_free_gb);
   elements.modelSpaceValue.textContent = Number.isFinite(minimumRuntimeGb) && minimumRuntimeGb > 0
     ? `至少约 ${minimumRuntimeGb.toFixed(0)} GB`
-    : "至少约 12 GB";
-  elements.modelBackendDescription.textContent = runtime.backend || runtime.backend_label
-    ? `时序视频增强模型，当前使用 ${deviceName} 的 ${backendLabel} 路径和 FP16 + SDPA。`
-    : "时序视频增强模型，会按本机支持的加速路径准备。";
+    : totalBytes > 0
+      ? `至少约 ${Math.ceil(totalBytes / 1_000_000_000)} GB`
+      : "正在计算";
+  const executionProfile = model?.id === DEFAULT_AI_MODEL_ID
+    ? "FP16 + SDPA"
+    : model?.precision || "本机默认精度";
+  elements.modelBackendDescription.textContent = model
+    ? `${model.description} 质量路径：${executionProfile}。${runtime.backend || runtime.backend_label ? ` 当前设备：${deviceName} · ${backendLabel}。` : ""}`
+    : "正在读取本机可用的 AI 模型。";
+  const compatibilityReason = aiModelCompatibilityReason(model);
+  elements.modelCompatibilityNote.hidden = !compatibilityReason;
+  elements.modelCompatibilityNote.dataset.level = blocked ? "blocked" : "unavailable";
+  elements.modelCompatibilityNote.textContent = compatibilityReason;
 
   let badgeStatus = "idle";
   let badgeText = "尚未下载";
   if (checking) badgeText = "正在检查";
+  else if (blocked) [badgeStatus, badgeText] = ["blocked", "暂不可用"];
   else if (prepared) [badgeStatus, badgeText] = ["ready", "已就绪"];
   else if (active) [badgeStatus, badgeText] = ["running", "准备中"];
-  else if (unavailable) badgeText = "当前不可用";
+  else if (unavailable) badgeText = "设备不兼容";
   else if (failed) [badgeStatus, badgeText] = ["failed", "未完成"];
   else if (cancelled) [badgeStatus, badgeText] = ["cancelled", "已暂停"];
   else if (needsSetup) badgeText = "需要更新";
@@ -1610,32 +1920,54 @@ function renderModelManager() {
 
   const runtimeBusy = active && !runtime.installed;
   const weightsBusy = active && (runtime.installed || stage.includes("model") || stage.includes("download") || stage.includes("verify"));
+  const weightsReady = prepared || model?.downloaded === true || snapshot.models_downloaded === true;
   setComponentState(
     elements.runtimeComponentDot,
     elements.runtimeComponentStatus,
     runtime.installed ? "ready" : runtimeBusy ? "running" : "idle",
-    runtime.installed ? "已安装并校验" : runtimeBusy ? "正在安装…" : needsSetup ? "需要安装或更新" : "尚未安装",
+    runtime.installed
+      ? "已安装并校验"
+      : runtimeBusy
+        ? "正在安装…"
+        : blocked
+          ? "当前不会安装"
+          : needsSetup
+            ? "需要安装或更新"
+            : "尚未安装",
   );
   setComponentState(
     elements.weightsComponentDot,
     elements.weightsComponentStatus,
-    runtime.models_downloaded ? "ready" : weightsBusy ? "running" : "idle",
-    runtime.models_downloaded ? "已下载并校验" : weightsBusy ? "正在下载或校验…" : "尚未下载",
+    weightsReady ? "ready" : weightsBusy ? "running" : "idle",
+    weightsReady
+      ? "已下载并校验"
+      : weightsBusy
+        ? "正在下载或校验…"
+        : blocked
+          ? "下载已锁定"
+          : "尚未下载",
   );
 
-  elements.modelSizeValue.textContent = Number.isFinite(sizeGb) && sizeGb > 0
-    ? `约 ${sizeGb.toFixed(1)} GB`
-    : "约 7.3 GB";
+  elements.modelSizeValue.textContent = totalBytes > 0 ? `约 ${formatBytes(totalBytes)}` : "正在计算";
   setModelProgress(progress, modelRemainingText);
   elements.modelProgressPanel.classList.toggle("is-ready", prepared);
   elements.modelProgressPanel.classList.toggle("is-error", failed);
+  elements.modelProgressPanel.classList.toggle("is-blocked", blocked);
 
-  const [stageKicker, stageTitle] = modelStageCopy(stage, active);
-  elements.modelProgressKicker.textContent = prepared ? "准备完成" : failed ? "准备未完成" : stageKicker;
+  const [stageKicker, stageTitle] = modelStageCopy(stage, active, model?.name);
+  elements.modelProgressKicker.textContent = blocked
+    ? "兼容性状态"
+    : prepared
+      ? "准备完成"
+      : failed
+        ? "准备未完成"
+        : stageKicker;
   elements.modelProgressTitle.textContent = prepared
     ? "AI 模型已经可以直接使用"
+    : blocked
+      ? "等待官方完整质量路径支持 RTX 50"
     : unavailable
-      ? "当前环境无法准备 AI 模型"
+      ? "所选模型无法在当前设备运行"
     : failed
       ? "AI 模型下载或安装失败"
       : needsSetup
@@ -1668,8 +2000,10 @@ function renderModelManager() {
     || snapshot.message
     || runtime.message;
   elements.modelProgressMessage.textContent = prepared
-    ? `SeedVR2 3B FP16、VAE 与本地 ${backendLabel} 运行环境均已完成校验。`
-    : String(message || "可以现在提前准备，之后做 AI 超清时无需再等待首次下载。");
+    ? `${model?.name || "AI 模型"} 与本地 ${backendLabel} 运行环境均已完成校验。`
+    : blocked
+      ? compatibilityReason
+      : String(message || "可以现在提前准备，之后做 AI 超清时无需再等待首次下载。");
 
   const busy = active || state.modelDownloadStarting;
   const buttonLabel = elements.modelDownloadButton.querySelector(".button-label");
@@ -1679,11 +2013,14 @@ function renderModelManager() {
     || busy
     || state.modelDownloadCancelling
     || prepared
-    || !platformReady;
+    || !platformReady
+    || blocked;
   if (buttonLabel) {
     buttonLabel.textContent = prepared
       ? "模型已准备完成"
-      : unavailable
+      : blocked
+        ? "等待兼容验证"
+        : unavailable
         ? "当前不可用"
       : busy
         ? "正在准备模型…"
@@ -1703,8 +2040,10 @@ function renderModelManager() {
     ? "已经准备完成；以后不会重复下载。"
     : active
       ? "可以切回视频处理；下载会继续，已完成部分会保留。"
+      : blocked
+        ? compatibilityReason
       : !platformReady && !checking
-        ? String(runtime.message || "当前电脑没有可用的 AI 加速运行环境。")
+        ? compatibilityReason || String(runtime.message || "当前电脑没有可用的 AI 加速运行环境。")
         : needsSetup
           ? "模型文件无需重下；只会更新本地运行环境。"
         : failed
@@ -1712,27 +2051,79 @@ function renderModelManager() {
           : "下载可以续传；切换页面不会中断。";
 
   elements.aiRuntimeInlineNote.textContent = prepared
-    ? "SeedVR2 模型已提前准备完成，开始 AI 超清时可以直接加载。"
+    ? `${model?.name || "AI 模型"} 已提前准备完成，开始 AI 超清时可以直接加载。`
     : unavailable
-      ? String(runtime.message || "当前环境无法使用 AI 超清。")
+      ? compatibilityReason || String(runtime.message || "当前环境无法使用 AI 超清。")
     : active
-      ? `SeedVR2 模型正在后台准备（${Math.round(progress)}%），切换页面不会中断。`
-      : `${aiDeviceSummary(runtime)}；全程本地处理，可以提前下载约 7.3 GB 模型。`;
+      ? `${model?.name || "AI 模型"} 正在后台准备（${Math.round(progress)}%），切换页面不会中断。`
+      : `${aiDeviceSummary(runtime)}；全程本地处理，可以提前下载约 ${formatBytes(totalBytes)} 模型。`;
   elements.openModelManagerButton.textContent = prepared
     ? "查看模型状态"
     : active
       ? "查看下载进度"
       : "管理 AI 模型";
+  renderAiModelChoices();
 }
 
-function applyModelDownloadSnapshot(snapshot) {
+function modelDownloadPath(modelId = state.modelDownloadModelId || state.selectedAiModelId) {
+  return state.multiModelApiAvailable
+    ? `/api/ai-models/${encodeURIComponent(modelId)}/download`
+    : "/api/ai-model-download";
+}
+
+function initialModelDownloadSnapshot(model = selectedAiModel()) {
+  const totalBytes = Math.max(0, Number(model?.download_size_bytes) || 0);
+  const downloadedBytes = model?.downloaded
+    ? totalBytes
+    : Math.min(totalBytes, Math.max(0, Number(model?.partial_bytes) || 0));
+  const prepared = model?.prepared === true;
+  const unavailable = !aiModelCanRun(model);
+  return {
+    model_id: model?.id || state.selectedAiModelId,
+    status: prepared
+      ? "completed"
+      : unavailable
+        ? "unavailable"
+        : downloadedBytes > 0
+          ? "cancelled"
+          : "idle",
+    stage: prepared ? "completed" : unavailable ? "unavailable" : "idle",
+    progress: prepared ? 100 : totalBytes > 0 ? downloadedBytes / totalBytes * 98 : 0,
+    downloaded_bytes: downloadedBytes,
+    total_bytes: totalBytes,
+    download_speed_bps: 0,
+    estimated_remaining_seconds: prepared ? 0 : null,
+    prepared,
+    models_downloaded: model?.downloaded === true,
+    runtime_unavailable: unavailable,
+    runtime: model?.runtime || selectedAiRuntime(),
+    message: unavailable ? aiModelCompatibilityReason(model) : "",
+  };
+}
+
+function applyModelDownloadSnapshot(snapshot, modelId = state.modelDownloadModelId) {
   if (!snapshot || typeof snapshot !== "object") return;
+  const resolvedModelId = String(snapshot.model_id || modelId || state.selectedAiModelId).toLowerCase();
+  state.modelDownloadModelId = resolvedModelId;
   state.modelDownload = snapshot;
   if (!modelDownloadIsActive(snapshot)) state.modelDownloadCancelling = false;
   const runtime = snapshot.runtime || snapshot.ai_runtime;
+  const model = state.aiModels.find((item) => item.id === resolvedModelId);
+  if (model) {
+    if (typeof snapshot.prepared === "boolean") model.prepared = snapshot.prepared;
+    if (typeof snapshot.models_downloaded === "boolean") {
+      model.downloaded = snapshot.models_downloaded;
+    }
+    if (Number.isFinite(Number(snapshot.downloaded_bytes))) {
+      model.partial_bytes = Math.max(0, Number(snapshot.downloaded_bytes));
+    }
+    if (runtime && typeof runtime === "object") model.runtime = runtime;
+  }
   if (runtime && typeof runtime === "object") {
-    state.aiRuntime = runtime;
-    state.aiEnhanceReady = Boolean(runtime.ready);
+    if (!state.multiModelApiAvailable || resolvedModelId === DEFAULT_AI_MODEL_ID) {
+      state.aiRuntime = runtime;
+    }
+    if (!state.multiModelApiAvailable) state.aiEnhanceReady = Boolean(runtime.ready);
   }
   state.modelDownloadRequestError = "";
   renderModelManager();
@@ -1751,8 +2142,9 @@ function scheduleModelDownloadPoll(pollSerial, delay = MODEL_DOWNLOAD_POLL_MS) {
   state.modelDownloadPollTimer = window.setTimeout(() => pollModelDownload(pollSerial), delay);
 }
 
-function startModelDownloadPolling(delay = 0) {
+function startModelDownloadPolling(delay = 0, modelId = state.modelDownloadModelId) {
   stopModelDownloadPolling();
+  state.modelDownloadModelId = modelId;
   const pollSerial = state.modelDownloadPollSerial;
   scheduleModelDownloadPoll(pollSerial, delay);
 }
@@ -1760,19 +2152,22 @@ function startModelDownloadPolling(delay = 0) {
 async function pollModelDownload(pollSerial) {
   if (pollSerial !== state.modelDownloadPollSerial) return;
   const wasActive = modelDownloadIsActive();
+  const modelId = state.modelDownloadModelId || state.selectedAiModelId;
   try {
-    const snapshot = await apiRequest("/api/ai-model-download");
+    const snapshot = state.multiModelApiAvailable
+      ? await apiRequest(`/api/ai-models/${encodeURIComponent(modelId)}/download`)
+      : await apiRequest("/api/ai-model-download");
     if (pollSerial !== state.modelDownloadPollSerial) return;
     state.modelDownloadPollFailures = 0;
-    applyModelDownloadSnapshot(snapshot);
+    applyModelDownloadSnapshot(snapshot, modelId);
     if (modelDownloadIsActive(snapshot)) {
       scheduleModelDownloadPoll(pollSerial);
       return;
     }
     state.modelDownloadPollTimer = null;
     const finalStatus = String(snapshot.status || "").toLowerCase();
-    if (wasActive && (modelRuntimePrepared(state.aiRuntime) || finalStatus === "completed")) {
-      showToast("AI 模型准备完成，以后可以直接开始超清");
+    if (wasActive && (modelRuntimePrepared() || finalStatus === "completed")) {
+      showToast(`${selectedAiModel()?.name || "AI 模型"} 准备完成，以后可以直接开始超清`);
     } else if (wasActive && ["cancelled", "canceled"].includes(finalStatus)) {
       showToast("模型下载已暂停，下次可以继续");
     } else if (wasActive && ["failed", "error"].includes(finalStatus)) {
@@ -1815,10 +2210,21 @@ async function refreshModelDownloadStatus({ reconnect = true } = {}) {
     renderModelManager();
     return;
   }
+  const model = selectedAiModel();
+  const modelId = model?.id || state.selectedAiModelId;
+  state.modelDownloadModelId = modelId;
+  if (state.multiModelApiAvailable && !aiModelCanRun(model)) {
+    applyModelDownloadSnapshot(initialModelDownloadSnapshot(model), modelId);
+    return;
+  }
   try {
-    const snapshot = await apiRequest("/api/ai-model-download");
-    applyModelDownloadSnapshot(snapshot);
-    if (reconnect && modelDownloadIsActive(snapshot)) startModelDownloadPolling(MODEL_DOWNLOAD_POLL_MS);
+    const snapshot = state.multiModelApiAvailable
+      ? await apiRequest(`/api/ai-models/${encodeURIComponent(modelId)}/download`)
+      : await apiRequest("/api/ai-model-download");
+    applyModelDownloadSnapshot(snapshot, modelId);
+    if (reconnect && modelDownloadIsActive(snapshot)) {
+      startModelDownloadPolling(MODEL_DOWNLOAD_POLL_MS, modelId);
+    }
   } catch (error) {
     state.modelDownloadRequestError = error.message || "无法读取 AI 模型状态";
     renderModelManager();
@@ -1832,12 +2238,14 @@ async function refreshModelDownloadStatus({ reconnect = true } = {}) {
 }
 
 async function startModelDownload() {
+  const model = selectedAiModel();
   if (
     !state.appReady
     || state.modelDownloadStarting
     || state.modelDownloadCancelling
     || modelDownloadIsActive()
     || modelRuntimePrepared()
+    || !aiModelCanRun(model)
   ) {
     return;
   }
@@ -1845,13 +2253,16 @@ async function startModelDownload() {
   state.modelDownloadRequestError = "";
   renderModelManager();
   try {
-    const snapshot = await post("/api/ai-model-download");
-    applyModelDownloadSnapshot(snapshot);
+    const modelId = model?.id || state.selectedAiModelId;
+    const snapshot = state.multiModelApiAvailable
+      ? await post(`/api/ai-models/${encodeURIComponent(modelId)}/download`)
+      : await post("/api/ai-model-download");
+    applyModelDownloadSnapshot(snapshot, modelId);
     if (modelDownloadIsActive(snapshot)) {
-      startModelDownloadPolling(MODEL_DOWNLOAD_POLL_MS);
-      showToast("AI 模型已开始在后台准备");
-    } else if (modelRuntimePrepared(state.aiRuntime)) {
-      showToast("AI 模型已经准备好了");
+      startModelDownloadPolling(MODEL_DOWNLOAD_POLL_MS, modelId);
+      showToast(`${model?.name || "AI 模型"} 已开始在后台准备`);
+    } else if (modelRuntimePrepared()) {
+      showToast(`${model?.name || "AI 模型"} 已经准备好了`);
     }
   } catch (error) {
     state.modelDownloadRequestError = error.message || "无法开始下载 AI 模型";
@@ -1869,15 +2280,91 @@ async function cancelModelDownload() {
   renderModelManager();
   try {
     const body = state.modelDownload.job_id ? { job_id: state.modelDownload.job_id } : undefined;
-    const snapshot = await post("/api/ai-model-download/cancel", body);
+    const modelId = state.modelDownloadModelId || state.selectedAiModelId;
+    const snapshot = state.multiModelApiAvailable
+      ? await post(`/api/ai-models/${encodeURIComponent(modelId)}/download/cancel`, body)
+      : await post("/api/ai-model-download/cancel", body);
     requestSucceeded = true;
-    applyModelDownloadSnapshot(snapshot);
-    if (modelDownloadIsActive(snapshot)) startModelDownloadPolling(150);
+    applyModelDownloadSnapshot(snapshot, modelId);
+    if (modelDownloadIsActive(snapshot)) startModelDownloadPolling(150, modelId);
   } catch (error) {
     showToast(error.message || "取消模型下载失败", "error");
   } finally {
     if (!requestSucceeded || !modelDownloadIsActive()) state.modelDownloadCancelling = false;
     renderModelManager();
+  }
+}
+
+async function refreshAiModels() {
+  if (!state.appReady) return;
+  state.modelCatalogLoading = true;
+  renderModelManager();
+  try {
+    const payload = await apiRequest("/api/ai-models");
+    state.multiModelApiAvailable = true;
+    if (payload.ai_runtime && typeof payload.ai_runtime === "object") {
+      state.aiRuntime = payload.ai_runtime;
+    }
+    applyAiModelCatalog(payload);
+    const activeModel = state.aiModels.find((model) => (
+      ["queued", "running"].includes(String(model.download_status || "").toLowerCase())
+    ));
+    if (activeModel) {
+      state.selectedAiModelId = activeModel.id;
+      state.modelDownloadModelId = activeModel.id;
+    }
+  } catch (_error) {
+    state.multiModelApiAvailable = false;
+    applyAiModelCatalog({
+      default_model_id: DEFAULT_AI_MODEL_ID,
+      models: [{
+        ...FALLBACK_AI_MODELS[0],
+        compatible: state.aiEnhanceReady,
+        runnable: state.aiEnhanceReady,
+        runtime: state.aiRuntime,
+        prepared: modelRuntimePrepared(state.aiRuntime, null),
+        downloaded: Boolean(state.aiRuntime.models_downloaded),
+      }],
+    });
+  } finally {
+    state.modelCatalogLoading = false;
+  }
+  state.modelDownload = initialModelDownloadSnapshot(selectedAiModel());
+  state.modelDownloadModelId = state.selectedAiModelId;
+  selectDefaultAiTarget();
+  renderModeCopy();
+  renderModelManager();
+  await refreshModelDownloadStatus();
+}
+
+function selectAiModel(modelId) {
+  const normalized = String(modelId || "").toLowerCase();
+  const model = state.aiModels.find((item) => item.id === normalized);
+  if (
+    !model
+    || model.id === state.selectedAiModelId
+    || state.exporting
+    || state.modelDownloadStarting
+    || modelDownloadIsActive()
+    || state.modelCatalogLoading
+  ) {
+    return;
+  }
+  if (state.exportCompleted || state.exportError) resetExportResult();
+  state.selectedAiModelId = model.id;
+  state.modelDownloadModelId = model.id;
+  state.modelDownload = initialModelDownloadSnapshot(model);
+  state.modelDownloadRequestError = "";
+  selectDefaultAiTarget();
+  if (state.activeRange) state.activePreviewKey = previewKey(state.activeRange);
+  renderModeCopy();
+  renderRangeSummary(readRange(false));
+  renderModelManager();
+  renderControls();
+  const reason = aiModelCompatibilityReason(model);
+  showToast(reason ? `${model.name} 暂不可用：${reason}` : `已切换到 ${model.name}`);
+  if (state.appReady && state.multiModelApiAvailable && aiModelCanRun(model)) {
+    void refreshModelDownloadStatus();
   }
 }
 
@@ -1932,6 +2419,8 @@ function setExportProgress(value, remainingText = "") {
 }
 
 function showExportProgress() {
+  const model = selectedAiModel();
+  const modelSize = Math.max(0, Number(model?.download_size_bytes) || 0);
   elements.exportSetup.hidden = true;
   elements.exportCompletePanel.hidden = true;
   elements.exportProgressPanel.hidden = false;
@@ -1949,8 +2438,10 @@ function showExportProgress() {
       : "正在导出视频…";
   elements.exportProgressMessage.textContent = isEnhanceMode()
     ? modelRuntimePrepared()
-      ? "模型已经提前准备完成，正在加载并开始整段 AI 计算。"
-      : "首次使用会准备环境并下载约 7.3 GB 模型，之后开始整段 AI 计算。"
+      ? `${model?.name || "AI 模型"} 已经提前准备完成，正在加载并开始整段 AI 计算。`
+      : model?.id === DEFAULT_AI_MODEL_ID
+        ? `首次使用会准备环境并下载${modelSize > 0 ? `约 ${formatBytes(modelSize)} 的` : "所选"}模型，之后开始整段 AI 计算。`
+        : `${model?.name || "所选模型"} 尚未准备完成，请先到 AI 模型管理下载。`
     : isRotateMode()
     ? "正在准备同级目录中的新视频，请不要关闭此页面。"
     : isFrameMode()
@@ -1978,7 +2469,11 @@ async function startExport() {
 
   try {
     const body = isEnhanceMode()
-      ? { video_id: state.video.id, target: state.enhanceTarget }
+      ? {
+          video_id: state.video.id,
+          target: state.enhanceTarget,
+          model_id: state.selectedAiModelId,
+        }
       : isRotateMode()
       ? { video_id: state.video.id, degrees: state.rotationDegrees }
       : { video_id: state.video.id, start: range.start, end: range.end };
@@ -2036,18 +2531,21 @@ async function pollExport(pollSerial) {
       ["running", "processing", "exporting"].includes(status)
       || (isEnhanceMode() && ["setup", "installing", "downloading", "inference", "remux", "verify", "verifying"].includes(status))
     ) {
+      const aiModelName = String(job.model_name || job.model || selectedAiModel()?.name || "AI 模型");
+      const aiModelBytes = Math.max(0, Number(selectedAiModel()?.download_size_bytes) || 0);
+      const aiModelSize = aiModelBytes > 0 ? `约 ${formatBytes(aiModelBytes)} 的` : "";
       const aiStageCopy = {
         inspect: ["检查原片", "正在核对逐帧时间戳…", "正在确认帧数和时间轴连续，避免长视频音画不同步。"],
         setup: ["首次准备", "正在准备 AI 运行环境…", "正在安装本地 AI 运行环境。"],
         installing: ["首次准备", "正在安装 AI 依赖…", "正在安装本地 AI 运行环境。"],
-        download: ["下载模型", "正在下载 SeedVR2 模型…", "正在下载并校验约 7.3 GB 的模型文件。"],
-        downloading: ["下载模型", "正在下载 SeedVR2 模型…", "正在下载并校验约 7.3 GB 的模型文件。"],
-        inference: ["AI 计算", `正在增强到 ${aiTargetLabel()}…`, "SeedVR2 正在逐帧恢复细节，耗时可能很长。"],
+        download: ["下载模型", `正在下载 ${aiModelName}…`, `正在下载并校验${aiModelSize}模型文件。`],
+        downloading: ["下载模型", `正在下载 ${aiModelName}…`, `正在下载并校验${aiModelSize}模型文件。`],
+        inference: ["AI 计算", `正在增强到 ${aiTargetLabel()}…`, `${aiModelName} 正在逐帧恢复细节，耗时可能很长。`],
         remux: ["封装成片", "正在复制原音频…", "画面已完成，正在无损复制原视频音频。"],
         verify: ["检查成片", "正在验证输出文件…", "正在检查分辨率、时长、编码和音频。"],
         verifying: ["检查成片", "正在验证输出文件…", "正在检查分辨率、时长、编码和音频。"],
       };
-      const aiCopy = aiStageCopy[stage] || ["本机处理中", "正在进行 AI 超清…", "SeedVR2 正在本机处理整段视频。"];
+      const aiCopy = aiStageCopy[stage] || ["本机处理中", "正在进行 AI 超清…", `${aiModelName} 正在本机处理整段视频。`];
       elements.exportProgressKicker.textContent = isEnhanceMode() ? aiCopy[0] : "本机处理中";
       elements.exportProgressTitle.textContent = isEnhanceMode()
         ? aiCopy[1]
@@ -2276,7 +2774,7 @@ function continueEditing() {
 
 function canExport(range = readRange(false)) {
   const exporterReady = isEnhanceMode()
-    ? state.aiEnhanceReady
+    ? aiModelReadyToEnhance()
     : isRotateMode()
     ? state.rotationReady
     : isFrameMode()
@@ -2300,6 +2798,9 @@ function canExport(range = readRange(false)) {
 }
 
 function renderReadyNote(range) {
+  const aiModel = selectedAiModel();
+  const aiRuntime = selectedAiRuntime();
+  const aiModelReason = aiModelCompatibilityReason(aiModel);
   elements.readyNote.classList.remove("is-ready", "is-error");
   if (state.exportError) {
     elements.readyNote.classList.add("is-error");
@@ -2317,9 +2818,12 @@ function renderReadyNote(range) {
   } else if (isEnhanceMode() && modelDownloadIsActive()) {
     elements.readyNoteText.textContent = "AI 模型正在后台准备，完成后即可开始超清";
   } else if (isEnhanceMode() && !aiSelectionReady()) {
-    if (!state.aiEnhanceReady) {
+    if (!aiModelCanRun(aiModel)) {
       elements.readyNote.classList.add("is-error");
-      elements.readyNoteText.textContent = String(state.aiRuntime.message || state.aiRuntime.reason || "当前电脑没有可用的 AI 加速运行环境");
+      elements.readyNoteText.textContent = aiModelReason
+        || String(aiRuntime.message || aiRuntime.reason || "当前电脑没有可用的 AI 加速运行环境");
+    } else if (!aiModelReadyToEnhance(aiModel)) {
+      elements.readyNoteText.textContent = `${aiModelPreparationReason(aiModel)}，完成后即可开始超清`;
     } else elements.readyNoteText.textContent = "当前视频没有可用目标；AI 超清不会把原片降级到更低分辨率";
   } else if (!range.valid) {
     elements.readyNoteText.textContent = "请先修正起始时间和结束时间";
@@ -2327,10 +2831,10 @@ function renderReadyNote(range) {
     elements.readyNoteText.textContent = "请等待新预览准备完成";
   } else if (!isRotateMode() && !state.outputDirectory) {
     elements.readyNoteText.textContent = "请选择一个保存目录";
-  } else if (!(isEnhanceMode() ? state.aiEnhanceReady : isRotateMode() ? state.rotationReady : isFrameMode() ? state.frameExportReady : state.ffmpegReady)) {
+  } else if (!(isEnhanceMode() ? aiModelReadyToEnhance(aiModel) : isRotateMode() ? state.rotationReady : isFrameMode() ? state.frameExportReady : state.ffmpegReady)) {
     elements.readyNote.classList.add("is-error");
     elements.readyNoteText.textContent = isEnhanceMode()
-      ? String(state.aiRuntime.message || state.aiRuntime.reason || "当前电脑没有可用的 AI 加速运行环境")
+      ? aiModelReason || String(aiRuntime.message || aiRuntime.reason || "当前电脑没有可用的 AI 加速运行环境")
       : isRotateMode()
       ? "当前 FFmpeg 缺少永久旋转所需编码器"
       : isFrameMode()
@@ -2340,8 +2844,8 @@ function renderReadyNote(range) {
     elements.readyNote.classList.add("is-ready");
     elements.readyNoteText.textContent = isEnhanceMode()
       ? state.video.is_hdr
-        ? `已就绪；将 HDR 映射为 BT.709 SDR 后，再增强到 ${aiTargetLabel()}；原片不会修改`
-        : `已就绪，将用 SeedVR2 3B FP16 把整段视频增强到 ${aiTargetLabel()}`
+        ? `已就绪；将 HDR 映射为 BT.709 SDR 后，再用 ${aiModel?.name || "所选模型"} 增强到 ${aiTargetLabel()}；原片不会修改`
+        : `已就绪，将用 ${aiModel?.name || "所选模型"} 把整段视频增强到 ${aiTargetLabel()}`
       : isRotateMode()
       ? `已就绪，将把整段视频顺时针永久旋转 ${state.rotationDegrees}°`
       : isFrameMode()
@@ -2464,7 +2968,7 @@ async function bootstrap() {
     } else {
       hideSystemBanner();
     }
-    await refreshModelDownloadStatus();
+    await refreshAiModels();
   } catch (error) {
     state.appReady = false;
     elements.versionLabel.textContent = "本地服务未连接";
@@ -2486,6 +2990,13 @@ elements.openModelManagerButton.addEventListener("click", () => {
 });
 elements.modelDownloadButton.addEventListener("click", startModelDownload);
 elements.cancelModelDownloadButton.addEventListener("click", cancelModelDownload);
+function handleAiModelSelection(event) {
+  const option = event.target.closest("[data-model-id]");
+  if (!option || !event.currentTarget.contains(option) || option.disabled) return;
+  selectAiModel(option.dataset.modelId);
+}
+elements.aiModelOptions.addEventListener("click", handleAiModelSelection);
+elements.modelSelector.addEventListener("click", handleAiModelSelection);
 elements.selectVideoButton.addEventListener("click", selectVideo);
 elements.replaceVideoButton.addEventListener("click", selectVideo);
 elements.modeClipButton.addEventListener("click", () => changeOperation("clip"));

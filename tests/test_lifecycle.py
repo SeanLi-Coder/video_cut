@@ -51,6 +51,37 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def test_existing_instance_opens_without_repeating_model_prompt(monkeypatch) -> None:
+    record = {
+        "instance_id": "existing-instance",
+        "server_pid": 42_424,
+        "port": 8_777,
+        "project_root": str(launcher.PROJECT_ROOT),
+    }
+    browser_ports: list[int] = []
+    prompt_calls: list[int] = []
+    monkeypatch.setattr(launcher, "_read_record", lambda: record)
+    monkeypatch.setattr(
+        launcher,
+        "_health",
+        lambda _port: {
+            "app_id": launcher.APP_ID,
+            "instance_id": "existing-instance",
+            "server_pid": 42_424,
+        },
+    )
+    monkeypatch.setattr(launcher, "_open_browser", browser_ports.append)
+    monkeypatch.setattr(
+        launcher,
+        "prompt_for_missing_models",
+        lambda port, *_args, **_kwargs: prompt_calls.append(port),
+    )
+
+    assert launcher._open_existing_instance(lock_handle=object()) is True
+    assert browser_ports == [8_777]
+    assert prompt_calls == []
+
+
 def test_media_executables_prefers_smoke_tested_ffmpeg_full(
     monkeypatch,
     tmp_path: Path,
@@ -221,6 +252,8 @@ def test_launch_passes_molten_vk_environment_to_backend(
     ffprobe = tmp_path / "ffprobe"
     molten_vk_icd = tmp_path / "MoltenVK_icd.json"
     captured_environment: dict[str, str] = {}
+    records: list[dict[str, object]] = []
+    lifecycle_events: list[str] = []
 
     class BackendProcess:
         pid = 42_424
@@ -248,12 +281,22 @@ def test_launch_passes_molten_vk_environment_to_backend(
     monkeypatch.setattr(launcher, "RUNTIME_ROOT", runtime_root)
     monkeypatch.setattr(launcher, "LOCK_PATH", runtime_root / "project.lock")
     monkeypatch.setattr(launcher, "RECORD_PATH", runtime_root / "runtime.json")
-    monkeypatch.setattr(launcher, "_write_record", lambda _payload: None)
+    monkeypatch.setattr(launcher, "_write_record", records.append)
     monkeypatch.setattr(launcher, "_read_record", lambda: None)
     monkeypatch.setattr(
         launcher,
         "_start_control_channel",
         lambda _token, _stop: (None, None, threading.Event(), 42_425),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_close_control_channel",
+        lambda *_args: lifecycle_events.append("close"),
+    )
+    monkeypatch.setattr(
+        launcher,
+        "prompt_for_missing_models",
+        lambda *_args, **_kwargs: lifecycle_events.append("prompt"),
     )
     monkeypatch.setattr(launcher, "_prepare_environment", lambda *_args, **_kwargs: python)
     monkeypatch.setattr(launcher, "_media_executables", select_media)
@@ -276,6 +319,9 @@ def test_launch_passes_molten_vk_environment_to_backend(
     assert captured_environment["VK_ICD_FILENAMES"] == str(molten_vk_icd)
     assert captured_environment["VIDEO_CUT_FFMPEG"] == str(ffmpeg)
     assert captured_environment["VIDEO_CUT_FFPROBE"] == str(ffprobe)
+    assert records[-1]["phase"] == "running"
+    assert records[-1]["control_port"] == 42_425
+    assert lifecycle_events == ["prompt", "close"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor inheritance")

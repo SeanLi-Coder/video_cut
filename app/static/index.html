@@ -241,11 +241,26 @@
           <div class="ai-panel" id="ai-panel" hidden>
             <div class="ai-heading">
               <div>
-                <strong>选择目标清晰度</strong>
+                <strong>选择 AI 模型和目标清晰度</strong>
                 <span>整段视频都会处理</span>
               </div>
-              <span class="ai-model-badge">SeedVR2 3B FP16</span>
+              <span class="ai-model-badge" id="active-ai-model-badge">SeedVR2 3B FP16 · 稳定</span>
             </div>
+            <div class="ai-model-options" id="ai-model-options" role="group" aria-label="选择 AI 超清模型">
+              <button class="ai-model-option" type="button" data-model-id="seedvr2-3b-fp16" data-status="stable" aria-pressed="true">
+                <span><strong>SeedVR2 3B FP16</strong><em>稳定</em></span>
+                <small>Mac / RTX · 1080p、2K、4K</small>
+              </button>
+              <button class="ai-model-option" type="button" data-model-id="swiftvr-5b-bf16" data-status="experimental" aria-pressed="false">
+                <span><strong>SwiftVR 5B BF16</strong><em>实验</em></span>
+                <small>RTX 5090 · 仅 1080p</small>
+              </button>
+              <button class="ai-model-option" type="button" data-model-id="flashvsr-v1-1-full" data-status="blocked" aria-pressed="false">
+                <span><strong>FlashVSR v1.1 Full</strong><em>暂不可用</em></span>
+                <small>RTX 50 的 Block-Sparse-Attention 尚未验证</small>
+              </button>
+            </div>
+            <p class="ai-model-note" id="ai-model-note" aria-live="polite">SeedVR2 是当前默认稳定模型。</p>
             <div class="ai-target-options" role="group" aria-label="选择 AI 超清目标分辨率">
               <button class="ai-target-option" type="button" data-target="1080p" aria-pressed="false" aria-describedby="ai-target-note">
                 <strong>1080p</strong>
@@ -384,7 +399,22 @@
         <div class="model-hero">
           <p class="eyebrow">AI MODEL MANAGER</p>
           <h1>提前把 AI 模型准备好</h1>
-          <p>不用选择视频，也不用等到开始超清时才下载。模型只保存在这台电脑，准备完成后所有视频都能直接使用。</p>
+          <p>不用选择视频；稳定与实验模型可以分别下载、切换和查看进度。尚未通过本机兼容性验证的模型会明确锁定，所有文件只保存在这台电脑。</p>
+        </div>
+
+        <div class="model-selector" id="model-selector" role="group" aria-label="选择要管理的 AI 模型">
+          <button class="model-selector-option" type="button" data-model-id="seedvr2-3b-fp16" data-status="stable" aria-pressed="true">
+            <span><strong>SeedVR2 3B FP16</strong><em>稳定</em></span>
+            <small>默认 · Mac / RTX · 1080p / 2K / 4K</small>
+          </button>
+          <button class="model-selector-option" type="button" data-model-id="swiftvr-5b-bf16" data-status="experimental" aria-pressed="false">
+            <span><strong>SwiftVR 5B BF16</strong><em>实验</em></span>
+            <small>RTX 5090 · 仅 1080p</small>
+          </button>
+          <button class="model-selector-option" type="button" data-model-id="flashvsr-v1-1-full" data-status="blocked" aria-pressed="false">
+            <span><strong>FlashVSR v1.1 Full</strong><em>暂不可用</em></span>
+            <small>保留完整质量路径，等待 RTX 50 兼容验证</small>
+          </button>
         </div>
 
         <article class="workflow-card model-manager-card" aria-labelledby="model-manager-heading">
@@ -393,7 +423,7 @@
               <svg viewBox="0 0 32 32"><path d="m16 4 1.8 5.7 5.7 1.8-5.7 1.8L16 19l-1.8-5.7-5.7-1.8 5.7-1.8L16 4Z"/><path d="M7 23h18M10 28h12"/></svg>
             </div>
             <div>
-              <span class="model-kicker">默认且唯一的质量模型</span>
+              <span class="model-kicker" id="model-kicker">默认稳定模型</span>
               <h2 id="model-manager-heading">SeedVR2 3B FP16</h2>
               <p id="model-backend-description">时序视频增强模型，会按本机支持的 MPS 或 CUDA 路径准备。</p>
             </div>
@@ -402,10 +432,13 @@
 
           <dl class="model-facts" aria-label="AI 模型信息">
             <div><dt>模型文件</dt><dd id="model-size-value">约 7.3 GB</dd></div>
-            <div><dt>精度</dt><dd>FP16</dd></div>
+            <div><dt>精度</dt><dd id="model-precision-value">FP16</dd></div>
+            <div><dt>支持输出</dt><dd id="model-targets-value">1080p · 2K · 4K</dd></div>
             <div><dt>运行设备</dt><dd id="model-device-value">正在检测…</dd></div>
             <div><dt>所需空间</dt><dd id="model-space-value">至少约 12 GB</dd></div>
           </dl>
+
+          <p class="model-compatibility-note" id="model-compatibility-note" role="status" hidden></p>
 
           <div class="model-components" aria-label="准备状态">
             <div class="model-component">

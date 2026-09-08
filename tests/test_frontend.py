@@ -72,7 +72,7 @@ def test_frontend_rotation_mode_uses_sibling_output_and_rotation_api() -> None:
     assert "rotation_output_extension" in javascript
     assert "directory_display" in javascript
     assert "state.video.id, degrees: state.rotationDegrees" in javascript
-    assert 'player.controls = false' in javascript
+    assert "player.controls = false" in javascript
     assert "parseAspectRatio(state.video.sample_aspect_ratio)" in javascript
 
 
@@ -80,7 +80,7 @@ def test_frontend_ai_mode_uses_local_quality_first_workflow() -> None:
     javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
     assert 'return "/api/ai-enhancements"' in javascript
-    assert 'target: state.enhanceTarget' in javascript
+    assert "target: state.enhanceTarget" in javascript
     assert "video.ai_targets" in javascript
     assert "result.ai_runtime" in javascript
     assert "AI 成片需完整计算后查看" in javascript
@@ -118,6 +118,8 @@ def test_frontend_has_independent_ai_model_download_manager() -> None:
     assert 'post("/api/ai-model-download/cancel", body)' in javascript
     assert "function renderModelManager" in javascript
     assert "function pollModelDownload" in javascript
+    assert "const activeModel = state.aiModels.find" in javascript
+    assert "state.selectedAiModelId = activeModel.id" in javascript
     assert "function switchWorkspace" in javascript
     assert "modelDownloadIsActive()" in javascript
     assert "download_speed_bps" in javascript
@@ -136,3 +138,43 @@ def test_frontend_has_independent_ai_model_download_manager() -> None:
     assert 'role="tablist"' in html
     assert 'aria-label="AI 模型下载进度"' in html
     assert "不用选择视频" in html
+
+
+def test_frontend_supports_selectable_ai_model_catalog() -> None:
+    javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+
+    for model_id, model_name in (
+        ("seedvr2-3b-fp16", "SeedVR2 3B FP16"),
+        ("swiftvr-5b-bf16", "SwiftVR 5B BF16"),
+        ("flashvsr-v1-1-full", "FlashVSR v1.1 Full"),
+    ):
+        assert model_id in javascript
+        assert model_id in html
+        assert model_name in javascript
+        assert model_name in html
+
+    assert 'apiRequest("/api/ai-models")' in javascript
+    assert "/api/ai-models/${encodeURIComponent(modelId)}/download" in javascript
+    assert "/api/ai-models/${encodeURIComponent(modelId)}/download/cancel" in javascript
+    assert "model_id: state.selectedAiModelId" in javascript
+    assert "function aiModelCanRun" in javascript
+    assert "function aiModelReadyToEnhance" in javascript
+    assert "model?.id === DEFAULT_AI_MODEL_ID" in javascript
+    assert "请先到 AI 模型管理下载并准备" in javascript
+    assert "|| blocked;" in javascript
+    assert "function selectAiModel" in javascript
+    assert "function selectedModelSupportsTarget" in javascript
+    assert "selectedAiModel()?.supported_targets" in javascript
+    assert "model.id === DEFAULT_AI_MODEL_ID" in javascript
+    assert 'String(model.id || "").split("-")[0]' in javascript
+    assert 'suggestedStem.endsWith("_sdr")' in javascript
+    assert "`${suggestedStem}_${modelSuffix}${colorSuffix}${extension}`" in javascript
+    assert "await refreshAiModels()" in javascript
+    assert 'id="ai-model-options"' in html
+    assert 'id="model-selector"' in html
+    assert 'id="model-compatibility-note"' in html
+    assert 'data-status="experimental"' in html
+    assert 'data-status="blocked"' in html
+    assert "仅 1080p" in html
+    assert "Block-Sparse-Attention 尚未验证" in html

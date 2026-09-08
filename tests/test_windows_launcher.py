@@ -16,6 +16,37 @@ from app import dialogs
 from app import paths as app_paths
 
 
+def test_existing_windows_instance_opens_without_repeating_model_prompt(monkeypatch) -> None:
+    record = {
+        "instance_id": "existing-instance",
+        "server_pid": 42_424,
+        "port": 8_777,
+        "project_root": str(launcher_windows.PROJECT_ROOT),
+    }
+    browser_ports: list[int] = []
+    prompt_calls: list[int] = []
+    monkeypatch.setattr(launcher_windows, "_read_record", lambda: record)
+    monkeypatch.setattr(
+        launcher_windows,
+        "_health",
+        lambda _port: {
+            "app_id": launcher_windows.APP_ID,
+            "instance_id": "existing-instance",
+            "server_pid": 42_424,
+        },
+    )
+    monkeypatch.setattr(launcher_windows, "_open_browser", browser_ports.append)
+    monkeypatch.setattr(
+        launcher_windows,
+        "prompt_for_missing_models",
+        lambda port, *_args, **_kwargs: prompt_calls.append(port),
+    )
+
+    assert launcher_windows._open_existing_instance(lock_handle=object()) is True
+    assert browser_ports == [8_777]
+    assert prompt_calls == []
+
+
 def test_posix_launcher_imports_when_fcntl_is_unavailable() -> None:
     completed = subprocess.run(
         [
@@ -97,10 +128,13 @@ def test_resolve_base_python_accepts_winget_already_installed_result(
 
     monkeypatch.setattr(launcher_windows, "_install_winget_package", already_installed)
 
-    assert launcher_windows._resolve_base_python(
-        initial,
-        stop_requested=threading.Event(),
-    ) == installed
+    assert (
+        launcher_windows._resolve_base_python(
+            initial,
+            stop_requested=threading.Event(),
+        )
+        == installed
+    )
 
 
 def test_winget_package_install_is_noninteractive_and_user_scoped(monkeypatch) -> None:
@@ -192,9 +226,7 @@ def test_candidate_ffmpeg_pairs_finds_winget_portable_package(
     monkeypatch.delenv("PROGRAMDATA", raising=False)
     monkeypatch.setattr(launcher_windows.shutil, "which", lambda _name: None)
 
-    assert launcher_windows._candidate_ffmpeg_pairs() == [
-        (ffmpeg.resolve(), ffprobe.resolve())
-    ]
+    assert launcher_windows._candidate_ffmpeg_pairs() == [(ffmpeg.resolve(), ffprobe.resolve())]
 
 
 def test_media_executables_keeps_verified_existing_full_build(
@@ -564,6 +596,83 @@ def test_running_stop_notifies_windows_launcher_control_channel(
         "_request_starting_stop",
         lambda supplied: (control_requests.append(supplied) or 101, True),
     )
+
+    assert stop.main() == 0
+    assert control_requests == [record]
+
+
+def test_running_stop_uses_control_channel_when_health_is_unavailable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    record_path = tmp_path / "runtime.json"
+    record = {
+        "app_id": stop.APP_ID,
+        "instance_id": "windows-instance",
+        "launcher_pid": 101,
+        "server_pid": 202,
+        "phase": "running",
+        "port": 8_777,
+        "control_port": 8_778,
+        "project_root": str(stop.PROJECT_ROOT.resolve()),
+        "stop_token": "windows-stop-token",
+    }
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    control_requests: list[dict[str, object]] = []
+    wait_calls: list[dict[str, int]] = []
+    monkeypatch.setattr(stop, "RECORD_PATH", record_path)
+    monkeypatch.setattr(stop, "_verified_health", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        stop,
+        "_request_starting_stop",
+        lambda supplied: (control_requests.append(supplied) or 101, True),
+    )
+    monkeypatch.setattr(
+        stop,
+        "_wait_for_running_shutdown",
+        lambda **kwargs: wait_calls.append(kwargs) or True,
+    )
+
+    assert stop.main() == 0
+    assert control_requests == [record]
+    assert wait_calls == [{"port": 8_777, "server_pid": 202, "launcher_pid": 101}]
+
+
+def test_running_stop_uses_control_channel_when_http_stop_fails(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    record_path = tmp_path / "runtime.json"
+    record = {
+        "app_id": stop.APP_ID,
+        "instance_id": "windows-instance",
+        "launcher_pid": 101,
+        "server_pid": 202,
+        "phase": "running",
+        "port": 8_777,
+        "control_port": 8_778,
+        "project_root": str(stop.PROJECT_ROOT.resolve()),
+        "stop_token": "windows-stop-token",
+    }
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+    control_requests: list[dict[str, object]] = []
+    monkeypatch.setattr(stop, "RECORD_PATH", record_path)
+    monkeypatch.setattr(
+        stop,
+        "_verified_health",
+        lambda **_kwargs: {
+            "app_id": stop.APP_ID,
+            "instance_id": "windows-instance",
+            "server_pid": 202,
+        },
+    )
+    monkeypatch.setattr(stop, "_request_json", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        stop,
+        "_request_starting_stop",
+        lambda supplied: (control_requests.append(supplied) or 101, True),
+    )
+    monkeypatch.setattr(stop, "_wait_for_running_shutdown", lambda **_kwargs: True)
 
     assert stop.main() == 0
     assert control_requests == [record]

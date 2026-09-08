@@ -20,6 +20,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from launcher_models import prompt_for_missing_models
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows uses launcher_windows.py
@@ -291,11 +293,7 @@ def _ffmpeg_full_check(ffmpeg: Path) -> tuple[bool, str]:
         if completed.returncode == 0:
             return True, ""
         lines = completed.stderr.strip().splitlines()
-        detail = (
-            " | ".join(lines[-6:])[-1000:]
-            if lines
-            else f"exit code {completed.returncode}"
-        )
+        detail = " | ".join(lines[-6:])[-1000:] if lines else f"exit code {completed.returncode}"
     return False, detail
 
 
@@ -330,8 +328,7 @@ def _media_executables(
             molten_vk_icd = _find_molten_vk_icd(brew)
             if molten_vk_icd is None and brew:
                 print(
-                    "MoltenVK is required for libplacebo on macOS. "
-                    "Installing it with Homebrew..."
+                    "MoltenVK is required for libplacebo on macOS. Installing it with Homebrew..."
                 )
                 return_code = _run_owned(
                     [brew, "install", "molten-vk"],
@@ -350,9 +347,7 @@ def _media_executables(
             return full_paths
 
         if brew:
-            print(
-                "FFmpeg Full could not be installed. Basic video tools will remain available."
-            )
+            print("FFmpeg Full could not be installed. Basic video tools will remain available.")
 
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
@@ -600,14 +595,23 @@ def _port_argument(value: str) -> int:
     return port
 
 
-def launch(*, base_python: Path, preferred_port: int, no_browser: bool) -> int:
+def launch(
+    *,
+    base_python: Path,
+    preferred_port: int,
+    no_browser: bool,
+    skip_model_prompt: bool = False,
+) -> int:
     RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
     lock_handle = LOCK_PATH.open("a+")
     try:
         try:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            if _open_existing_instance(lock_handle=lock_handle, no_browser=no_browser):
+            if _open_existing_instance(
+                lock_handle=lock_handle,
+                no_browser=no_browser,
+            ):
                 return 0
 
         instance_id = secrets.token_hex(16)
@@ -730,14 +734,17 @@ def launch(*, base_python: Path, preferred_port: int, no_browser: bool) -> int:
                         "server_pid": process.pid,
                         "phase": "running",
                         "port": port,
+                        "control_port": control_port,
                         "project_root": str(PROJECT_ROOT),
                         "stop_token": stop_token,
                     }
                 )
-                _close_control_channel(control_listener, control_thread, control_shutdown)
-                control_listener = None
-                control_thread = None
                 print(f"Local Video Cutter is ready at http://127.0.0.1:{port}")
+                prompt_for_missing_models(
+                    port,
+                    stop_requested,
+                    skip=skip_model_prompt,
+                )
                 if not no_browser:
                     _open_browser(port)
             while process.poll() is None and not stop_requested.wait(0.25):
@@ -786,6 +793,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Start the Local Video Cutter")
     parser.add_argument("--port", type=_port_argument, default=DEFAULT_PORT)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--skip-model-prompt", action="store_true")
     args = parser.parse_args(argv)
     if sys.version_info < MINIMUM_PYTHON:
         print("Python 3.10 or newer is required.")
@@ -795,6 +803,7 @@ def main(argv: list[str] | None = None) -> int:
             base_python=Path(sys.executable).resolve(),
             preferred_port=args.port,
             no_browser=args.no_browser,
+            skip_model_prompt=args.skip_model_prompt,
         )
     except (LauncherError, OSError) as exc:
         print(f"Startup failed: {exc}")

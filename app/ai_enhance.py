@@ -25,6 +25,13 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .ai_models import (
+    DEFAULT_AI_MODEL_ID,
+    SWIFTVR_5B_BF16_ID,
+    catalog_metadata,
+    get_ai_model,
+    model_compatibility,
+)
 from .media import (
     ExportManager,
     MediaError,
@@ -42,6 +49,8 @@ AI_CUDA_REQUIREMENTS_PATH = RESOURCE_ROOT / "requirements-ai-cuda.txt"
 AI_COMMON_REQUIREMENTS_PATH = RESOURCE_ROOT / "requirements-ai-common.txt"
 AI_PATCH_PATH = RESOURCE_ROOT / "vendor" / "seedvr2-mps-quality.patch"
 AI_COLOR_PATCH_PATH = RESOURCE_ROOT / "vendor" / "seedvr2-color-input.patch"
+AI_SWIFTVR_REQUIREMENTS_PATH = RESOURCE_ROOT / "requirements-ai-swiftvr-cuda.txt"
+AI_SWIFTVR_RUNNER_PATH = RESOURCE_ROOT / "vendor" / "swiftvr_runner.py"
 
 RUNNER_REVISION = "4490bd1f482e026674543386bb2a4d176da245b9"
 RUNNER_VERSION = "2.5.24"
@@ -51,11 +60,10 @@ RUNNER_ARCHIVE_URL = (
 RUNNER_ARCHIVE_SHA256 = "04c61842bc00fd8673e6bc9a3b1b1935955461f363791070ed14d67d2a2e77fb"
 RUNNER_PATCH_SHA256 = "bd92759faf0523658cf24ab280139a9217064cd21ae9d6b00e7f0992982a8775"
 RUNNER_COLOR_PATCH_SHA256 = "bb6ce72648ed8f175cab10179d1af90645e638b17296ddb2e2ff45e89f79215c"
+SWIFTVR_RUNTIME_VERSION = "5ca168cef6ca7200f135fdfea85e5e13d12c5b53"
 
 MODEL_REPOSITORY = "numz/SeedVR2_comfyUI"
-MODEL_DOWNLOAD_URL = (
-    "https://huggingface.co/{repository}/resolve/main/{filename}"
-)
+MODEL_DOWNLOAD_URL = "https://huggingface.co/{repository}/resolve/main/{filename}"
 MODEL_NAME = "SeedVR2 3B FP16"
 MODEL_FILENAME = "seedvr2_ema_3b_fp16.safetensors"
 MODEL_SHA256 = "2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"
@@ -72,6 +80,7 @@ FIRST_MODEL_DOWNLOAD_GB = round((MODEL_SIZE_BYTES + VAE_SIZE_BYTES) / 1_000_000_
 
 MINIMUM_RUNTIME_FREE_BYTES = 12 * 1024**3
 MINIMUM_CUDA_RUNTIME_FREE_BYTES = 18 * 1024**3
+MINIMUM_SWIFTVR_RUNTIME_FREE_BYTES = 36 * 1024**3
 MINIMUM_OUTPUT_FREE_BYTES = 512 * 1024**2
 MAX_ESTIMATED_REMAINING_SECONDS = 30 * 24 * 60 * 60
 AI_SDR_COLOR_FILTER_GRAPH = (
@@ -195,9 +204,12 @@ def _nvidia_smi_executable() -> str | None:
     if candidate:
         return candidate
     if sys.platform == "win32":
-        fixed = Path(
-            os.environ.get("PROGRAMFILES", r"C:\Program Files")
-        ) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe"
+        fixed = (
+            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+            / "NVIDIA Corporation"
+            / "NVSMI"
+            / "nvidia-smi.exe"
+        )
         if fixed.is_file():
             return str(fixed)
     return None
@@ -255,9 +267,7 @@ def _detect_compute_device() -> AIComputeDevice | None:
     return None
 
 
-_HUNK_HEADER = re.compile(
-    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
-)
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$")
 
 
 def _normalized_patch_line(value: str) -> str:
@@ -352,8 +362,7 @@ def _hunk_matches(
     if position < 0 or position + len(old_lines) > len(source):
         return False
     return all(
-        _normalized_patch_line(source[position + offset])
-        == _normalized_patch_line(expected)
+        _normalized_patch_line(source[position + offset]) == _normalized_patch_line(expected)
         for offset, expected in enumerate(old_lines)
     )
 
@@ -528,6 +537,7 @@ def ai_input_color_plan(source: VideoSource) -> AIInputColorPlan:
         warning=warning,
     )
 
+
 InferenceRunner = Callable[["AIEnhancementJob", Path], None]
 
 
@@ -622,12 +632,14 @@ def default_ai_output_name(
     *,
     suffix: str = ".mp4",
     tone_mapped: bool = False,
+    model_id: str = DEFAULT_AI_MODEL_ID,
 ) -> str:
     target = validate_ai_target(target_value)
     stem = safe_output_stem(source.stem)
     label = {"1080p": "1080p", "2k": "2k", "4k": "4k"}[target.id]
     color_suffix = "_sdr" if tone_mapped else ""
-    return f"{stem}_ai_{label}{color_suffix}{suffix}"
+    model_suffix = "" if model_id == DEFAULT_AI_MODEL_ID else f"_{model_id.split('-', 1)[0]}"
+    return f"{stem}_ai_{label}{model_suffix}{color_suffix}{suffix}"
 
 
 def ai_output_suffix(source: VideoSource) -> str:
@@ -713,6 +725,7 @@ class AIEnhancementJob:
     output_path: Path
     expected_width: int
     expected_height: int
+    model_id: str = DEFAULT_AI_MODEL_ID
     input_frame_count: int | None = None
     input_frame_rate: str | None = None
     expected_duration: float | None = None
@@ -724,6 +737,7 @@ class AIEnhancementJob:
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     stage_started_at: float | None = None
+    reported_eta_seconds: float | None = None
     finished_at: float | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     process: subprocess.Popen[str] | None = field(default=None, repr=False)
@@ -737,6 +751,22 @@ class AIEnhancementJob:
             elapsed_seconds = max(0.0, end_time - start_time)
             stage_start_time = self.stage_started_at or start_time
             stage_elapsed_seconds = max(0.0, end_time - stage_start_time)
+            estimated_remaining_seconds = _estimated_ai_remaining_seconds(
+                status=self.status,
+                stage=self.stage,
+                progress=self.progress,
+                stage_elapsed_seconds=stage_elapsed_seconds,
+            )
+            if (
+                self.status == "running"
+                and self.stage == "inference"
+                and self.reported_eta_seconds is not None
+                and math.isfinite(self.reported_eta_seconds)
+                and self.reported_eta_seconds >= 0
+            ):
+                estimated_remaining_seconds = round(
+                    min(MAX_ESTIMATED_REMAINING_SECONDS, self.reported_eta_seconds), 1
+                )
             return {
                 "job_id": self.id,
                 "operation": "enhance",
@@ -748,23 +778,20 @@ class AIEnhancementJob:
                 "output_path": str(self.output_path) if self.status == "completed" else None,
                 "error": self.error,
                 "elapsed_seconds": round(elapsed_seconds, 1),
-                "estimated_remaining_seconds": _estimated_ai_remaining_seconds(
-                    status=self.status,
-                    stage=self.stage,
-                    progress=self.progress,
-                    stage_elapsed_seconds=stage_elapsed_seconds,
-                ),
+                "estimated_remaining_seconds": estimated_remaining_seconds,
                 "target": self.target.id,
                 "target_label": self.target.label,
                 "target_width": self.expected_width,
                 "target_height": self.expected_height,
-                "model": MODEL_NAME,
+                "model_id": self.model_id,
+                "model": get_ai_model(self.model_id).name,
             }
 
 
 @dataclass
 class AIModelDownloadJob:
     id: str
+    model_id: str = DEFAULT_AI_MODEL_ID
     status: str = "queued"
     stage: str = "queued"
     progress: float = 0.0
@@ -807,7 +834,8 @@ class AIModelDownloadJob:
                     total_bytes=self.total_bytes,
                     download_speed_bps=self.download_speed_bps,
                 ),
-                "model": MODEL_NAME,
+                "model_id": self.model_id,
+                "model": get_ai_model(self.model_id).name,
             }
 
 
@@ -858,9 +886,7 @@ class AIEnhancementManager:
         )
         self.device_uuid = detected_device.uuid if detected_device is not None else device_uuid
         self.device_memory_bytes = (
-            detected_device.memory_bytes
-            if detected_device is not None
-            else device_memory_bytes
+            detected_device.memory_bytes if detected_device is not None else device_memory_bytes
         )
         self.compute_capability = (
             detected_device.compute_capability if detected_device is not None else None
@@ -869,21 +895,20 @@ class AIEnhancementManager:
             detected_device.driver_version if detected_device is not None else None
         )
         self.hardware_detected = detected_device is not None
-        self.driver_supported = (
-            selected_backend != "cuda" or _cuda_driver_supported(self.driver_version)
+        self.driver_supported = selected_backend != "cuda" or _cuda_driver_supported(
+            self.driver_version
         )
         detected = detected_device is not None or compute_backend is not None
         self.platform_supported = detected if platform_supported is None else platform_supported
         self.encoder_available = inference_runner is not None or self._has_encoder("libx265")
         self.color_pipeline_error: str | None = None
-        self.color_pipeline_available = (
-            inference_runner is not None or self._has_color_pipeline()
-        )
+        self.color_pipeline_available = inference_runner is not None or self._has_color_pipeline()
         self._jobs: dict[str, AIEnhancementJob] = {}
         self._model_download_jobs: dict[str, AIModelDownloadJob] = {}
         self._lock = threading.RLock()
         self._active_job_id: str | None = None
         self._latest_model_download_job_id: str | None = None
+        self._latest_model_download_job_ids: dict[str, str] = {}
 
     @property
     def code_root(self) -> Path:
@@ -905,11 +930,7 @@ class AIEnhancementManager:
 
     @property
     def runtime_requirements_path(self) -> Path:
-        return (
-            AI_CUDA_REQUIREMENTS_PATH
-            if self.compute_backend == "cuda"
-            else AI_REQUIREMENTS_PATH
-        )
+        return AI_CUDA_REQUIREMENTS_PATH if self.compute_backend == "cuda" else AI_REQUIREMENTS_PATH
 
     @property
     def model_root(self) -> Path:
@@ -918,6 +939,64 @@ class AIEnhancementManager:
     @property
     def marker_path(self) -> Path:
         return self.runtime_root / "runtime.json"
+
+    def _runtime_root_for(self, model_id: str) -> Path:
+        if model_id == DEFAULT_AI_MODEL_ID:
+            return self.runtime_root
+        return self.runtime_root / "engines" / get_ai_model(model_id).id
+
+    def _code_root_for(self, model_id: str) -> Path:
+        if model_id == DEFAULT_AI_MODEL_ID:
+            return self.code_root
+        return self._runtime_root_for(model_id) / "runner"
+
+    def _venv_python_for(self, model_id: str) -> Path:
+        if model_id == DEFAULT_AI_MODEL_ID:
+            return self.venv_python
+        root = self._runtime_root_for(model_id) / "venv"
+        if sys.platform == "win32":
+            return root / "Scripts" / "python.exe"
+        return root / "bin" / "python"
+
+    def _model_root_for(self, model_id: str) -> Path:
+        if model_id == DEFAULT_AI_MODEL_ID:
+            return self.model_root
+        return self._runtime_root_for(model_id) / "models"
+
+    def _marker_path_for(self, model_id: str) -> Path:
+        if model_id == DEFAULT_AI_MODEL_ID:
+            return self.marker_path
+        return self._runtime_root_for(model_id) / "runtime.json"
+
+    @staticmethod
+    def _model_files_for(model_id: str) -> tuple[tuple[str, int, str, str], ...]:
+        spec = get_ai_model(model_id)
+        urls = {item.relative_path: item.url for item in spec.files}
+        if model_id == DEFAULT_AI_MODEL_ID:
+            return tuple(
+                (
+                    filename,
+                    size,
+                    sha256,
+                    urls.get(
+                        filename,
+                        MODEL_DOWNLOAD_URL.format(
+                            repository=MODEL_REPOSITORY,
+                            filename=filename,
+                        ),
+                    ),
+                )
+                for filename, size, sha256 in MODEL_FILES
+            )
+        return tuple(
+            (item.relative_path, item.size_bytes, item.sha256, item.url) for item in spec.files
+        )
+
+    @staticmethod
+    def _model_total_bytes(model_id: str) -> int:
+        if model_id == DEFAULT_AI_MODEL_ID:
+            return MODEL_DOWNLOAD_SIZE_BYTES
+        return get_ai_model(model_id).total_download_bytes
 
     def _has_encoder(self, encoder: str) -> bool:
         try:
@@ -990,38 +1069,56 @@ class AIEnhancementManager:
                 return True
             lines = completed.stderr.strip().splitlines()
             self.color_pipeline_error = (
-                " | ".join(lines[-6:])[-1000:]
-                if lines
-                else f"exit code {completed.returncode}"
+                " | ".join(lines[-6:])[-1000:] if lines else f"exit code {completed.returncode}"
             )
         return False
 
-    def _runtime_fingerprint(self) -> str:
+    def _runtime_fingerprint(self, model_id: str = DEFAULT_AI_MODEL_ID) -> str:
         digest = hashlib.sha256()
-        digest.update(RUNNER_REVISION.encode("ascii"))
+        runtime_version = (
+            SWIFTVR_RUNTIME_VERSION if model_id == SWIFTVR_5B_BF16_ID else RUNNER_REVISION
+        )
+        digest.update(runtime_version.encode("ascii"))
         digest.update((self.compute_backend or "unsupported").encode("ascii"))
         digest.update(sys.platform.encode("ascii"))
         digest.update(platform.machine().lower().encode("ascii", errors="ignore"))
         digest.update(f"{sys.version_info.major}.{sys.version_info.minor}".encode("ascii"))
-        for path in (
-            self.runtime_requirements_path,
-            AI_COMMON_REQUIREMENTS_PATH,
-            AI_PATCH_PATH,
-            AI_COLOR_PATCH_PATH,
-        ):
+        paths = (
+            (AI_SWIFTVR_REQUIREMENTS_PATH, AI_SWIFTVR_RUNNER_PATH)
+            if model_id == SWIFTVR_5B_BF16_ID
+            else (
+                self.runtime_requirements_path,
+                AI_COMMON_REQUIREMENTS_PATH,
+                AI_PATCH_PATH,
+                AI_COLOR_PATCH_PATH,
+            )
+        )
+        for path in paths:
             try:
                 digest.update(path.read_bytes())
             except OSError:
                 return "missing"
         return digest.hexdigest()
 
-    def _runtime_installed(self) -> bool:
-        if not self.venv_python.is_file() or not (self.code_root / "inference_cli.py").is_file():
+    def _runtime_installed(self, model_id: str = DEFAULT_AI_MODEL_ID) -> bool:
+        python = self._venv_python_for(model_id)
+        if not python.is_file():
+            return False
+        if model_id == DEFAULT_AI_MODEL_ID and not (self.code_root / "inference_cli.py").is_file():
+            return False
+        if model_id == SWIFTVR_5B_BF16_ID and not AI_SWIFTVR_RUNNER_PATH.is_file():
             return False
         try:
-            marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
+            marker = json.loads(self._marker_path_for(model_id).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return False
+        if model_id == SWIFTVR_5B_BF16_ID:
+            return bool(
+                marker.get("fingerprint") == self._runtime_fingerprint(model_id)
+                and marker.get("runner_revision") == SWIFTVR_RUNTIME_VERSION
+                and marker.get("backend") == self.compute_backend
+                and marker.get("model_id") == model_id
+            )
         return bool(
             marker.get("fingerprint") == self._runtime_fingerprint()
             and marker.get("runner_revision") == RUNNER_REVISION
@@ -1034,9 +1131,19 @@ class AIEnhancementManager:
     def model_validation_cache_path(self) -> Path:
         return self.model_root / ".validation_cache.json"
 
-    def _model_validation_cache(self) -> dict[str, Any]:
+    def _model_validation_cache_path_for(self, model_id: str) -> Path:
+        if model_id == DEFAULT_AI_MODEL_ID:
+            return self.model_validation_cache_path
+        return self._model_root_for(model_id) / ".validation_cache.json"
+
+    def _model_validation_cache(
+        self,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> dict[str, Any]:
         try:
-            cache = json.loads(self.model_validation_cache_path.read_text(encoding="utf-8"))
+            cache = json.loads(
+                self._model_validation_cache_path_for(model_id).read_text(encoding="utf-8")
+            )
         except (OSError, json.JSONDecodeError):
             return {}
         return cache if isinstance(cache, dict) else {}
@@ -1064,10 +1171,11 @@ class AIEnhancementManager:
             and float(entry["mtime"]) == stat.st_mtime
         )
 
-    def _models_downloaded(self) -> bool:
-        cache = self._model_validation_cache()
-        for filename, size, sha256 in MODEL_FILES:
-            path = self.model_root / filename
+    def _models_downloaded(self, model_id: str = DEFAULT_AI_MODEL_ID) -> bool:
+        cache = self._model_validation_cache(model_id)
+        model_root = self._model_root_for(model_id)
+        for filename, size, sha256, _url in self._model_files_for(model_id):
+            path = model_root.joinpath(*PurePosixPath(filename).parts)
             if not self._model_cache_entry_matches(
                 path,
                 cache.get(filename),
@@ -1077,11 +1185,12 @@ class AIEnhancementManager:
                 return False
         return True
 
-    def _available_model_bytes(self) -> int:
-        cache = self._model_validation_cache()
+    def _available_model_bytes(self, model_id: str = DEFAULT_AI_MODEL_ID) -> int:
+        cache = self._model_validation_cache(model_id)
+        model_root = self._model_root_for(model_id)
         downloaded = 0
-        for filename, size, sha256 in MODEL_FILES:
-            path = self.model_root / filename
+        for filename, size, sha256, _url in self._model_files_for(model_id):
+            path = model_root.joinpath(*PurePosixPath(filename).parts)
             if self._model_cache_entry_matches(
                 path,
                 cache.get(filename),
@@ -1098,20 +1207,29 @@ class AIEnhancementManager:
             if not partial.is_symlink():
                 with contextlib.suppress(OSError):
                     downloaded += min(size, max(0, partial.stat().st_size))
-        return min(MODEL_DOWNLOAD_SIZE_BYTES, downloaded)
+        return min(self._model_total_bytes(model_id), downloaded)
 
-    def _required_runtime_free_bytes(self, *, runtime_installed: bool) -> int:
-        remaining_models = max(0, MODEL_DOWNLOAD_SIZE_BYTES - self._available_model_bytes())
+    def _required_runtime_free_bytes(
+        self,
+        *,
+        runtime_installed: bool,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> int:
+        total_bytes = self._model_total_bytes(model_id)
+        available_bytes = (
+            self._available_model_bytes()
+            if model_id == DEFAULT_AI_MODEL_ID
+            else self._available_model_bytes(model_id)
+        )
+        remaining_models = max(0, total_bytes - available_bytes)
         minimum_runtime_bytes = (
-            MINIMUM_CUDA_RUNTIME_FREE_BYTES
+            MINIMUM_SWIFTVR_RUNTIME_FREE_BYTES
+            if model_id == SWIFTVR_5B_BF16_ID
+            else MINIMUM_CUDA_RUNTIME_FREE_BYTES
             if self.compute_backend == "cuda"
             else MINIMUM_RUNTIME_FREE_BYTES
         )
-        runtime_install = (
-            0
-            if runtime_installed
-            else max(0, minimum_runtime_bytes - MODEL_DOWNLOAD_SIZE_BYTES)
-        )
+        runtime_install = 0 if runtime_installed else max(0, minimum_runtime_bytes - total_bytes)
         return max(MINIMUM_OUTPUT_FREE_BYTES, remaining_models + runtime_install)
 
     def _memory_bytes(self) -> int | None:
@@ -1132,14 +1250,25 @@ class AIEnhancementManager:
             return None
         return value if value > 0 else None
 
-    def runtime_status(self) -> dict[str, Any]:
-        installed = self.inference_runner is not None or self._runtime_installed()
-        models_downloaded = self.inference_runner is not None or self._models_downloaded()
+    def runtime_status(self, model_id: str = DEFAULT_AI_MODEL_ID) -> dict[str, Any]:
+        spec = get_ai_model(model_id)
+        model_id = spec.id
+        injected = self.inference_runner is not None and model_id == DEFAULT_AI_MODEL_ID
+        installed = injected or (
+            self._runtime_installed()
+            if model_id == DEFAULT_AI_MODEL_ID
+            else self._runtime_installed(model_id)
+        )
+        models_downloaded = injected or (
+            self._models_downloaded()
+            if model_id == DEFAULT_AI_MODEL_ID
+            else self._models_downloaded(model_id)
+        )
+        compatible, compatibility_reason = model_compatibility(spec, self.compute_backend)
         memory = self._memory_bytes()
         if not self.platform_supported:
             message = (
-                "未检测到 Apple Silicon MPS 或 NVIDIA GeForce RTX 5090。"
-                "基础剪辑功能仍可使用。"
+                "未检测到 Apple Silicon MPS 或 NVIDIA GeForce RTX 5090。基础剪辑功能仍可使用。"
             )
         elif not self.driver_supported:
             message = (
@@ -1150,9 +1279,7 @@ class AIEnhancementManager:
             message = "当前 FFmpeg 缺少 libx265，无法生成质量优先的 10-bit 成片。"
         elif not self.color_pipeline_available:
             detail = str(self.color_pipeline_error or "").lower()
-            if self.compute_backend == "mps" and (
-                "vulkan" in detail or "vk_error" in detail
-            ):
+            if self.compute_backend == "mps" and ("vulkan" in detail or "vk_error" in detail):
                 message = (
                     "当前 Mac 无法加载 Vulkan→Metal 驱动；请运行 "
                     "brew install molten-vk 后重新启动。"
@@ -1162,42 +1289,48 @@ class AIEnhancementManager:
                     "FFmpeg Full 的 AI 色彩链路检测失败。请重新运行启动脚本；"
                     f"检测详情：{self.color_pipeline_error or 'unknown error'}"
                 )
+        elif not compatible:
+            message = compatibility_reason or f"{spec.name} 与当前设备不兼容。"
         elif installed and models_downloaded:
-            message = f"SeedVR2 3B FP16 与 {self.backend_label} 运行环境已就绪。"
+            message = f"{spec.name} 与 {self.backend_label} 运行环境已就绪。"
         elif installed:
-            message = f"首次处理会下载约 {FIRST_MODEL_DOWNLOAD_GB:.1f} GB 的已校验模型。"
+            download_gb = spec.total_download_bytes / 1_000_000_000
+            message = f"尚需下载约 {download_gb:.1f} GB 的已校验模型。"
         elif models_downloaded:
-            message = (
-                f"SeedVR2 3B FP16 已校验，仍需安装固定版本的 {self.backend_label} "
-                "运行环境。"
-            )
+            message = f"{spec.name} 已校验，仍需安装固定版本的 {self.backend_label} 运行环境。"
         else:
             message = (
-                f"首次处理会自动安装独立 AI 环境，并下载约 {FIRST_MODEL_DOWNLOAD_GB:.1f} GB 模型。"
+                "需要安装独立 AI 环境，并下载约 "
+                f"{spec.total_download_bytes / 1_000_000_000:.1f} GB 模型。"
             )
+        ready = bool(
+            self.platform_supported
+            and self.driver_supported
+            and self.encoder_available
+            and self.color_pipeline_available
+            and compatible
+        )
         return {
-            "supported": self.platform_supported,
-            "ready": (
-                self.platform_supported
-                and self.driver_supported
-                and self.encoder_available
-                and self.color_pipeline_available
-            ),
-            "prepared": (
-                self.platform_supported
-                and self.driver_supported
-                and self.encoder_available
-                and self.color_pipeline_available
-                and installed
-                and models_downloaded
-            ),
+            "model_id": spec.id,
+            "supported": bool(self.platform_supported and compatible),
+            "compatible": compatible,
+            "compatibility_reason": compatibility_reason,
+            "ready": ready,
+            "prepared": bool(ready and installed and models_downloaded),
             "installed": installed,
             "models_downloaded": models_downloaded,
-            "model_name": MODEL_NAME,
-            "model_filename": MODEL_FILENAME,
-            "precision": "FP16",
-            "runner_version": RUNNER_VERSION,
-            "runner_revision": RUNNER_REVISION,
+            "downloaded": models_downloaded,
+            "model_name": spec.name,
+            "model_filename": spec.files[0].relative_path,
+            "precision": spec.precision,
+            "status": spec.status,
+            "runtime_kind": spec.runtime_kind,
+            "runner_version": (
+                SWIFTVR_RUNTIME_VERSION[:12] if model_id == SWIFTVR_5B_BF16_ID else RUNNER_VERSION
+            ),
+            "runner_revision": (
+                SWIFTVR_RUNTIME_VERSION if model_id == SWIFTVR_5B_BF16_ID else RUNNER_REVISION
+            ),
             "backend": self.compute_backend,
             "backend_label": self.backend_label,
             "device_name": self.device_name,
@@ -1216,9 +1349,12 @@ class AIEnhancementManager:
             "color_pipeline": "libplacebo + zscale, 16-bit sRGB / BT.2446A to BT.709 SDR",
             "color_pipeline_available": self.color_pipeline_available,
             "color_pipeline_error": self.color_pipeline_error,
-            "first_download_gb": FIRST_MODEL_DOWNLOAD_GB,
+            "first_download_gb": round(spec.total_download_bytes / 1_000_000_000, 1),
+            "download_size_bytes": self._model_total_bytes(model_id),
             "minimum_runtime_free_gb": (
-                MINIMUM_CUDA_RUNTIME_FREE_BYTES
+                MINIMUM_SWIFTVR_RUNTIME_FREE_BYTES
+                if model_id == SWIFTVR_5B_BF16_ID
+                else MINIMUM_CUDA_RUNTIME_FREE_BYTES
                 if self.compute_backend == "cuda"
                 else MINIMUM_RUNTIME_FREE_BYTES
             )
@@ -1238,22 +1374,35 @@ class AIEnhancementManager:
             return None
         return active
 
-    def _model_download_snapshot(self, job: AIModelDownloadJob | None) -> dict[str, Any]:
+    def _model_download_snapshot(
+        self,
+        job: AIModelDownloadJob | None,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> dict[str, Any]:
+        if job is not None:
+            model_id = job.model_id
+        spec = get_ai_model(model_id)
+        model_id = spec.id
+        total_bytes = self._model_total_bytes(model_id)
         snapshot = job.snapshot() if job is not None else None
-        runtime = self.runtime_status()
+        runtime = (
+            self.runtime_status()
+            if model_id == DEFAULT_AI_MODEL_ID
+            else self.runtime_status(model_id)
+        )
         models_downloaded = bool(runtime["models_downloaded"])
         prepared = bool(runtime["prepared"])
         runtime_unavailable = not bool(runtime["ready"])
         requires_runtime_update = bool(
-            not runtime_unavailable
-            and models_downloaded
-            and not bool(runtime["installed"])
+            not runtime_unavailable and models_downloaded and not bool(runtime["installed"])
         )
         if snapshot is None:
             downloaded_bytes = (
-                MODEL_DOWNLOAD_SIZE_BYTES
-                if self.inference_runner is not None
+                total_bytes
+                if self.inference_runner is not None and model_id == DEFAULT_AI_MODEL_ID
                 else self._available_model_bytes()
+                if model_id == DEFAULT_AI_MODEL_ID
+                else self._available_model_bytes(model_id)
             )
             resumable = downloaded_bytes > 0 and not models_downloaded
             initial_status = (
@@ -1272,13 +1421,9 @@ class AIEnhancementManager:
                 "operation": "ai_model_download",
                 "status": initial_status,
                 "stage": "setup" if requires_runtime_update else initial_status,
-                "progress": (
-                    100.0
-                    if prepared
-                    else round(downloaded_bytes / MODEL_DOWNLOAD_SIZE_BYTES * 98, 1)
-                ),
+                "progress": (100.0 if prepared else round(downloaded_bytes / total_bytes * 98, 1)),
                 "message": (
-                    f"SeedVR2 3B FP16 模型和 {self.backend_label} 运行环境已经就绪。"
+                    f"{spec.name} 模型和 {self.backend_label} 运行环境已经就绪。"
                     if prepared
                     else (
                         str(runtime["message"])
@@ -1296,14 +1441,19 @@ class AIEnhancementManager:
                 ),
                 "error": None,
                 "downloaded_bytes": downloaded_bytes,
-                "total_bytes": MODEL_DOWNLOAD_SIZE_BYTES,
+                "total_bytes": total_bytes,
                 "download_speed_bps": 0,
                 "elapsed_seconds": 0.0,
                 "estimated_remaining_seconds": 0.0 if prepared else None,
-                "model": MODEL_NAME,
+                "model_id": model_id,
+                "model": spec.name,
             }
         elif snapshot["status"] == "completed" and not prepared:
-            downloaded_bytes = self._available_model_bytes()
+            downloaded_bytes = (
+                self._available_model_bytes()
+                if model_id == DEFAULT_AI_MODEL_ID
+                else self._available_model_bytes(model_id)
+            )
             fallback_status = (
                 "unavailable"
                 if runtime_unavailable
@@ -1318,7 +1468,7 @@ class AIEnhancementManager:
                     "status": fallback_status,
                     "stage": "setup" if requires_runtime_update else fallback_status,
                     "progress": round(
-                        downloaded_bytes / MODEL_DOWNLOAD_SIZE_BYTES * 98,
+                        downloaded_bytes / total_bytes * 98,
                         1,
                     ),
                     "message": (
@@ -1342,6 +1492,7 @@ class AIEnhancementManager:
                 "prepared": prepared,
                 "requires_runtime_update": requires_runtime_update,
                 "runtime_unavailable": runtime_unavailable,
+                "model_id": model_id,
                 "model_name": runtime["model_name"],
                 "first_download_gb": runtime["first_download_gb"],
                 "runtime": runtime,
@@ -1349,16 +1500,59 @@ class AIEnhancementManager:
         )
         return snapshot
 
-    def model_download_status(self) -> dict[str, Any]:
+    def model_download_status(
+        self,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> dict[str, Any]:
+        model_id = get_ai_model(model_id).id
         with self._lock:
-            job = (
-                self._model_download_jobs.get(self._latest_model_download_job_id)
-                if self._latest_model_download_job_id is not None
-                else None
-            )
-        return self._model_download_snapshot(job)
+            latest_id = self._latest_model_download_job_ids.get(model_id)
+            if model_id == DEFAULT_AI_MODEL_ID and latest_id is None:
+                latest_id = self._latest_model_download_job_id
+            job = self._model_download_jobs.get(latest_id) if latest_id is not None else None
+        return self._model_download_snapshot(job, model_id)
 
-    def start_model_download(self) -> dict[str, Any]:
+    def model_catalog_status(self) -> dict[str, Any]:
+        models: list[dict[str, Any]] = []
+        for metadata in catalog_metadata(self.compute_backend):
+            model_id = str(metadata["id"])
+            snapshot = self.model_download_status(model_id)
+            runtime_value = snapshot["runtime"]
+            if not isinstance(runtime_value, dict):
+                raise RuntimeError("AI runtime metadata has an unexpected shape")
+            runtime: dict[str, Any] = runtime_value
+            runnable = bool(runtime["ready"])
+            compatibility_reason = metadata.get("compatibility_reason")
+            if not runnable and not compatibility_reason:
+                compatibility_reason = runtime["message"]
+            models.append(
+                {
+                    **metadata,
+                    "backend_compatible": bool(metadata["compatible"]),
+                    "compatible": runnable,
+                    "runnable": runnable,
+                    "compatibility_reason": compatibility_reason,
+                    "startup_prompt": bool(metadata["startup_prompt"] and runnable),
+                    "include_in_startup_prompt": bool(
+                        metadata["include_in_startup_prompt"] and runnable
+                    ),
+                    "downloaded": bool(runtime["models_downloaded"]),
+                    "partial_bytes": int(snapshot["downloaded_bytes"]),
+                    "prepared": bool(runtime["prepared"]),
+                    "installed": bool(runtime["installed"]),
+                    "download_status": snapshot["status"],
+                    "runtime": runtime,
+                }
+            )
+        return {"default_model_id": DEFAULT_AI_MODEL_ID, "models": models}
+
+    def start_model_download(
+        self,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> dict[str, Any]:
+        spec = get_ai_model(model_id)
+        model_id = spec.id
+        compatible, reason = model_compatibility(spec, self.compute_backend)
         if not self.platform_supported:
             raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
         if not self.driver_supported:
@@ -1367,47 +1561,78 @@ class AIEnhancementManager:
             raise MediaError("Required FFmpeg encoder is not available: libx265")
         if not self.color_pipeline_available:
             raise MediaError("Required FFmpeg color filters are not available")
+        if not compatible:
+            raise MediaError(reason or "The selected AI model is not compatible")
         with self._lock:
             active = self._active_job_locked()
             if isinstance(active, AIModelDownloadJob):
-                return self._model_download_snapshot(active)
+                if active.model_id == model_id:
+                    return self._model_download_snapshot(active, model_id)
+                raise MediaError("Another AI model download is already running")
             if active is not None:
                 raise MediaError("Another AI enhancement job is already running")
-            prepared = self.inference_runner is not None or (
-                self._runtime_installed() and self._models_downloaded()
+            prepared = (self.inference_runner is not None and model_id == DEFAULT_AI_MODEL_ID) or (
+                (
+                    self._runtime_installed()
+                    if model_id == DEFAULT_AI_MODEL_ID
+                    else self._runtime_installed(model_id)
+                )
+                and (
+                    self._models_downloaded()
+                    if model_id == DEFAULT_AI_MODEL_ID
+                    else self._models_downloaded(model_id)
+                )
             )
             if prepared:
-                latest = (
-                    self._model_download_jobs.get(self._latest_model_download_job_id)
-                    if self._latest_model_download_job_id is not None
-                    else None
-                )
+                latest_id = self._latest_model_download_job_ids.get(model_id)
+                if model_id == DEFAULT_AI_MODEL_ID and latest_id is None:
+                    latest_id = self._latest_model_download_job_id
+                latest = self._model_download_jobs.get(latest_id) if latest_id is not None else None
                 if latest is not None and latest.snapshot()["status"] == "completed":
-                    return self._model_download_snapshot(latest)
-                return self._model_download_snapshot(None)
+                    return self._model_download_snapshot(latest, model_id)
+                return self._model_download_snapshot(None, model_id)
             job = AIModelDownloadJob(
                 id=uuid.uuid4().hex,
-                downloaded_bytes=self._available_model_bytes(),
+                model_id=model_id,
+                downloaded_bytes=(
+                    self._available_model_bytes()
+                    if model_id == DEFAULT_AI_MODEL_ID
+                    else self._available_model_bytes(model_id)
+                ),
+                total_bytes=self._model_total_bytes(model_id),
             )
             self._model_download_jobs[job.id] = job
             self._active_job_id = job.id
-            self._latest_model_download_job_id = job.id
+            self._latest_model_download_job_ids[model_id] = job.id
+            if model_id == DEFAULT_AI_MODEL_ID:
+                self._latest_model_download_job_id = job.id
         worker = threading.Thread(target=self._run_model_download, args=(job,), daemon=True)
         job.worker = worker
         worker.start()
-        return self._model_download_snapshot(job)
+        return self._model_download_snapshot(job, model_id)
 
-    def cancel_model_download(self, job_id: str | None = None) -> dict[str, Any]:
+    def cancel_model_download(
+        self,
+        job_id: str | None = None,
+        *,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> dict[str, Any]:
+        model_id = get_ai_model(model_id).id
         with self._lock:
-            selected_id = job_id or self._latest_model_download_job_id
+            latest_id = self._latest_model_download_job_ids.get(model_id)
+            if model_id == DEFAULT_AI_MODEL_ID and latest_id is None:
+                latest_id = self._latest_model_download_job_id
+            selected_id = job_id or latest_id
             job = self._model_download_jobs.get(selected_id) if selected_id is not None else None
+            if job is not None and job.model_id != model_id:
+                job = None
         if job_id is not None and job is None:
             raise MediaError("AI model download job was not found")
         if job is None:
-            return self._model_download_snapshot(None)
+            return self._model_download_snapshot(None, model_id)
         with job.lock:
             if job.status not in {"queued", "running"}:
-                return self._model_download_snapshot(job)
+                return self._model_download_snapshot(job, model_id)
             job.cancel_event.set()
             process = job.process
             job.message = "正在停止 AI 模型下载；已下载部分会保留以便续传"
@@ -1418,7 +1643,7 @@ class AIEnhancementManager:
                 args=(process,),
                 daemon=True,
             ).start()
-        return self._model_download_snapshot(job)
+        return self._model_download_snapshot(job, model_id)
 
     def create(
         self,
@@ -1426,7 +1651,14 @@ class AIEnhancementManager:
         *,
         target: str,
         output_directory: Path,
+        model_id: str = DEFAULT_AI_MODEL_ID,
     ) -> AIEnhancementJob:
+        try:
+            spec = get_ai_model(model_id)
+        except KeyError as exc:
+            raise MediaError("Unknown AI enhancement model") from exc
+        model_id = spec.id
+        compatible, reason = model_compatibility(spec, self.compute_backend)
         if not self.platform_supported:
             raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
         if not self.driver_supported:
@@ -1435,6 +1667,16 @@ class AIEnhancementManager:
             raise MediaError("Required FFmpeg encoder is not available: libx265")
         if not self.color_pipeline_available:
             raise MediaError("Required FFmpeg color filters are not available")
+        if not compatible:
+            raise MediaError(reason or "The selected AI model is not compatible")
+        normalized_target = str(target).strip().lower()
+        if normalized_target not in spec.supported_targets:
+            supported = "、".join(spec.supported_targets)
+            raise MediaError(f"{spec.name} 当前仅支持 {supported} 输出。")
+        if model_id != DEFAULT_AI_MODEL_ID and not (
+            self._runtime_installed(model_id) and self._models_downloaded(model_id)
+        ):
+            raise MediaError(f"请先在模型管理中下载并准备 {spec.name}。")
         validated_target = validate_ai_source(source, target)
         directory = output_directory.expanduser().resolve()
         if not directory.is_dir():
@@ -1466,6 +1708,7 @@ class AIEnhancementManager:
             validated_target.id,
             suffix=suffix,
             tone_mapped=color_plan.mode == "tone_map_hdr",
+            model_id=model_id,
         )
         destination = available_output_path(directory, desired_name)
         job = AIEnhancementJob(
@@ -1475,6 +1718,7 @@ class AIEnhancementManager:
             output_path=destination,
             expected_width=expected_width,
             expected_height=expected_height,
+            model_id=model_id,
         )
         with self._lock:
             if self._active_job_locked() is not None:
@@ -1518,7 +1762,7 @@ class AIEnhancementManager:
                 self.cancel(job.id)
         for job in model_download_jobs:
             if job.snapshot()["status"] in {"queued", "running"}:
-                self.cancel_model_download()
+                self.cancel_model_download(job.id, model_id=job.model_id)
         deadline = time.monotonic() + 10
         for job in [*jobs, *model_download_jobs]:
             worker = job.worker
@@ -1612,36 +1856,72 @@ class AIEnhancementManager:
                 transferred = max(0, job.downloaded_bytes - job.network_start_bytes)
                 job.download_speed_bps = transferred / elapsed
 
-    def _remove_model_cache_entry(self, filename: str) -> None:
-        cache = self._model_validation_cache()
+    def _remove_model_cache_entry(
+        self,
+        filename: str,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> None:
+        cache = self._model_validation_cache(model_id)
         if filename not in cache:
             return
         cache.pop(filename, None)
-        self._write_model_validation_cache(cache)
+        self._write_model_validation_cache(cache, model_id)
 
-    def _write_model_validation_cache(self, cache: dict[str, Any]) -> None:
-        self.model_root.mkdir(parents=True, exist_ok=True)
-        temporary = self.model_validation_cache_path.with_name(
-            f".{self.model_validation_cache_path.name}.{uuid.uuid4().hex}.tmp"
-        )
+    def _write_model_validation_cache(
+        self,
+        cache: dict[str, Any],
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> None:
+        model_root = self._model_root_for(model_id)
+        cache_path = self._model_validation_cache_path_for(model_id)
+        model_root.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_name(f".{cache_path.name}.{uuid.uuid4().hex}.tmp")
         try:
             temporary.write_text(
                 json.dumps(cache, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
             )
-            os.replace(temporary, self.model_validation_cache_path)
+            os.replace(temporary, cache_path)
         finally:
             temporary.unlink(missing_ok=True)
 
-    def _record_validated_model(self, path: Path, sha256: str) -> None:
+    def _record_validated_model(
+        self,
+        path: Path,
+        sha256: str,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> None:
         stat = path.stat()
-        cache = self._model_validation_cache()
-        cache[path.name] = {
+        model_root = self._model_root_for(model_id)
+        try:
+            cache_key = path.resolve().relative_to(model_root.resolve()).as_posix()
+        except ValueError as exc:
+            raise MediaError("The AI model file is outside its isolated directory") from exc
+        cache = self._model_validation_cache(model_id)
+        cache[cache_key] = {
             "size": stat.st_size,
             "mtime": stat.st_mtime,
             "hash": sha256,
         }
-        self._write_model_validation_cache(cache)
+        self._write_model_validation_cache(cache, model_id)
+
+    def _model_destination(self, model_id: str, filename: str) -> Path:
+        relative = PurePosixPath(filename)
+        if not filename or relative.is_absolute() or ".." in relative.parts or "\\" in filename:
+            raise MediaError("The AI model catalog contains an unsafe file path")
+        root = self._model_root_for(model_id)
+        if root.is_symlink():
+            raise MediaError("The AI model directory must not be a symbolic link")
+        destination = root.joinpath(*relative.parts)
+        current = root
+        for part in relative.parts[:-1]:
+            current = current / part
+            if current.is_symlink():
+                raise MediaError("The AI model directory contains an unsafe symbolic link")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if root.resolve() not in destination.resolve().parents:
+            raise MediaError("The AI model catalog contains an unsafe file path")
+        return destination
 
     @staticmethod
     def _model_file_sha256(job: AIWorkerJob, path: Path) -> str:
@@ -1663,8 +1943,10 @@ class AIEnhancementManager:
         filename: str,
         expected_size: int,
         completed_bytes: int,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+        download_url: str | None = None,
     ) -> Path:
-        destination = self.model_root / filename
+        destination = self._model_destination(model_id, filename)
         partial = destination.with_suffix(destination.suffix + ".download")
         try:
             existing = partial.stat().st_size
@@ -1675,7 +1957,8 @@ class AIEnhancementManager:
             existing = 0
 
         request = Request(
-            MODEL_DOWNLOAD_URL.format(repository=MODEL_REPOSITORY, filename=filename),
+            download_url
+            or MODEL_DOWNLOAD_URL.format(repository=MODEL_REPOSITORY, filename=filename),
             headers={
                 "User-Agent": "local-video-cutter-ai-model",
                 **({"Range": f"bytes={existing}-"} if existing else {}),
@@ -1734,9 +2017,11 @@ class AIEnhancementManager:
         expected_size: int,
         expected_sha256: str,
         completed_bytes: int,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+        download_url: str | None = None,
     ) -> None:
-        destination = self.model_root / filename
-        cache = self._model_validation_cache()
+        destination = self._model_destination(model_id, filename)
+        cache = self._model_validation_cache(model_id)
         if self._model_cache_entry_matches(
             destination,
             cache.get(filename),
@@ -1756,11 +2041,11 @@ class AIEnhancementManager:
                 destination.stat().st_size == expected_size
                 and self._model_file_sha256(job, destination) == expected_sha256
             ):
-                self._record_validated_model(destination, expected_sha256)
+                self._record_validated_model(destination, expected_sha256, model_id)
                 self._set_model_download_bytes(job, completed_bytes + expected_size)
                 return
         destination.unlink(missing_ok=True)
-        self._remove_model_cache_entry(filename)
+        self._remove_model_cache_entry(filename, model_id)
 
         integrity_failure = False
         partial = destination.with_suffix(destination.suffix + ".download")
@@ -1775,7 +2060,7 @@ class AIEnhancementManager:
             self._set_model_download_bytes(job, completed_bytes + expected_size)
             if self._model_file_sha256(job, partial) == expected_sha256:
                 os.replace(partial, destination)
-                self._record_validated_model(destination, expected_sha256)
+                self._record_validated_model(destination, expected_sha256, model_id)
                 return
             integrity_failure = True
             partial.unlink(missing_ok=True)
@@ -1786,7 +2071,7 @@ class AIEnhancementManager:
                 job,
                 stage="download",
                 message=(
-                    f"正在下载 {MODEL_NAME}：{filename}"
+                    f"正在下载 {get_ai_model(job.model_id).name}：{filename}"
                     if attempt == 0
                     else f"正在重试下载 {filename}（第 {attempt + 1} 次）"
                 ),
@@ -1797,6 +2082,8 @@ class AIEnhancementManager:
                     filename=filename,
                     expected_size=expected_size,
                     completed_bytes=completed_bytes,
+                    model_id=model_id,
+                    download_url=download_url,
                 )
             except InterruptedError:
                 raise
@@ -1841,7 +2128,7 @@ class AIEnhancementManager:
                     continue
                 break
             os.replace(partial, destination)
-            self._record_validated_model(destination, expected_sha256)
+            self._record_validated_model(destination, expected_sha256, model_id)
             self._set_model_download_bytes(job, completed_bytes + expected_size)
             return
 
@@ -1852,22 +2139,28 @@ class AIEnhancementManager:
         raise MediaError("Could not download the pinned AI model")
 
     def _download_models(self, job: AIModelDownloadJob) -> None:
-        self.model_root.mkdir(parents=True, exist_ok=True)
+        model_root = self._model_root_for(job.model_id)
+        model_root.mkdir(parents=True, exist_ok=True)
         completed_bytes = 0
-        for filename, expected_size, expected_sha256 in MODEL_FILES:
+        for filename, expected_size, expected_sha256, download_url in self._model_files_for(
+            job.model_id
+        ):
             self._download_model_file(
                 job,
                 filename=filename,
                 expected_size=expected_size,
                 expected_sha256=expected_sha256,
                 completed_bytes=completed_bytes,
+                model_id=job.model_id,
+                download_url=download_url,
             )
             completed_bytes += expected_size
 
     def _finalize_complete_model_partials(self, job: AIWorkerJob) -> None:
-        self.model_root.mkdir(parents=True, exist_ok=True)
-        for filename, expected_size, expected_sha256 in MODEL_FILES:
-            destination = self.model_root / filename
+        model_root = self._model_root_for(job.model_id)
+        model_root.mkdir(parents=True, exist_ok=True)
+        for filename, expected_size, expected_sha256, _url in self._model_files_for(job.model_id):
+            destination = self._model_destination(job.model_id, filename)
             partial = destination.with_suffix(destination.suffix + ".download")
             if partial.is_symlink():
                 partial.unlink(missing_ok=True)
@@ -1891,11 +2184,11 @@ class AIEnhancementManager:
                 partial.unlink(missing_ok=True)
                 continue
             os.replace(partial, destination)
-            self._record_validated_model(destination, expected_sha256)
+            self._record_validated_model(destination, expected_sha256, job.model_id)
 
     def _verify_all_models(self, job: AIModelDownloadJob) -> None:
-        for filename, expected_size, expected_sha256 in MODEL_FILES:
-            path = self.model_root / filename
+        for filename, expected_size, expected_sha256, _url in self._model_files_for(job.model_id):
+            path = self._model_destination(job.model_id, filename)
             self._set_job(
                 job,
                 stage="verify",
@@ -1915,18 +2208,19 @@ class AIEnhancementManager:
                 valid = False
             if not valid:
                 path.unlink(missing_ok=True)
-                self._remove_model_cache_entry(filename)
+                self._remove_model_cache_entry(filename, job.model_id)
                 raise MediaError("The downloaded AI model failed integrity verification")
-            self._record_validated_model(path, expected_sha256)
+            self._record_validated_model(path, expected_sha256, job.model_id)
 
     def _run_model_download(self, job: AIModelDownloadJob) -> None:
+        spec = get_ai_model(job.model_id)
         try:
             if job.cancel_event.is_set():
                 raise InterruptedError
             with job.lock:
                 job.status = "running"
                 job.stage = "setup"
-                job.message = f"正在准备固定版本的 SeedVR2 {self.backend_label} 运行环境"
+                job.message = f"正在准备固定版本的 {spec.name} {self.backend_label} 运行环境"
                 job.started_at = time.time()
             self._prepare_runtime(job)
             if job.cancel_event.is_set():
@@ -1935,7 +2229,9 @@ class AIEnhancementManager:
                 job,
                 stage="download",
                 progress=8,
-                message=f"正在准备下载并校验约 {FIRST_MODEL_DOWNLOAD_GB:.1f} GB 模型",
+                message=(
+                    f"正在准备下载并校验约 {spec.total_download_bytes / 1_000_000_000:.1f} GB 模型"
+                ),
             )
             self._download_models(job)
             if job.cancel_event.is_set():
@@ -1947,7 +2243,12 @@ class AIEnhancementManager:
                 message="正在确认全部 AI 模型均已通过完整性校验",
             )
             self._verify_all_models(job)
-            if not self._models_downloaded():
+            models_downloaded = (
+                self._models_downloaded()
+                if job.model_id == DEFAULT_AI_MODEL_ID
+                else self._models_downloaded(job.model_id)
+            )
+            if not models_downloaded:
                 raise MediaError("The downloaded AI model failed integrity verification")
             with job.lock:
                 if job.cancel_event.is_set():
@@ -1956,7 +2257,7 @@ class AIEnhancementManager:
                 job.stage = "completed"
                 job.progress = 100.0
                 job.downloaded_bytes = job.total_bytes
-                job.message = f"{MODEL_NAME} 模型和 {self.backend_label} 运行环境已就绪"
+                job.message = f"{spec.name} 模型和 {self.backend_label} 运行环境已就绪"
                 job.finished_at = time.time()
         except InterruptedError:
             with job.lock:
@@ -2006,9 +2307,7 @@ class AIEnhancementManager:
                     append = existing > 0 and status == 206
                     if append:
                         content_range = str(response.headers.get("Content-Range") or "")
-                        match = re.fullmatch(
-                            r"bytes\s+(\d+)-(\d+)/(\d+)", content_range.strip()
-                        )
+                        match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", content_range.strip())
                         if match is None or int(match.group(1)) != existing:
                             partial.unlink(missing_ok=True)
                             raise URLError("invalid runtime download range response")
@@ -2237,9 +2536,27 @@ class AIEnhancementManager:
             env=self._inference_environment(python.parent),
         )
 
+    @staticmethod
+    def _swiftvr_runtime_probe_script() -> str:
+        return (
+            "import accelerate, decord, diffusers, numpy, safetensors, swiftvr, "
+            "torch, transformers; "
+            "from swiftvr import SwiftVRPipeline; "
+            "from swiftvr.io import ntchw_to_uint8_frames; "
+            "assert callable(getattr(SwiftVRPipeline, 'from_pretrained', None)), "
+            "'SwiftVRPipeline.from_pretrained is unavailable'; "
+            "assert callable(ntchw_to_uint8_frames), "
+            "'swiftvr.io.ntchw_to_uint8_frames is unavailable'"
+        )
+
     def _prepare_runtime(self, job: AIWorkerJob) -> None:
         if self.inference_runner is not None:
             return
+        if job.model_id == SWIFTVR_5B_BF16_ID:
+            self._prepare_swiftvr_runtime(job)
+            return
+        if job.model_id != DEFAULT_AI_MODEL_ID:
+            raise MediaError("The selected AI model runtime is not available")
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         runtime_installed = self._runtime_installed()
         required_free = self._required_runtime_free_bytes(runtime_installed=runtime_installed)
@@ -2369,6 +2686,97 @@ class AIEnhancementManager:
         if not self._runtime_installed():
             raise MediaError("The AI runtime did not pass its installation check")
 
+    def _prepare_swiftvr_runtime(self, job: AIWorkerJob) -> None:
+        model_id = SWIFTVR_5B_BF16_ID
+        runtime_root = self._runtime_root_for(model_id)
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        runtime_installed = self._runtime_installed(model_id)
+        required_free = self._required_runtime_free_bytes(
+            runtime_installed=runtime_installed,
+            model_id=model_id,
+        )
+        if shutil.disk_usage(runtime_root).free < required_free:
+            raise MediaError("There is not enough free space for the SwiftVR runtime and models")
+        if runtime_installed:
+            return
+        if not AI_SWIFTVR_REQUIREMENTS_PATH.is_file() or not AI_SWIFTVR_RUNNER_PATH.is_file():
+            raise MediaError("The bundled SwiftVR runtime files are missing")
+
+        staging = runtime_root / f"setup-{job.id}"
+        staging_venv = staging / "venv"
+        if staging.exists():
+            shutil.rmtree(staging)
+        try:
+            self._set_job(
+                job,
+                stage="setup",
+                progress=3,
+                message="正在创建独立的 SwiftVR CUDA 13.0 环境",
+            )
+            self._run_process(job, [self.base_python, "-m", "venv", str(staging_venv)])
+            python = (
+                staging_venv / "Scripts" / "python.exe"
+                if sys.platform == "win32"
+                else staging_venv / "bin" / "python"
+            )
+            self._set_job(
+                job,
+                stage="setup",
+                progress=5,
+                message="正在安装固定版本的 SwiftVR、PyTorch 与 CUDA 13.0 依赖",
+            )
+            self._run_process(
+                job,
+                [
+                    str(python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--no-input",
+                    "--no-cache-dir",
+                    "-r",
+                    str(AI_SWIFTVR_REQUIREMENTS_PATH),
+                ],
+            )
+            self._verify_compute_runtime(job, python)
+            self._run_process(
+                job,
+                [str(python), "-c", self._swiftvr_runtime_probe_script()],
+                env=self._inference_environment(python.parent),
+            )
+            self._run_process(
+                job,
+                [str(python), str(AI_SWIFTVR_RUNNER_PATH), "--help"],
+                env=self._inference_environment(python.parent),
+            )
+            installed_venv = self._venv_python_for(model_id).parent.parent
+            if installed_venv.exists():
+                shutil.rmtree(installed_venv)
+            os.replace(staging_venv, installed_venv)
+            self._marker_path_for(model_id).write_text(
+                json.dumps(
+                    {
+                        "fingerprint": self._runtime_fingerprint(model_id),
+                        "runner_revision": SWIFTVR_RUNTIME_VERSION,
+                        "backend": self.compute_backend,
+                        "backend_label": self.backend_label,
+                        "device_name": self.device_name,
+                        "model_id": model_id,
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+        if not self._runtime_installed(model_id):
+            raise MediaError("The SwiftVR runtime did not pass its installation check")
+
     def _quality_batch_size(self, target: AIResolutionTarget) -> int:
         if self.compute_backend == "cuda":
             # SeedVR2 recommends batch 21 for its 24 GB+ FP16 1080p path.
@@ -2388,6 +2796,57 @@ class AIEnhancementManager:
         input_path: Path,
         output_path: Path,
     ) -> list[str]:
+        if job.model_id == SWIFTVR_5B_BF16_ID:
+            frame_rate = _positive_fraction(job.input_frame_rate) or _source_frame_rate(
+                job.source.metadata
+            )
+            frame_count = job.input_frame_count or int(
+                job.source.metadata.get("video_frame_count") or 0
+            )
+            if frame_rate is None or frame_count <= 0:
+                raise MediaError("SwiftVR requires an exact frame rate and frame count")
+            metadata = job.source.metadata
+            color_plan = ai_input_color_plan(job.source)
+            if not color_plan.filter_graph:
+                raise MediaError("SwiftVR requires an explicit input color conversion")
+            return [
+                str(self._venv_python_for(job.model_id)),
+                "-u",
+                str(AI_SWIFTVR_RUNNER_PATH),
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--checkpoint",
+                str(self._model_root_for(job.model_id)),
+                "--resolution",
+                f"{job.expected_width}x{job.expected_height}",
+                "--fps",
+                f"{frame_rate.numerator}/{frame_rate.denominator}",
+                "--frame-count",
+                str(frame_count),
+                "--input-stream",
+                str(int(metadata["video_stream_index"])),
+                "--input-width",
+                str(int(metadata["width"])),
+                "--input-height",
+                str(int(metadata["height"])),
+                "--input-vf",
+                color_plan.filter_graph,
+                "--output-vf",
+                AI_OUTPUT_COLOR_FILTER_GRAPH,
+                "--ffmpeg",
+                self.ffmpeg,
+                "--clip-len",
+                "24",
+                "--dit-overlap",
+                "0",
+                "--device",
+                "cuda",
+                "--dtype",
+                "bfloat16",
+                "--attention-backend",
+                "sdpa",
+            ]
         batch_size = self._quality_batch_size(job.target)
         chunk_size = batch_size * 8 + 1
         command = [
@@ -2527,6 +2986,9 @@ class AIEnhancementManager:
             self.inference_runner(job, output_path)
             self._set_job(job, progress=90)
             return
+        if job.model_id == SWIFTVR_5B_BF16_ID:
+            self._run_swiftvr_inference(job, input_path, output_path)
+            return
 
         current_chunk = 0
         total_chunks = 0
@@ -2601,6 +3063,75 @@ class AIEnhancementManager:
             on_line=parse_line,
         )
         self._set_job(job, stage="inference", progress=90, message="AI 画面生成完成")
+
+    def _run_swiftvr_inference(
+        self,
+        job: AIEnhancementJob,
+        input_path: Path,
+        output_path: Path,
+    ) -> None:
+        if job.input_frame_count is None or not job.input_frame_rate:
+            raise MediaError("SwiftVR requires an exact frame timing audit")
+        color_plan = ai_input_color_plan(job.source)
+        self._set_job(
+            job,
+            stage="inference",
+            progress=18,
+            message=(
+                "正在实时转换 HDR 色彩并启动 SwiftVR 流式修复"
+                if color_plan.mode == "tone_map_hdr"
+                else "正在启动 SwiftVR 流式色彩转换、修复与 10-bit 编码"
+            ),
+        )
+
+        def parse_swiftvr_progress(line: str) -> None:
+            if not line.startswith("SWIFTVR_PROGRESS "):
+                return
+            try:
+                payload = json.loads(line.removeprefix("SWIFTVR_PROGRESS "))
+                percent = float(payload.get("percent") or 0)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return
+            stage = str(payload.get("stage") or "inference")
+            if stage == "model_load":
+                with job.lock:
+                    job.reported_eta_seconds = None
+                self._set_job(
+                    job,
+                    stage="inference",
+                    progress=20,
+                    message="正在将 SwiftVR 5B BF16 加载到 RTX 5090",
+                )
+                return
+            completed = max(0, int(payload.get("completed_frames") or 0))
+            total = max(1, int(payload.get("total_frames") or job.input_frame_count))
+            eta_value = payload.get("eta_seconds")
+            try:
+                reported_eta = float(eta_value) if eta_value is not None else None
+            except (TypeError, ValueError):
+                reported_eta = None
+            with job.lock:
+                job.reported_eta_seconds = (
+                    reported_eta
+                    if reported_eta is not None
+                    and math.isfinite(reported_eta)
+                    and reported_eta >= 0
+                    else None
+                )
+            self._set_job(
+                job,
+                stage="inference",
+                progress=20 + min(100.0, max(0.0, percent)) * 0.66,
+                message=f"SwiftVR 正在流式修复并编码：{completed}/{total}",
+            )
+
+        self._run_process(
+            job,
+            self.inference_command(job, input_path, output_path),
+            env=self._inference_environment(self._venv_python_for(job.model_id).parent),
+            on_line=parse_swiftvr_progress,
+        )
+        self._set_job(job, stage="inference", progress=90, message="SwiftVR AI 画面生成完成")
 
     def _remux_command(self, job: AIEnhancementJob, ai_video: Path, output: Path) -> list[str]:
         command = [
@@ -2829,8 +3360,7 @@ class AIEnhancementManager:
             "chroma_location": "left",
         }
         if any(
-            str(metadata.get(key) or "").lower() != value
-            for key, value in expected_color.items()
+            str(metadata.get(key) or "").lower() != value for key, value in expected_color.items()
         ):
             raise MediaError("AI output verification detected unexpected color metadata")
         if metadata.get("rotation") or metadata.get("display_matrix") is not None:
@@ -2910,6 +3440,7 @@ class AIEnhancementManager:
             raise MediaError("The AI runner unexpectedly added an audio stream")
 
     def _run(self, job: AIEnhancementJob) -> None:
+        model_name = get_ai_model(job.model_id).name
         work_directory: Path | None = None
         partial_output = job.output_path.with_name(
             f".{job.output_path.stem}.partial-{job.id}{job.output_path.suffix}"
@@ -2922,7 +3453,7 @@ class AIEnhancementManager:
                 started_at = time.time()
                 job.status = "running"
                 job.stage = "setup"
-                job.message = f"正在准备质量优先的 {self.backend_label} AI 环境"
+                job.message = f"正在准备 {model_name} 的 {self.backend_label} AI 环境"
                 job.started_at = started_at
                 job.stage_started_at = started_at
             self._audit_frame_timing(job)
@@ -2974,7 +3505,7 @@ class AIEnhancementManager:
                 job.status = "completed"
                 job.stage = "completed"
                 job.progress = 100.0
-                job.message = f"{MODEL_NAME} {job.target.label} AI 超清完成，原音轨未重压"
+                job.message = f"{model_name} {job.target.label} AI 超清完成，原音轨未重压"
                 job.finished_at = time.time()
             published = None
         except InterruptedError:

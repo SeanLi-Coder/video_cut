@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .ai_enhance import AIEnhancementManager, ai_target_options
+from .ai_models import DEFAULT_AI_MODEL_ID
 from .build_info import APP_ID, APP_NAME, APP_VERSION
 from .dialogs import DialogError, select_output_directory, select_video_file
 from .media import (
@@ -75,12 +76,13 @@ class AIEnhancementRequest(BaseModel):
 
     video_id: str
     target: Literal["1080p", "2k", "4k"]
+    model_id: str = DEFAULT_AI_MODEL_ID
 
 
 class AIModelDownloadCancelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    job_id: str
+    job_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -174,7 +176,11 @@ def _user_media_error(exc: MediaError) -> str:
             "RTX 5090 的 CUDA 13.0 环境需要 NVIDIA R580 或更高版本驱动。"
         ),
         "Another AI enhancement job is already running": "一次只能运行一个 AI 模型下载或超清任务。",
+        "Another AI model download is already running": (
+            "另一个 AI 模型正在准备，请等待完成或先取消。"
+        ),
         "AI enhancement job was not found": "找不到这次 AI 超清任务，请刷新页面后重试。",
+        "Unknown AI enhancement model": "没有找到所选 AI 模型，请刷新页面后重试。",
         "AI enhancement requires baked-in video orientation": (
             "该视频仍带旋转标记，请先用“永久旋转”固化方向，再进行 AI 超清。"
         ),
@@ -215,6 +221,9 @@ def _user_media_error(exc: MediaError) -> str:
         "There is not enough free space for the AI runtime and models": (
             "AI 环境和模型约需 12–18 GB 可用空间，请清理项目所在磁盘后重试。"
         ),
+        "There is not enough free space for the SwiftVR runtime and models": (
+            "SwiftVR 环境和模型需要约 36 GB 可用空间，请清理项目所在磁盘后重试。"
+        ),
         "Could not download the pinned AI runtime": (
             "无法下载固定版本的 AI 运行器，请检查网络后重试。"
         ),
@@ -227,13 +236,14 @@ def _user_media_error(exc: MediaError) -> str:
         "The downloaded AI model failed integrity verification": (
             "AI 模型完整性校验失败，异常文件已删除，请重新下载。"
         ),
-        "AI model download job was not found": (
-            "找不到这次 AI 模型下载任务，请刷新页面后重试。"
-        ),
+        "AI model download job was not found": ("找不到这次 AI 模型下载任务，请刷新页面后重试。"),
         "The bundled AI quality patch failed integrity verification": (
             "内置 AI 质量补丁校验失败，请重新下载本项目。"
         ),
         "The bundled AI runtime files are missing": "AI 运行文件不完整，请重新下载本项目。",
+        "The bundled SwiftVR runtime files are missing": (
+            "SwiftVR 运行文件不完整，请重新下载本项目。"
+        ),
         "The AI runtime archive contains an unsafe path": (
             "AI 运行器压缩包包含异常路径，已停止安装。"
         ),
@@ -242,6 +252,21 @@ def _user_media_error(exc: MediaError) -> str:
         ),
         "The AI runtime did not pass its installation check": (
             "AI 运行环境安装后未通过完整检查，请检查网络和磁盘空间后重试。"
+        ),
+        "The SwiftVR runtime did not pass its installation check": (
+            "SwiftVR 运行环境安装后未通过完整检查，请检查驱动、网络和磁盘空间后重试。"
+        ),
+        "The selected AI model runtime is not available": (
+            "所选 AI 模型的运行环境暂不可用，请到模型管理重新准备。"
+        ),
+        "SwiftVR requires an exact frame rate and frame count": (
+            "无法确认原片的准确帧率和帧数，SwiftVR 已停止以避免音画不同步。"
+        ),
+        "SwiftVR requires an explicit input color conversion": (
+            "无法为原片建立安全的色彩转换链路，SwiftVR 已停止以避免改变颜色。"
+        ),
+        "SwiftVR requires an exact frame timing audit": (
+            "无法完整核对原片逐帧时间，SwiftVR 已停止以避免丢帧或音画不同步。"
         ),
         "The AI runner did not create an output video": "AI 没有生成有效成片，请重试。",
         "The AI runner unexpectedly added an audio stream": (
@@ -620,6 +645,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "rotation_ready": state.rotations is not None,
             "ai_enhance_ready": bool(ai_runtime["ready"]),
             "ai_runtime": ai_runtime,
+            "default_ai_model_id": DEFAULT_AI_MODEL_ID,
             "max_frame_seconds": MAX_FRAME_EXTRACTION_SECONDS,
             "output_directory": _display_path(directory) if directory else None,
         }
@@ -640,8 +666,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "video": _video_payload(
                 source,
                 color_pipeline_available=bool(
-                    state.ai_enhancements
-                    and state.ai_enhancements.color_pipeline_available
+                    state.ai_enhancements and state.ai_enhancements.color_pipeline_available
                 ),
             ),
             "suggested_start": format_timecode(0),
@@ -745,9 +770,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         command.extend(["-i", str(spec.source.path), "-t", f"{spec.end - spec.start:.6f}"])
         command.extend(["-map", f"0:{spec.source.metadata['video_stream_index']}"])
         audio_stream_index = (
-            spec.source.metadata.get("audio_stream_index")
-            if spec.operation == "clip"
-            else None
+            spec.source.metadata.get("audio_stream_index") if spec.operation == "clip" else None
         )
         if audio_stream_index is not None:
             command.extend(["-map", f"0:{audio_stream_index}"])
@@ -882,10 +905,71 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
                 source,
                 target=request.target,
                 output_directory=output_directory,
+                model_id=request.model_id,
             )
         except MediaError as exc:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
         return {"job_id": job.id, "output_name": job.output_path.name}
+
+    @app.get("/api/ai-models", dependencies=[Depends(require_app_token)])
+    def ai_models() -> dict[str, Any]:
+        if state.ai_enhancements is None:
+            raise HTTPException(status_code=503, detail="AI 超清尚未就绪。")
+        return state.ai_enhancements.model_catalog_status()
+
+    @app.get(
+        "/api/ai-models/{model_id}/download",
+        dependencies=[Depends(require_app_token)],
+    )
+    def ai_model_download_status_for_model(model_id: str) -> dict[str, Any]:
+        try:
+            if state.ai_enhancements is None:
+                raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
+            snapshot = state.ai_enhancements.model_download_status(model_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="没有找到这个 AI 模型。") from exc
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
+        if snapshot.get("error"):
+            snapshot["error"] = _user_media_error(MediaError(str(snapshot["error"])))
+        return snapshot
+
+    @app.post(
+        "/api/ai-models/{model_id}/download",
+        dependencies=[Depends(require_app_token)],
+    )
+    def start_ai_model_download_for_model(model_id: str) -> dict[str, Any]:
+        try:
+            if state.ai_enhancements is None:
+                raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
+            return state.ai_enhancements.start_model_download(model_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="没有找到这个 AI 模型。") from exc
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
+
+    @app.post(
+        "/api/ai-models/{model_id}/download/cancel",
+        dependencies=[Depends(require_app_token)],
+    )
+    def cancel_ai_model_download_for_model(
+        model_id: str,
+        request: AIModelDownloadCancelRequest | None = None,
+    ) -> dict[str, Any]:
+        try:
+            if state.ai_enhancements is None:
+                raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
+            snapshot = state.ai_enhancements.cancel_model_download(
+                request.job_id if request is not None else None,
+                model_id=model_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="没有找到这个 AI 模型。") from exc
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
+        if snapshot.get("error"):
+            snapshot["error"] = _user_media_error(MediaError(str(snapshot["error"])))
+        return snapshot
 
     @app.get("/api/ai-model-download", dependencies=[Depends(require_app_token)])
     def ai_model_download_status() -> dict[str, Any]:
@@ -909,11 +993,15 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         "/api/ai-model-download/cancel",
         dependencies=[Depends(require_app_token)],
     )
-    def cancel_ai_model_download(request: AIModelDownloadCancelRequest) -> dict[str, Any]:
+    def cancel_ai_model_download(
+        request: AIModelDownloadCancelRequest | None = None,
+    ) -> dict[str, Any]:
         try:
             if state.ai_enhancements is None:
                 raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
-            snapshot = state.ai_enhancements.cancel_model_download(request.job_id)
+            snapshot = state.ai_enhancements.cancel_model_download(
+                request.job_id if request is not None else None
+            )
         except MediaError as exc:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
         if snapshot.get("error"):

@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.10.0+cu130
+torchvision==0.25.0+cu130
+diffusers==0.36.0
+transformers==5.2.0
+accelerate==1.12.0
+safetensors==0.7.0
+numpy==1.26.0
+pillow==11.3.0
+einops==0.8.2
+decord==0.6.0
+imageio==2.37.2
+imageio-ffmpeg==0.6.0
+swiftvr @ https://github.com/H-oliday/SwiftVR/archive/5ca168cef6ca7200f135fdfea85e5e13d12c5b53.zip#sha256=5ce4f16eee92b064eaaff058cdcd7d3956ee92240d84bd5d98585efd38cc6639

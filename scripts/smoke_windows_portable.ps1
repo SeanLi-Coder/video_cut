@@ -25,10 +25,24 @@ $PortableRoot = $Executable.Directory.FullName
 $RuntimePath = Join-Path $PortableRoot "data\runtime\runtime.json"
 $LauncherProcess = $null
 
+$RequiredPortableFiles = @(
+    "launcher_models.py",
+    "app\ai_models.py",
+    "vendor\swiftvr_runner.py",
+    "vendor\SWIFTVR_LICENSE.txt",
+    "requirements-ai-swiftvr-cuda.txt"
+)
+foreach ($RelativePath in $RequiredPortableFiles) {
+    $RequiredPath = Join-Path $PortableRoot $RelativePath
+    if (-not (Test-Path $RequiredPath -PathType Leaf)) {
+        throw "Required portable package file is missing: $RelativePath"
+    }
+}
+
 try {
     $LauncherProcess = Start-Process `
         -FilePath $Executable.FullName `
-        -ArgumentList @("--no-browser", "--port", "18777") `
+        -ArgumentList @("--no-browser", "--skip-model-prompt", "--port", "18777") `
         -WorkingDirectory $PortableRoot `
         -RedirectStandardOutput $StandardOutput `
         -RedirectStandardError $StandardError `
@@ -85,6 +99,43 @@ try {
     $Bootstrap = Invoke-RestMethod `
         -Uri "http://127.0.0.1:$Port/api/bootstrap" `
         -TimeoutSec 10
+    if (-not $Bootstrap.app_token) {
+        throw "The packaged application did not provide an application token"
+    }
+
+    $ModelCatalog = Invoke-RestMethod `
+        -Uri "http://127.0.0.1:$Port/api/ai-models" `
+        -Headers @{ "X-App-Token" = [string]$Bootstrap.app_token } `
+        -TimeoutSec 10
+    $Models = @($ModelCatalog.models)
+    $ExpectedModelIds = @(
+        "seedvr2-3b-fp16",
+        "swiftvr-5b-bf16",
+        "flashvsr-v1-1-full"
+    )
+    foreach ($ExpectedModelId in $ExpectedModelIds) {
+        $ModelMatches = @($Models | Where-Object { $_.id -eq $ExpectedModelId })
+        if ($ModelMatches.Count -ne 1) {
+            throw "The packaged AI model catalog is missing or duplicated: $ExpectedModelId"
+        }
+    }
+
+    $SwiftModel = $Models | Where-Object { $_.id -eq "swiftvr-5b-bf16" }
+    $SwiftTargets = @($SwiftModel.supported_targets)
+    if ($SwiftTargets.Count -ne 1 -or [string]$SwiftTargets[0] -ne "1080p") {
+        throw "SwiftVR must expose only the 1080p target in this release"
+    }
+
+    $FlashModel = $Models | Where-Object { $_.id -eq "flashvsr-v1-1-full" }
+    if (
+        $FlashModel.status -ne "blocked" -or
+        -not [bool]$FlashModel.blocked -or
+        [bool]$FlashModel.startup_prompt -or
+        [bool]$FlashModel.include_in_startup_prompt
+    ) {
+        throw "FlashVSR must remain blocked and excluded from startup prompts"
+    }
+
     if (-not $Bootstrap.ai_runtime.encoder_available) {
         throw "FFmpeg Full did not expose the required libx265 encoder"
     }
