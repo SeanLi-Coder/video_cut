@@ -44,6 +44,44 @@ def _manager(
     )
 
 
+def _restartable_manager(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> AIEnhancementManager:
+    manager = _manager(tmp_path, ffmpeg, ffprobe)
+    manager.inference_runner = None
+    manager._model_cleanup_disk_free_bytes = lambda: 1 << 60
+    return manager
+
+
+def _model_artifact_path(manager: AIEnhancementManager, model_id: str) -> Path:
+    filename = manager._model_files_for(model_id)[0][0]
+    return manager._model_destination(model_id, filename)
+
+
+def _register_running_download(
+    manager: AIEnhancementManager,
+    model_id: str,
+    *,
+    job_id: str = "active-download",
+) -> AIModelDownloadJob:
+    job = AIModelDownloadJob(
+        id=job_id,
+        model_id=model_id,
+        status="running",
+        stage="download",
+        downloaded_bytes=1,
+        total_bytes=manager._model_total_bytes(model_id),
+    )
+    manager._model_download_jobs[job.id] = job
+    manager._active_job_id = job.id
+    manager._latest_model_download_job_ids[model_id] = job.id
+    if model_id == DEFAULT_AI_MODEL_ID:
+        manager._latest_model_download_job_id = job.id
+    return job
+
+
 def _source(path: Path, ffprobe: str) -> VideoSource:
     return VideoSource(id="video", path=path, metadata=probe_video(path, ffprobe=ffprobe))
 
@@ -66,6 +104,14 @@ def _source(path: Path, ffprobe: str) -> VideoSource:
         (
             "SwiftVR requires an exact frame timing audit",
             "无法完整核对原片逐帧时间，SwiftVR 已停止以避免丢帧或音画不同步。",
+        ),
+        (
+            "The AI model directory contains an unsafe symbolic link",
+            "AI 模型目录包含不安全的链接，已停止操作且没有删除链接目标。",
+        ),
+        (
+            "The AI model directory contains an unsafe path",
+            "AI 模型目录结构异常，已停止操作以避免误删数据。",
         ),
     ],
 )
@@ -120,6 +166,395 @@ def test_swiftvr_partial_download_is_isolated_and_counts_nested_paths(
     assert snapshot["downloaded_bytes"] == len(b"partial")
     assert snapshot["status"] == "cancelled"
     assert snapshot["total_bytes"] > 20_000_000_000
+
+
+@pytest.mark.parametrize(
+    ("model_id", "other_model_id"),
+    [
+        (DEFAULT_AI_MODEL_ID, SWIFTVR_5B_BF16_ID),
+        (SWIFTVR_5B_BF16_ID, DEFAULT_AI_MODEL_ID),
+    ],
+)
+def test_restart_download_removes_only_selected_model_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+    model_id: str,
+    other_model_id: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    selected_paths: list[Path] = []
+    for filename, _size, _sha256, _url in manager._model_files_for(model_id):
+        destination = manager._model_destination(model_id, filename)
+        destination.write_bytes(b"selected-final")
+        partial = destination.with_suffix(destination.suffix + ".download")
+        partial.write_bytes(b"selected-partial")
+        selected_paths.extend((destination, partial))
+
+    selected_root = manager._model_root_for(model_id)
+    cache = manager._model_validation_cache_path_for(model_id)
+    cache.write_text('{"stale": true}\n', encoding="utf-8")
+    unknown = selected_root / "keep-unknown.bin"
+    unknown.write_bytes(b"keep unknown")
+    nested_unknown = selected_root / "transformer" / "keep-unknown.bin"
+    nested_unknown.parent.mkdir(parents=True, exist_ok=True)
+    nested_unknown.write_bytes(b"keep nested unknown")
+
+    runtime_root = manager._runtime_root_for(model_id)
+    runtime_marker = runtime_root / "runtime.json"
+    runtime_marker.parent.mkdir(parents=True, exist_ok=True)
+    runtime_marker.write_bytes(b"keep runtime marker")
+    runtime_file = runtime_root / "venv" / "keep-runtime.bin"
+    runtime_file.parent.mkdir(parents=True, exist_ok=True)
+    runtime_file.write_bytes(b"keep runtime")
+
+    other_destination = _model_artifact_path(manager, other_model_id)
+    other_destination.write_bytes(b"keep other final")
+    other_partial = other_destination.with_suffix(other_destination.suffix + ".download")
+    other_partial.write_bytes(b"keep other partial")
+    other_cache = manager._model_validation_cache_path_for(other_model_id)
+    other_cache.write_text('{"keep": true}\n', encoding="utf-8")
+
+    monkeypatch.setattr(manager, "_run_model_download", lambda _job: None)
+
+    snapshot = manager.start_model_download(model_id, restart=True)
+
+    job = manager._model_download_jobs[snapshot["job_id"]]
+    assert job.worker is not None
+    job.worker.join(timeout=2)
+    assert snapshot["model_id"] == model_id
+    assert snapshot["downloaded_bytes"] == 0
+    assert snapshot["already_running"] is False
+    assert all(not path.exists() for path in selected_paths)
+    assert not cache.exists()
+    assert unknown.read_bytes() == b"keep unknown"
+    assert nested_unknown.read_bytes() == b"keep nested unknown"
+    assert runtime_marker.read_bytes() == b"keep runtime marker"
+    assert runtime_file.read_bytes() == b"keep runtime"
+    assert other_destination.read_bytes() == b"keep other final"
+    assert other_partial.read_bytes() == b"keep other partial"
+    assert other_cache.read_text(encoding="utf-8") == '{"keep": true}\n'
+
+
+def test_restart_download_returns_active_same_model_without_deleting(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    artifact.write_bytes(b"must remain")
+    active = _register_running_download(manager, SWIFTVR_5B_BF16_ID)
+
+    snapshot = manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    assert snapshot["job_id"] == active.id
+    assert snapshot["already_running"] is True
+    assert artifact.read_bytes() == b"must remain"
+    assert len(manager._model_download_jobs) == 1
+
+
+def test_restart_download_is_noop_when_model_is_already_prepared(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    artifact.write_bytes(b"verified model must remain")
+    monkeypatch.setattr(manager, "_runtime_installed", lambda _model_id=None: True)
+    monkeypatch.setattr(manager, "_models_downloaded", lambda _model_id=None: True)
+
+    snapshot = manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    assert snapshot["status"] == "completed"
+    assert snapshot["job_id"] is None
+    assert snapshot["already_running"] is False
+    assert artifact.read_bytes() == b"verified model must remain"
+    assert manager._model_download_jobs == {}
+
+
+def test_restart_download_preserves_verified_weights_while_repairing_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    artifact.write_bytes(b"verified model must remain")
+    total_bytes = manager._model_total_bytes(SWIFTVR_5B_BF16_ID)
+    monkeypatch.setattr(manager, "_runtime_installed", lambda _model_id=None: False)
+    monkeypatch.setattr(manager, "_models_downloaded", lambda _model_id=None: True)
+    monkeypatch.setattr(manager, "_available_model_bytes", lambda _model_id=None: total_bytes)
+    monkeypatch.setattr(manager, "_run_model_download", lambda _job: None)
+
+    snapshot = manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    job = manager._model_download_jobs[snapshot["job_id"]]
+    assert job.worker is not None
+    job.worker.join(timeout=2)
+    assert snapshot["already_running"] is False
+    assert snapshot["downloaded_bytes"] == total_bytes
+    assert artifact.read_bytes() == b"verified model must remain"
+
+
+def test_restart_download_rejects_active_other_model_without_deleting(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    artifact.write_bytes(b"must remain")
+    _register_running_download(manager, DEFAULT_AI_MODEL_ID)
+
+    with pytest.raises(MediaError, match="Another AI model download"):
+        manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    assert artifact.read_bytes() == b"must remain"
+    assert len(manager._model_download_jobs) == 1
+
+
+def test_restart_download_rejects_active_enhancement_without_deleting(
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    artifact.write_bytes(b"must remain")
+    enhancement = AIEnhancementJob(
+        id="active-enhancement",
+        source=_source(sample_video, ffprobe),
+        target=AI_TARGETS["1080p"],
+        output_path=tmp_path / "output.mp4",
+        expected_width=1920,
+        expected_height=1080,
+        status="running",
+    )
+    manager._jobs[enhancement.id] = enhancement
+    manager._active_job_id = enhancement.id
+
+    with pytest.raises(MediaError, match="Another AI enhancement"):
+        manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    assert artifact.read_bytes() == b"must remain"
+    assert manager._model_download_jobs == {}
+
+
+def test_restart_download_cleanup_failure_does_not_start_job(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    artifact.write_bytes(b"locked")
+    real_unlink = Path.unlink
+
+    def fail_selected_unlink(path: Path, *args, **kwargs) -> None:
+        if path == artifact:
+            raise PermissionError("locked model artifact")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_selected_unlink)
+
+    with pytest.raises(MediaError):
+        manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    assert artifact.read_bytes() == b"locked"
+    assert manager._model_download_jobs == {}
+    assert manager._active_job_id is None
+
+
+def test_restart_download_checks_space_before_deleting_any_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    artifact.write_bytes(b"final")
+    partial = artifact.with_suffix(artifact.suffix + ".download")
+    partial.write_bytes(b"partial")
+    cache = manager._model_validation_cache_path_for(SWIFTVR_5B_BF16_ID)
+    cache.write_bytes(b"cache")
+    monkeypatch.setattr(manager, "_model_cleanup_disk_free_bytes", lambda: 0)
+    monkeypatch.setattr(manager, "_required_runtime_free_bytes", lambda **_kwargs: 100)
+
+    with pytest.raises(MediaError, match="not enough free space"):
+        manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    assert artifact.read_bytes() == b"final"
+    assert partial.read_bytes() == b"partial"
+    assert cache.read_bytes() == b"cache"
+    assert manager._model_download_jobs == {}
+    assert manager._active_job_id is None
+
+
+def test_restart_download_counts_selected_artifacts_as_reclaimable_space(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    artifact.write_bytes(b"x" * 80)
+    monkeypatch.setattr(manager, "_model_cleanup_disk_free_bytes", lambda: 20)
+    monkeypatch.setattr(manager, "_required_runtime_free_bytes", lambda **_kwargs: 100)
+    monkeypatch.setattr(manager, "_run_model_download", lambda _job: None)
+
+    snapshot = manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    job = manager._model_download_jobs[snapshot["job_id"]]
+    assert job.worker is not None
+    job.worker.join(timeout=2)
+    assert not artifact.exists()
+    assert snapshot["downloaded_bytes"] == 0
+
+
+def test_restart_download_unlinks_leaf_symlink_without_deleting_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    outside = tmp_path / "outside-model.bin"
+    outside.write_bytes(b"outside target must remain")
+    try:
+        artifact.symlink_to(outside)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Symlinks are unavailable: {exc}")
+    monkeypatch.setattr(manager, "_run_model_download", lambda _job: None)
+
+    snapshot = manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    job = manager._model_download_jobs[snapshot["job_id"]]
+    assert job.worker is not None
+    job.worker.join(timeout=2)
+    assert not artifact.exists()
+    assert outside.read_bytes() == b"outside target must remain"
+
+
+def test_restart_download_rejects_symlinked_model_parent_without_deleting_target(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    model_root = manager._model_root_for(SWIFTVR_5B_BF16_ID)
+    model_root.mkdir(parents=True)
+    outside = tmp_path / "outside-transformer"
+    outside.mkdir()
+    outside_artifact = outside / "config.json"
+    outside_artifact.write_bytes(b"outside target must remain")
+    try:
+        (model_root / "transformer").symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Symlinks are unavailable: {exc}")
+
+    with pytest.raises(MediaError, match="unsafe symbolic link"):
+        manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    assert outside_artifact.read_bytes() == b"outside target must remain"
+    assert manager._model_download_jobs == {}
+
+
+def test_restart_download_rejects_symlinked_runtime_ancestor_without_deleting_target(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    manager.runtime_root.mkdir(parents=True)
+    outside = tmp_path / "outside-engines"
+    outside_model_root = outside / SWIFTVR_5B_BF16_ID / "models"
+    outside_model_root.mkdir(parents=True)
+    outside_artifact = outside_model_root / "prompt_embedding.safetensors"
+    outside_artifact.write_bytes(b"outside target must remain")
+    try:
+        (manager.runtime_root / "engines").symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Symlinks are unavailable: {exc}")
+
+    with pytest.raises(MediaError, match="unsafe symbolic link"):
+        manager.start_model_download(SWIFTVR_5B_BF16_ID, restart=True)
+
+    assert outside_artifact.read_bytes() == b"outside target must remain"
+    assert manager._model_download_jobs == {}
+
+
+def test_restart_download_api_requires_token_and_normalizes_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    state.ai_enhancements = manager
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    artifact.write_bytes(b"restart through API")
+    monkeypatch.setattr(manager, "_run_model_download", lambda _job: None)
+    endpoint = f"/api/ai-models/{SWIFTVR_5B_BF16_ID.upper()}/download/restart"
+
+    with TestClient(create_app(state)) as client:
+        unauthorized = client.post(endpoint)
+        assert unauthorized.status_code == 403
+        assert artifact.read_bytes() == b"restart through API"
+
+        token = client.get("/api/bootstrap").json()["app_token"]
+        restarted = client.post(endpoint, headers={"X-App-Token": token})
+        assert restarted.status_code == 200, restarted.text
+        payload = restarted.json()
+        assert payload["model_id"] == SWIFTVR_5B_BF16_ID
+        assert payload["job_id"]
+        assert payload["downloaded_bytes"] == 0
+        assert payload["already_running"] is False
+        assert not artifact.exists()
+
+
+def test_restart_download_api_does_not_delete_blocked_model(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
+    state.ai_enhancements = manager
+    artifact = _model_artifact_path(manager, FLASHVSR_V1_1_FULL_ID)
+    artifact.write_bytes(b"blocked model must remain")
+    partial = artifact.with_suffix(artifact.suffix + ".download")
+    partial.write_bytes(b"blocked partial must remain")
+
+    with TestClient(create_app(state)) as client:
+        token = client.get("/api/bootstrap").json()["app_token"]
+        response = client.post(
+            f"/api/ai-models/{FLASHVSR_V1_1_FULL_ID}/download/restart",
+            headers={"X-App-Token": token},
+        )
+
+    assert response.status_code == 400
+    assert "Block-Sparse-Attention" in response.json()["detail"]
+    assert artifact.read_bytes() == b"blocked model must remain"
+    assert partial.read_bytes() == b"blocked partial must remain"
 
 
 def test_swiftvr_rejects_2k_before_starting_or_downloading(

@@ -29,6 +29,22 @@ class StartupModel:
     name: str
     download_size_bytes: int
     partial_bytes: int
+    downloaded: bool
+    download_status: str
+    requires_runtime_update: bool
+
+    @property
+    def active(self) -> bool:
+        return self.download_status in ACTIVE_DOWNLOAD_STATUSES
+
+    @property
+    def recoverable(self) -> bool:
+        return bool(
+            self.active
+            or self.requires_runtime_update
+            or self.partial_bytes > 0
+            or self.download_status in {"cancelled", "failed"}
+        )
 
 
 def _write(stream: TextIO, value: str) -> None:
@@ -45,6 +61,7 @@ def _request_json(
     *,
     method: str = "GET",
     token: str | None = None,
+    json_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     headers = {
         "Accept": "application/json",
@@ -54,7 +71,11 @@ def _request_json(
     if token is not None:
         headers["X-App-Token"] = token
     if method == "POST":
-        data = b"{}"
+        data = json.dumps(
+            dict(json_body) if json_body is not None else {},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = Request(
         f"http://127.0.0.1:{port}{path}",
@@ -65,7 +86,18 @@ def _request_json(
     try:
         with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
-    except (HTTPError, URLError, OSError, TimeoutError) as exc:
+    except HTTPError as exc:
+        detail = str(exc)
+        try:
+            error_raw = exc.read(MAX_RESPONSE_BYTES + 1)
+            if len(error_raw) <= MAX_RESPONSE_BYTES:
+                error_payload = json.loads(error_raw.decode("utf-8"))
+                if isinstance(error_payload, dict) and isinstance(error_payload.get("detail"), str):
+                    detail = _clean_terminal_text(error_payload["detail"], fallback=detail)
+        except (AttributeError, TypeError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        raise ModelPromptError(f"local API request failed: {detail}") from exc
+    except (URLError, OSError, TimeoutError) as exc:
         raise ModelPromptError(f"local API request failed: {exc}") from exc
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ModelPromptError("local API response was too large")
@@ -88,6 +120,16 @@ def _nonnegative_integer(value: object) -> int:
     return max(0, result)
 
 
+def _valid_job_id(value: object) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 128:
+        return None
+    if not all(
+        character.isascii() and (character.isalnum() or character in "-_.:") for character in value
+    ):
+        return None
+    return value
+
+
 def _finite_number(value: object) -> float | None:
     if isinstance(value, bool):
         return None
@@ -104,7 +146,11 @@ def _clean_terminal_text(value: object, *, fallback: str) -> str:
     return cleaned.strip()[:300] or fallback
 
 
-def _startup_models(payload: Mapping[str, Any]) -> list[StartupModel]:
+def _startup_models(
+    payload: Mapping[str, Any],
+    *,
+    recovery_only: bool = False,
+) -> list[StartupModel]:
     raw_models = payload.get("models")
     if not isinstance(raw_models, list):
         raise ModelPromptError("local API did not return an AI model list")
@@ -123,14 +169,25 @@ def _startup_models(payload: Mapping[str, Any]) -> list[StartupModel]:
         ):
             continue
         seen.add(model_id)
-        models.append(
-            StartupModel(
-                id=model_id,
-                name=_clean_terminal_text(raw_model.get("name"), fallback=model_id),
-                download_size_bytes=_nonnegative_integer(raw_model.get("download_size_bytes")),
-                partial_bytes=_nonnegative_integer(raw_model.get("partial_bytes")),
-            )
+        downloaded = raw_model.get("downloaded") is True
+        model = StartupModel(
+            id=model_id,
+            name=_clean_terminal_text(raw_model.get("name"), fallback=model_id),
+            download_size_bytes=_nonnegative_integer(raw_model.get("download_size_bytes")),
+            partial_bytes=_nonnegative_integer(raw_model.get("partial_bytes")),
+            downloaded=downloaded,
+            download_status=_clean_terminal_text(
+                raw_model.get("download_status"),
+                fallback="idle",
+            ).lower(),
+            requires_runtime_update=bool(
+                raw_model.get("requires_runtime_update") is True
+                or (downloaded and raw_model.get("prepared") is not True)
+            ),
         )
+        if recovery_only and not model.recoverable:
+            continue
+        models.append(model)
     return models
 
 
@@ -217,13 +274,20 @@ def _model_path(model_id: str, suffix: str = "") -> str:
     return f"/api/ai-models/{quote(model_id, safe='')}/download{suffix}"
 
 
-def _attempt_cancel(port: int, token: str, model_id: str, output: TextIO) -> bool:
+def _attempt_cancel(
+    port: int,
+    token: str,
+    model_id: str,
+    job_id: str,
+    output: TextIO,
+) -> bool:
     try:
         _request_json(
             port,
             _model_path(model_id, "/cancel"),
             method="POST",
             token=token,
+            json_body={"job_id": job_id},
         )
         _write(output, "AI model cancellation was requested; partial data was kept.\n")
         return True
@@ -239,6 +303,8 @@ def _wait_for_download(
     initial: Mapping[str, Any],
     stop_requested: threading.Event,
     output: TextIO,
+    *,
+    owned_job_id: str | None,
 ) -> str:
     progress_output = _ProgressOutput(output)
     snapshot: Mapping[str, Any] = initial
@@ -253,11 +319,17 @@ def _wait_for_download(
                 break
             if stop_requested.is_set():
                 progress_output.finish()
-                _attempt_cancel(port, token, model.id, output)
+                if owned_job_id is not None:
+                    _attempt_cancel(port, token, model.id, owned_job_id, output)
+                else:
+                    _write(output, "Stopped monitoring; the existing download continues.\n")
                 return "stopped"
             if stop_requested.wait(POLL_INTERVAL_SECONDS):
                 progress_output.finish()
-                _attempt_cancel(port, token, model.id, output)
+                if owned_job_id is not None:
+                    _attempt_cancel(port, token, model.id, owned_job_id, output)
+                else:
+                    _write(output, "Stopped monitoring; the existing download continues.\n")
                 return "stopped"
             try:
                 snapshot = _request_json(port, _model_path(model.id), token=token)
@@ -335,11 +407,35 @@ def _read_download_choice(
         _write(output_stream, "Please enter y or n.\n")
 
 
+def _read_recovery_choice(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    stop_requested: threading.Event,
+) -> str | None:
+    while True:
+        _write(output_stream, "Continue, restart from zero, or skip? [c/r/N]: ")
+        try:
+            answer = _readline_until_stopped(input_stream, stop_requested)
+        except EOFError:
+            return None
+        if answer is None or answer == "":
+            return None
+        normalized = answer.strip().lower()
+        if normalized in {"c", "continue", "y", "yes"}:
+            return "continue"
+        if normalized in {"r", "restart"}:
+            return "restart"
+        if normalized in {"", "n", "no"}:
+            return "skip"
+        _write(output_stream, "Please enter c, r, or n.\n")
+
+
 def prompt_for_missing_models(
     port: int,
     stop_requested: threading.Event,
     *,
     skip: bool = False,
+    recovery_only: bool = False,
     input_stream: TextIO | None = None,
     output_stream: TextIO | None = None,
 ) -> None:
@@ -360,19 +456,27 @@ def prompt_for_missing_models(
         except (AttributeError, OSError):
             return
 
-    active_model_id: str | None = None
-    token: str | None = None
     try:
         bootstrap = _request_json(port, "/api/bootstrap")
         token_value = bootstrap.get("app_token")
         if not isinstance(token_value, str) or not token_value:
             raise ModelPromptError("local API did not provide an application token")
         token = token_value
-        models = _startup_models(_request_json(port, "/api/ai-models", token=token))
+        models = _startup_models(
+            _request_json(port, "/api/ai-models", token=token),
+            recovery_only=recovery_only,
+        )
         if not models:
             return
 
-        _write(output, "Optional AI models can be downloaded before the app opens.\n")
+        _write(
+            output,
+            (
+                "Recoverable AI model downloads were found.\n"
+                if recovery_only
+                else "Optional AI models can be downloaded before the app opens.\n"
+            ),
+        )
         for index, model in enumerate(models, start=1):
             if stop_requested.is_set():
                 return
@@ -383,24 +487,66 @@ def prompt_for_missing_models(
                 else ""
             )
             _write(output, f"[{index}/{len(models)}] {model.name} ({size}{resume})\n")
-            choice = _read_download_choice(source, output, stop_requested)
-            if choice is None:
-                if stop_requested.is_set():
+            action = "download"
+            if model.active:
+                action = "attach"
+                _write(output, "A download is already running; showing its progress here.\n")
+            elif model.requires_runtime_update:
+                _write(
+                    output,
+                    "Model files are complete, but the AI runtime needs repair.\n",
+                )
+                choice = _read_download_choice(source, output, stop_requested)
+                if choice is None:
+                    if stop_requested.is_set():
+                        return
+                    _write(
+                        output,
+                        "Input closed; remaining AI model downloads were skipped.\n",
+                    )
                     return
-                _write(output, "Input closed; remaining AI model downloads were skipped.\n")
-                return
-            if not choice:
-                _write(output, f"Skipped {model.name}.\n")
-                continue
+                if not choice:
+                    _write(output, f"Skipped {model.name}.\n")
+                    continue
+            elif model.partial_bytes > 0 or model.download_status in {"cancelled", "failed"}:
+                _write(output, "A previous model download is incomplete or failed.\n")
+                recovery_choice = _read_recovery_choice(source, output, stop_requested)
+                if recovery_choice is None:
+                    if stop_requested.is_set():
+                        return
+                    _write(
+                        output,
+                        "Input closed; remaining AI model downloads were skipped.\n",
+                    )
+                    return
+                if recovery_choice == "skip":
+                    _write(output, f"Skipped {model.name}.\n")
+                    continue
+                action = recovery_choice
+            else:
+                choice = _read_download_choice(source, output, stop_requested)
+                if choice is None:
+                    if stop_requested.is_set():
+                        return
+                    _write(
+                        output,
+                        "Input closed; remaining AI model downloads were skipped.\n",
+                    )
+                    return
+                if not choice:
+                    _write(output, f"Skipped {model.name}.\n")
+                    continue
 
-            active_model_id = model.id
+            owned_job_id: str | None = None
             try:
                 initial = _request_json(
                     port,
-                    _model_path(model.id),
-                    method="POST",
+                    _model_path(model.id, "/restart" if action == "restart" else ""),
+                    method="GET" if action == "attach" else "POST",
                     token=token,
                 )
+                if action != "attach" and initial.get("already_running") is False:
+                    owned_job_id = _valid_job_id(initial.get("job_id"))
                 outcome = _wait_for_download(
                     port,
                     token,
@@ -408,14 +554,18 @@ def prompt_for_missing_models(
                     initial,
                     stop_requested,
                     output,
+                    owned_job_id=owned_job_id,
                 )
             except KeyboardInterrupt:
-                _attempt_cancel(port, token, model.id, output)
-                active_model_id = None
+                if owned_job_id is not None:
+                    _attempt_cancel(port, token, model.id, owned_job_id, output)
                 _write(output, "AI model setup was interrupted; startup will continue.\n")
                 return
             except Exception as exc:
-                cancellation_requested = _attempt_cancel(port, token, model.id, output)
+                cancellation_requested = bool(
+                    owned_job_id is not None
+                    and _attempt_cancel(port, token, model.id, owned_job_id, output)
+                )
                 _write(
                     output,
                     (
@@ -427,14 +577,10 @@ def prompt_for_missing_models(
                         "Check Model Manager after the browser opens.\n"
                     ),
                 )
-                active_model_id = None
                 return
-            active_model_id = None
             if outcome == "stopped":
                 return
     except KeyboardInterrupt:
-        if active_model_id is not None and token is not None:
-            _attempt_cancel(port, token, active_model_id, output)
         _write(output, "AI model setup was interrupted; startup will continue.\n")
     except Exception as exc:
         _write(output, f"AI model check was skipped ({exc}); startup will continue.\n")

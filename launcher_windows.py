@@ -672,6 +672,7 @@ def _open_existing_instance(
     *,
     lock_handle: BinaryIO,
     no_browser: bool = False,
+    skip_model_prompt: bool = False,
 ) -> bool:
     deadline = time.monotonic() + 180
     waiting_reported = False
@@ -691,6 +692,12 @@ def _open_existing_instance(
                 and record.get("project_root") == str(PROJECT_ROOT)
             ):
                 print(f"Local Video Cutter is already running at http://127.0.0.1:{port}")
+                prompt_for_missing_models(
+                    port,
+                    threading.Event(),
+                    skip=skip_model_prompt,
+                    recovery_only=True,
+                )
                 if not no_browser:
                     _open_browser(port)
                 return True
@@ -738,6 +745,7 @@ def launch(
             if _open_existing_instance(
                 lock_handle=lock_handle,
                 no_browser=no_browser,
+                skip_model_prompt=skip_model_prompt,
             ):
                 return 0
             owns_lock = True

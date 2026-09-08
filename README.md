@@ -32,9 +32,11 @@
 
 服务启动后，Terminal 或 Windows Console 会逐个询问是否立即准备当前设备兼容但尚未完整就绪的 AI 模型。输入 `y` 并按 Enter 会安装所需环境、下载缺少的文件，并显示百分比、速度和预计剩余时间；输入 `n` 或直接按 Enter 会跳过这个模型并继续启动，不会禁用基础视频功能，也不会阻止以后再下载。Apple Silicon 只会询问稳定版 SeedVR2；Windows RTX 5090 还会询问实验版 SwiftVR。处于 blocked 状态的 FlashVSR 不会进入启动询问。
 
+普通下载支持断点续传。如果网页下载曾失败、取消，或磁盘上留有部分文件，下次运行启动器会显示 `Continue, restart from zero, or skip? [c/r/N]`：输入 `c` 从已下载位置继续，输入 `r` 只清理当前这个模型的权重并从零重下，输入 `n` 或直接按 Enter 跳过。清理不会删除已安装的 AI runtime，也不会影响其他模型。即使本地网页服务已经在运行，再次运行 `start.command`、`LocalVideoCutter.exe` 或 `start.bat` 也会先显示可恢复下载的模型，然后再重新打开网页。
+
 也可以全部跳过，等浏览器打开后进入独立的“AI 模型管理”标签页。每个模型都有自己的状态、兼容性说明和下载按钮，无需先选择视频或保存目录。页面会显示实际检测到的设备名称、后端、显存或统一内存，以及当前阶段、百分比、已下载容量、下载速度、已用时间和预计剩余时间。切换回“视频处理”不会中断；刷新页面后也会自动找回正在运行的任务。取消后已下载部分会保留，下次点击“继续下载”会断点续传。全部文件通过 SHA-256 校验后，模型才能运行。
 
-SeedVR2 权重约 7.3 GB，SwiftVR 权重约 20.2 GB，运行环境还会另外占用空间。只安装 SeedVR2 建议至少留出约 12 GB；Windows 同时安装 SeedVR2 与 SwiftVR 建议至少留出约 60 GB。启动时预下载不是强制步骤：SeedVR2 可以在第一次任务时自动准备；SwiftVR 必须先在启动窗口输入 `y`，或稍后到“AI 模型管理”完成准备，网页才会允许开始 SwiftVR 任务。
+SeedVR2 权重约 7.3 GB，SwiftVR 权重约 20.2 GB，运行环境还会另外占用空间。Apple Silicon 只安装 SeedVR2 建议至少留出约 12 GB，Windows RTX 5090 只安装 SeedVR2 建议至少留出约 18 GB；Windows 同时安装 SeedVR2 与 SwiftVR 建议至少留出约 60 GB。启动时预下载不是强制步骤：SeedVR2 可以在第一次任务时自动准备；SwiftVR 必须先在启动窗口输入 `y`，或稍后到“AI 模型管理”完成准备，网页才会允许开始 SwiftVR 任务。
 
 ### 4. 选择视频和保存目录
 
@@ -150,11 +152,11 @@ SwiftVR 是 5B BF16 的流式一阶段视频修复模型。本版本把它作为
 
 SeedVR2 的两条路径使用完全相同的 3B FP16 权重和 PyTorch SDPA attention。RTX 5090 路径不会默认换成 FP8，也不会默认安装 SageAttention、Apex、FlashAttention 或额外 Triton kernel；这样可以保留 FP16 质量并避免把一次性编译、第三方二进制兼容性变成稳定路径的前置条件。程序不会因显存不足静默降低模型精度，也不会把一个模型的任务悄悄换给另一个模型。
 
-启动器会在本地网页服务就绪后检查当前设备兼容、允许启动提示且尚未完整准备的模型，并逐个显示 `Download this model now? [y/N]`。输入 `y` 后会等待该模型环境安装、下载和校验完成，再继续下一个；输入 `n` 或直接按 Enter 会跳过。某个模型准备失败不会阻止基础工具启动。自动化或无人值守启动可传入 `--skip-model-prompt`，它只跳过命令行询问，不会隐藏网页模型管理功能。
+启动器会在本地网页服务就绪后检查当前设备兼容、允许启动提示且尚未完整准备的模型。新下载会显示 `Download this model now? [y/N]`；检测到失败、取消或残留的部分文件时，会改为显示 `Continue, restart from zero, or skip? [c/r/N]`。`c` 使用 HTTP Range 从断点续传，`r` 只删除所选模型的已有权重和 `.download` 文件后从零重下，`n` 或直接按 Enter 跳过。重下不会删除该模型的 runtime 或任何其他模型。某个模型准备失败不会阻止基础工具启动。已有实例运行时再次启动程序，也会检查并显示恢复提示；如果同一模型仍在下载，则直接在命令行接管其进度显示。自动化或无人值守启动可传入 `--skip-model-prompt`，它只跳过命令行询问，不会隐藏网页模型管理功能。
 
 也可以在独立的“AI 模型管理”标签页按模型提前安装、继续下载或取消。安装过程会创建隔离环境，下载固定 revision 的运行器与权重，并逐文件校验 SHA-256。SeedVR2 下载约 7.3 GB 的 3B FP16 与 VAE 权重；SwiftVR 下载约 20.2 GB 的 5B BF16 权重。blocked 的 FlashVSR 不会开始下载。
 
-模型管理页支持查看每个模型的实时百分比、下载容量、速度、耗时和预计剩余时间。中途取消会停止下载或安装进程；已完整下载的文件会保留，`.download` 临时文件也会保留以便下次续传。AI 视频任务中途取消时会停止整个 AI/FFmpeg 进程组并删除未完成成片。已通过完整性检查的模型不会在下次启动时重复安装或下载。
+模型管理页支持查看每个模型的实时百分比、下载容量、速度、耗时和预计剩余时间。中途取消会停止下载或安装进程；已完整下载的文件会保留，`.download` 临时文件也会保留，普通重试会自动断点续传。如果用户在启动窗口明确选择从零重下，程序只会清理所选模型的权重和校验记录，保留 runtime 与其他模型。AI 视频任务中途取消时会停止整个 AI/FFmpeg 进程组并删除未完成成片。已通过完整性检查的模型不会在下次启动时重复安装或下载。
 
 Apple Silicon 有不同统一内存容量，RTX 5090 提供独立显存。SeedVR2 会根据当前设备和目标尺寸调整同一个 FP16 模型的时序 batch，不会降低模型精度；RTX 5090 默认对 1080p、2K、4K 分别使用 `21`、`13`、`5` 帧 batch。1080p 的 `21` 来自上游 24 GB+ FP16 推荐配置，2K 与 4K 按像素量和 32 GB 显存保守缩小。batch 越高通常越有利于时序一致性，但三档仍必须在实机用短片验证显存峰值。1080p、2K、4K 的内存需求相差很大，4K 仍可能因可用内存不足而明确失败。SwiftVR 当前只允许 1080p，不会为了接受 2K/4K 请求而静默改变参数。4K 是本工具的输出尺寸档位，不代表任一模型对任意素材都给出了 4K 质量保证。关闭占用大量内存或显存的软件后重试，或选择较低目标档位。时序生成模型在重度退化或大幅运动素材上仍可能恢复失败，原本已经很清晰的素材也可能被过度生成或锐化；AI 生成的细节不是原片中可证明存在的真实细节。
 
@@ -231,7 +233,7 @@ python3 --version
 
 便携版 EXE 是一键启动器，旁边的 `app`、`vendor` 和 requirements 文件是程序本体的一部分，不能只单独复制 EXE。启动器会查找兼容的 Python，建立项目内独立环境，并检查 FFmpeg、FFprobe、`nvidia-smi` 和 RTX 5090。缺少 Python 3.12 或 FFmpeg 时会在可用的情况下通过 WinGet 自动安装；请保留启动窗口，按其中提示处理系统确认。模型不会打进 ZIP。
 
-本地网页服务就绪后，启动窗口会依次询问是否准备尚未完整就绪的 SeedVR2 和实验版 SwiftVR。输入 `y` 安装环境、下载缺少文件并在窗口中查看进度，输入 `n` 或直接按 Enter 跳过；跳过后浏览器仍会正常打开。以后可随时在网页“AI 模型管理”中逐个下载、继续下载、取消并查看进度。FlashVSR 是 blocked 状态，不会询问或下载。如果需要无人值守启动，可在 PowerShell 中运行 `LocalVideoCutter.exe --skip-model-prompt`，但普通用户直接双击即可。
+本地网页服务就绪后，启动窗口会依次询问是否准备尚未完整就绪的 SeedVR2 和实验版 SwiftVR。输入 `y` 安装环境、下载缺少文件并在窗口中查看进度，输入 `n` 或直接按 Enter 跳过；跳过后浏览器仍会正常打开。以后可随时在网页“AI 模型管理”中逐个下载、继续下载、取消并查看进度。网页下载失败、取消或留下部分文件后，再次运行 `LocalVideoCutter.exe` 会显示 `Continue, restart from zero, or skip? [c/r/N]`：`c` 断点续传，`r` 只清理该模型权重后从零重下，`n` 或直接按 Enter 跳过。清理不会动 runtime 或其他模型；即使网页服务已经在运行，再次双击启动器也会显示恢复提示。FlashVSR 是 blocked 状态，不会询问或下载。如果需要无人值守启动，可在 PowerShell 中运行 `LocalVideoCutter.exe --skip-model-prompt`，但普通用户直接双击即可。
 
 便携包应放在桌面、下载目录或其他普通用户可写目录，不要放入 `Program Files`。程序数据会写在便携包内部的 `.venv` 和 `data` 目录，因此移动到另一台 Windows 电脑时应复制整个文件夹；第一次在新电脑上仍会按该机器重新准备运行环境。
 
@@ -298,8 +300,8 @@ brew install python ffmpeg-full molten-vk
 当前 GitHub Release 没有商业代码签名证书，Windows 可能在第一次运行时显示 SmartScreen 提示。请只使用本仓库 Releases 中的 ZIP，并同时下载同页对应的 `.zip.sha256` 文件；确认来源后点击“更多信息”再选择“仍要运行”。SHA-256 可以在 PowerShell 中检查：
 
 ```powershell
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.8.0.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.8.0.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.8.1.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.8.1.zip.sha256
 ```
 
 第一条命令输出中的 `Hash` 必须与 `.zip.sha256` 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行该文件，应重新下载并再次核对。

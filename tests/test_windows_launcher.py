@@ -16,15 +16,14 @@ from app import dialogs
 from app import paths as app_paths
 
 
-def test_existing_windows_instance_opens_without_repeating_model_prompt(monkeypatch) -> None:
+def test_existing_windows_instance_checks_recovery_before_opening(monkeypatch) -> None:
     record = {
         "instance_id": "existing-instance",
         "server_pid": 42_424,
         "port": 8_777,
         "project_root": str(launcher_windows.PROJECT_ROOT),
     }
-    browser_ports: list[int] = []
-    prompt_calls: list[int] = []
+    events: list[tuple[str, int, dict[str, object]]] = []
     monkeypatch.setattr(launcher_windows, "_read_record", lambda: record)
     monkeypatch.setattr(
         launcher_windows,
@@ -35,16 +34,22 @@ def test_existing_windows_instance_opens_without_repeating_model_prompt(monkeypa
             "server_pid": 42_424,
         },
     )
-    monkeypatch.setattr(launcher_windows, "_open_browser", browser_ports.append)
+    monkeypatch.setattr(
+        launcher_windows,
+        "_open_browser",
+        lambda port: events.append(("browser", port, {})),
+    )
     monkeypatch.setattr(
         launcher_windows,
         "prompt_for_missing_models",
-        lambda port, *_args, **_kwargs: prompt_calls.append(port),
+        lambda port, *_args, **kwargs: events.append(("prompt", port, kwargs)),
     )
 
     assert launcher_windows._open_existing_instance(lock_handle=object()) is True
-    assert browser_ports == [8_777]
-    assert prompt_calls == []
+    assert events == [
+        ("prompt", 8_777, {"skip": False, "recovery_only": True}),
+        ("browser", 8_777, {}),
+    ]
 
 
 def test_posix_launcher_imports_when_fcntl_is_unavailable() -> None:

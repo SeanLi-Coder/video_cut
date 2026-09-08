@@ -51,15 +51,14 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
-def test_existing_instance_opens_without_repeating_model_prompt(monkeypatch) -> None:
+def test_existing_instance_checks_only_recoverable_models_before_opening(monkeypatch) -> None:
     record = {
         "instance_id": "existing-instance",
         "server_pid": 42_424,
         "port": 8_777,
         "project_root": str(launcher.PROJECT_ROOT),
     }
-    browser_ports: list[int] = []
-    prompt_calls: list[int] = []
+    events: list[tuple[str, int, dict[str, object]]] = []
     monkeypatch.setattr(launcher, "_read_record", lambda: record)
     monkeypatch.setattr(
         launcher,
@@ -70,16 +69,22 @@ def test_existing_instance_opens_without_repeating_model_prompt(monkeypatch) -> 
             "server_pid": 42_424,
         },
     )
-    monkeypatch.setattr(launcher, "_open_browser", browser_ports.append)
+    monkeypatch.setattr(
+        launcher,
+        "_open_browser",
+        lambda port: events.append(("browser", port, {})),
+    )
     monkeypatch.setattr(
         launcher,
         "prompt_for_missing_models",
-        lambda port, *_args, **_kwargs: prompt_calls.append(port),
+        lambda port, *_args, **kwargs: events.append(("prompt", port, kwargs)),
     )
 
     assert launcher._open_existing_instance(lock_handle=object()) is True
-    assert browser_ports == [8_777]
-    assert prompt_calls == []
+    assert events == [
+        ("prompt", 8_777, {"skip": False, "recovery_only": True}),
+        ("browser", 8_777, {}),
+    ]
 
 
 def test_media_executables_prefers_smoke_tested_ffmpeg_full(

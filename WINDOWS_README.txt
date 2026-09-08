@@ -6,6 +6,9 @@ Windows 11 / RTX 5090 便携版使用方法
 4. 本地网页服务就绪后，启动窗口会逐个询问是否准备兼容但尚未完整就绪的 AI 模型：
    - 输入 y 并按 Enter：立即下载该模型，并显示百分比、速度和预计剩余时间。
    - 输入 n 或直接按 Enter：跳过该模型并继续启动；以后仍可下载，基础功能不受影响。
+   - 普通下载支持断点续传。如果网页下载曾失败、取消，或留有部分文件，再次运行启动器会显示 Continue, restart from zero, or skip? [c/r/N]。
+   - 输入 c：从现有断点继续下载；输入 r：只清理所选模型的权重后从零重下；输入 n 或直接按 Enter：跳过。
+   - 从零重下不会删除已安装的 AI runtime，也不会影响其他模型。即使本地网页服务已经在运行，再次双击 LocalVideoCutter.exe 也会显示恢复提示；如果下载仍在进行，命令行会接管其进度显示。
    - 本 Windows RTX 5090 版会询问 SeedVR2 和 SwiftVR。FlashVSR 不会进入询问。
 5. 浏览器打开后即可使用剪辑、逐帧截图、永久旋转和 AI 超清。“AI 模型管理”标签页可以逐个下载、继续下载、取消，并显示每个模型的进度。
 6. 模型不会打进 ZIP。当前模型状态如下：
@@ -19,7 +22,7 @@ Windows 11 / RTX 5090 便携版使用方法
 
 LocalVideoCutter.exe --skip-model-prompt
 
-这个参数只跳过命令行 y/n 询问，不会关闭网页中的模型管理功能。
+这个参数只跳过命令行 y/n 和 c/r/n 询问，不会关闭网页中的模型管理功能。
 
 RTX 5090 需要已经正确安装 R580 或更新分支的 NVIDIA 驱动；程序不会自动安装或升级显卡驱动。模型环境使用固定的 cu130 PyTorch wheel，不需要另外安装 CUDA Toolkit、cuDNN 或 Visual Studio CUDA workload。
 
@@ -27,8 +30,8 @@ RTX 5090 需要已经正确安装 R580 或更新分支的 NVIDIA 驱动；程序
 
 这是未购买商业代码签名证书的未签名构建。Windows SmartScreen 可能首次显示“未知发布者”。本项目 GitHub 仓库是 private 仓库，下载 Releases 前必须登录已获访问权限的 GitHub 账号；如果 RTX 5090 电脑不方便登录，请先在有权限的电脑上下载并核对，再复制完整 ZIP。请同时下载同页对应的 .zip.sha256 文件，在 PowerShell 运行：
 
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.8.0.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.8.0.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.8.1.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.8.1.zip.sha256
 
 第一条命令输出中的 Hash 必须与 .zip.sha256 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行；完全相同且确认来源后，才可在 SmartScreen 中点击“更多信息”再选择“仍要运行”。
 

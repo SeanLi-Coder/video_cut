@@ -236,6 +236,25 @@ def _user_media_error(exc: MediaError) -> str:
         "The downloaded AI model failed integrity verification": (
             "AI 模型完整性校验失败，异常文件已删除，请重新下载。"
         ),
+        "The existing AI model download could not be cleared": (
+            "无法清理已有 AI 模型文件，请关闭占用这些文件的程序后重试。"
+        ),
+        "The AI model download contains an unexpected directory": (
+            "AI 模型下载目录中存在异常文件夹，已停止清理以避免误删数据。"
+        ),
+        "The AI model catalog contains an unsafe file path": (
+            "AI 模型清单包含异常文件路径，已停止操作以避免误删数据。"
+        ),
+        "The AI model directory must not be a symbolic link": (
+            "AI 模型目录不能是符号链接，已停止操作以避免访问目录外的数据。"
+        ),
+        "The AI model directory contains an unsafe symbolic link": (
+            "AI 模型目录包含不安全的链接，已停止操作且没有删除链接目标。"
+        ),
+        "The AI model directory contains an unsafe path": (
+            "AI 模型目录结构异常，已停止操作以避免误删数据。"
+        ),
+        "An AI task is still stopping": "AI 任务仍在停止和清理中，请稍后再试。",
         "AI model download job was not found": ("找不到这次 AI 模型下载任务，请刷新页面后重试。"),
         "The bundled AI quality patch failed integrity verification": (
             "内置 AI 质量补丁校验失败，请重新下载本项目。"
@@ -970,6 +989,20 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         if snapshot.get("error"):
             snapshot["error"] = _user_media_error(MediaError(str(snapshot["error"])))
         return snapshot
+
+    @app.post(
+        "/api/ai-models/{model_id}/download/restart",
+        dependencies=[Depends(require_app_token)],
+    )
+    def restart_ai_model_download_for_model(model_id: str) -> dict[str, Any]:
+        try:
+            if state.ai_enhancements is None:
+                raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
+            return state.ai_enhancements.start_model_download(model_id, restart=True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="没有找到这个 AI 模型。") from exc
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
 
     @app.get("/api/ai-model-download", dependencies=[Depends(require_app_token)])
     def ai_model_download_status() -> dict[str, Any]:

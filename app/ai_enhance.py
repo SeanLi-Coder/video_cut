@@ -1214,13 +1214,16 @@ class AIEnhancementManager:
         *,
         runtime_installed: bool,
         model_id: str = DEFAULT_AI_MODEL_ID,
+        available_model_bytes: int | None = None,
     ) -> int:
         total_bytes = self._model_total_bytes(model_id)
-        available_bytes = (
-            self._available_model_bytes()
-            if model_id == DEFAULT_AI_MODEL_ID
-            else self._available_model_bytes(model_id)
-        )
+        available_bytes = available_model_bytes
+        if available_bytes is None:
+            available_bytes = (
+                self._available_model_bytes()
+                if model_id == DEFAULT_AI_MODEL_ID
+                else self._available_model_bytes(model_id)
+            )
         remaining_models = max(0, total_bytes - available_bytes)
         minimum_runtime_bytes = (
             MINIMUM_SWIFTVR_RUNTIME_FREE_BYTES
@@ -1546,9 +1549,169 @@ class AIEnhancementManager:
             )
         return {"default_model_id": DEFAULT_AI_MODEL_ID, "models": models}
 
+    @staticmethod
+    def _is_unsafe_model_link(path: Path) -> bool:
+        try:
+            if path.is_symlink():
+                return True
+            is_junction = getattr(path, "is_junction", None)
+            return bool(callable(is_junction) and is_junction())
+        except OSError:
+            return True
+
+    def _model_cleanup_destination(self, model_id: str, filename: str) -> Path:
+        relative = PurePosixPath(filename)
+        if not filename or relative.is_absolute() or ".." in relative.parts or "\\" in filename:
+            raise MediaError("The AI model catalog contains an unsafe file path")
+        root = self._validate_model_cleanup_root(model_id)
+        current = root
+        for part in relative.parts[:-1]:
+            current = current / part
+            if self._is_unsafe_model_link(current):
+                raise MediaError("The AI model directory contains an unsafe symbolic link")
+            if current.exists() and not current.is_dir():
+                raise MediaError("The AI model directory contains an unsafe path")
+        return root.joinpath(*relative.parts)
+
+    def _validate_model_cleanup_root(self, model_id: str) -> Path:
+        root = self._model_root_for(model_id)
+        try:
+            relative = root.relative_to(self.runtime_root)
+        except ValueError as exc:
+            raise MediaError("The AI model directory contains an unsafe path") from exc
+        current = self.runtime_root
+        for part in (None, *relative.parts):
+            if part is not None:
+                current = current / part
+            if self._is_unsafe_model_link(current):
+                raise MediaError("The AI model directory contains an unsafe symbolic link")
+            if current.exists() and not current.is_dir():
+                raise MediaError("The AI model directory contains an unsafe path")
+        return root
+
+    def _validate_model_cleanup_parent(self, model_id: str, path: Path) -> None:
+        root = self._validate_model_cleanup_root(model_id)
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise MediaError("The AI model directory contains an unsafe path") from exc
+        current = root
+        for part in relative.parts[:-1]:
+            current = current / part
+            if self._is_unsafe_model_link(current):
+                raise MediaError("The AI model directory contains an unsafe symbolic link")
+            if current.exists() and not current.is_dir():
+                raise MediaError("The AI model directory contains an unsafe path")
+
+    def _unlink_model_download_artifact(self, model_id: str, path: Path) -> None:
+        try:
+            self._validate_model_cleanup_parent(model_id, path)
+            if self._is_unsafe_model_link(path):
+                path.unlink(missing_ok=True)
+                return
+            if path.exists() and not path.is_file():
+                raise MediaError("The AI model download contains an unexpected directory")
+            path.unlink(missing_ok=True)
+        except MediaError:
+            raise
+        except OSError as exc:
+            raise MediaError("The existing AI model download could not be cleared") from exc
+
+    def _model_cleanup_paths_locked(self, model_id: str) -> tuple[Path, ...]:
+        model_root = self._validate_model_cleanup_root(model_id)
+        cache_path = self._model_validation_cache_path_for(model_id)
+        paths = [cache_path]
+        if model_root.is_dir():
+            cache_temporary_pattern = re.compile(
+                rf"\.{re.escape(cache_path.name)}\.[0-9a-f]{{32}}\.tmp"
+            )
+            try:
+                cache_temporaries = tuple(model_root.iterdir())
+            except OSError as exc:
+                raise MediaError("The existing AI model download could not be cleared") from exc
+            paths.extend(
+                candidate
+                for candidate in cache_temporaries
+                if cache_temporary_pattern.fullmatch(candidate.name)
+            )
+        for filename, _size, _sha256, _url in self._model_files_for(model_id):
+            destination = self._model_cleanup_destination(model_id, filename)
+            paths.extend(
+                (
+                    destination,
+                    destination.with_suffix(destination.suffix + ".download"),
+                )
+            )
+        return tuple(paths)
+
+    def _reclaimable_model_download_bytes_locked(self, model_id: str) -> int:
+        reclaimable = 0
+        seen: set[tuple[int, int]] = set()
+        for path in self._model_cleanup_paths_locked(model_id):
+            self._validate_model_cleanup_parent(model_id, path)
+            if self._is_unsafe_model_link(path):
+                continue
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise MediaError("The existing AI model download could not be cleared") from exc
+            if not path.is_file():
+                raise MediaError("The AI model download contains an unexpected directory")
+            identity = (stat.st_dev, stat.st_ino)
+            if identity in seen or stat.st_nlink != 1:
+                continue
+            seen.add(identity)
+            reclaimable += max(0, stat.st_size)
+        return reclaimable
+
+    def _model_cleanup_disk_free_bytes(self) -> int:
+        current = self.runtime_root
+        while not current.exists() and current != current.parent:
+            current = current.parent
+        try:
+            return shutil.disk_usage(current).free
+        except OSError as exc:
+            raise MediaError("The existing AI model download could not be cleared") from exc
+
+    def _ensure_restart_disk_space_locked(
+        self,
+        model_id: str,
+        *,
+        runtime_installed: bool,
+    ) -> None:
+        reclaimable = self._reclaimable_model_download_bytes_locked(model_id)
+        required = self._required_runtime_free_bytes(
+            runtime_installed=runtime_installed,
+            model_id=model_id,
+            available_model_bytes=0,
+        )
+        if self._model_cleanup_disk_free_bytes() + reclaimable < required:
+            if model_id == SWIFTVR_5B_BF16_ID:
+                raise MediaError(
+                    "There is not enough free space for the SwiftVR runtime and models"
+                )
+            raise MediaError("There is not enough free space for the AI runtime and models")
+
+    def _clear_model_download_locked(self, model_id: str) -> None:
+        for path in self._model_cleanup_paths_locked(model_id):
+            self._unlink_model_download_artifact(model_id, path)
+
+    def _ensure_model_cleanup_is_idle_locked(self) -> None:
+        for job in (*self._jobs.values(), *self._model_download_jobs.values()):
+            worker = job.worker
+            process = job.process
+            if (worker is not None and worker.is_alive()) or (
+                process is not None and process.poll() is None
+            ):
+                raise MediaError("An AI task is still stopping")
+
     def start_model_download(
         self,
         model_id: str = DEFAULT_AI_MODEL_ID,
+        *,
+        restart: bool = False,
     ) -> dict[str, Any]:
         spec = get_ai_model(model_id)
         model_id = spec.id
@@ -1567,35 +1730,50 @@ class AIEnhancementManager:
             active = self._active_job_locked()
             if isinstance(active, AIModelDownloadJob):
                 if active.model_id == model_id:
-                    return self._model_download_snapshot(active, model_id)
+                    snapshot = self._model_download_snapshot(active, model_id)
+                    snapshot["already_running"] = True
+                    return snapshot
                 raise MediaError("Another AI model download is already running")
             if active is not None:
                 raise MediaError("Another AI enhancement job is already running")
-            prepared = (self.inference_runner is not None and model_id == DEFAULT_AI_MODEL_ID) or (
-                (
-                    self._runtime_installed()
-                    if model_id == DEFAULT_AI_MODEL_ID
-                    else self._runtime_installed(model_id)
-                )
-                and (
-                    self._models_downloaded()
-                    if model_id == DEFAULT_AI_MODEL_ID
-                    else self._models_downloaded(model_id)
-                )
+            injected = self.inference_runner is not None and model_id == DEFAULT_AI_MODEL_ID
+            runtime_installed = injected or (
+                self._runtime_installed()
+                if model_id == DEFAULT_AI_MODEL_ID
+                else self._runtime_installed(model_id)
             )
+            models_downloaded = injected or (
+                self._models_downloaded()
+                if model_id == DEFAULT_AI_MODEL_ID
+                else self._models_downloaded(model_id)
+            )
+            prepared = runtime_installed and models_downloaded
             if prepared:
                 latest_id = self._latest_model_download_job_ids.get(model_id)
                 if model_id == DEFAULT_AI_MODEL_ID and latest_id is None:
                     latest_id = self._latest_model_download_job_id
                 latest = self._model_download_jobs.get(latest_id) if latest_id is not None else None
                 if latest is not None and latest.snapshot()["status"] == "completed":
-                    return self._model_download_snapshot(latest, model_id)
-                return self._model_download_snapshot(None, model_id)
+                    snapshot = self._model_download_snapshot(latest, model_id)
+                else:
+                    snapshot = self._model_download_snapshot(None, model_id)
+                snapshot["already_running"] = False
+                return snapshot
+            discard_existing = restart and not models_downloaded
+            if discard_existing:
+                self._ensure_model_cleanup_is_idle_locked()
+                self._ensure_restart_disk_space_locked(
+                    model_id,
+                    runtime_installed=runtime_installed,
+                )
+                self._clear_model_download_locked(model_id)
             job = AIModelDownloadJob(
                 id=uuid.uuid4().hex,
                 model_id=model_id,
                 downloaded_bytes=(
-                    self._available_model_bytes()
+                    0
+                    if discard_existing
+                    else self._available_model_bytes()
                     if model_id == DEFAULT_AI_MODEL_ID
                     else self._available_model_bytes(model_id)
                 ),
@@ -1609,7 +1787,9 @@ class AIEnhancementManager:
         worker = threading.Thread(target=self._run_model_download, args=(job,), daemon=True)
         job.worker = worker
         worker.start()
-        return self._model_download_snapshot(job, model_id)
+        snapshot = self._model_download_snapshot(job, model_id)
+        snapshot["already_running"] = False
+        return snapshot
 
     def cancel_model_download(
         self,
