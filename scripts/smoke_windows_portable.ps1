@@ -110,9 +110,11 @@ try {
     $Models = @($ModelCatalog.models)
     $ExpectedModelIds = @(
         "seedvr2-3b-fp16",
-        "swiftvr-5b-bf16",
-        "flashvsr-v1-1-full"
+        "swiftvr-5b-bf16"
     )
+    if ($Models.Count -ne $ExpectedModelIds.Count) {
+        throw "The packaged AI model catalog contains unexpected entries"
+    }
     foreach ($ExpectedModelId in $ExpectedModelIds) {
         $ModelMatches = @($Models | Where-Object { $_.id -eq $ExpectedModelId })
         if ($ModelMatches.Count -ne 1) {
@@ -124,16 +126,6 @@ try {
     $SwiftTargets = @($SwiftModel.supported_targets)
     if ($SwiftTargets.Count -ne 1 -or [string]$SwiftTargets[0] -ne "1080p") {
         throw "SwiftVR must expose only the 1080p target in this release"
-    }
-
-    $FlashModel = $Models | Where-Object { $_.id -eq "flashvsr-v1-1-full" }
-    if (
-        $FlashModel.status -ne "blocked" -or
-        -not [bool]$FlashModel.blocked -or
-        [bool]$FlashModel.startup_prompt -or
-        [bool]$FlashModel.include_in_startup_prompt
-    ) {
-        throw "FlashVSR must remain blocked and excluded from startup prompts"
     }
 
     if (-not $Bootstrap.ai_runtime.encoder_available) {

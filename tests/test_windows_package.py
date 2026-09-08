@@ -70,16 +70,13 @@ def test_windows_portable_smoke_checks_authenticated_model_catalog() -> None:
     for model_id in (
         "seedvr2-3b-fp16",
         "swiftvr-5b-bf16",
-        "flashvsr-v1-1-full",
     ):
         assert model_id in smoke_script
 
+    assert "$Models.Count -ne $ExpectedModelIds.Count" in smoke_script
+    assert "contains unexpected entries" in smoke_script
     assert "$SwiftTargets.Count -ne 1" in smoke_script
     assert '[string]$SwiftTargets[0] -ne "1080p"' in smoke_script
-    assert '$FlashModel.status -ne "blocked"' in smoke_script
-    assert "-not [bool]$FlashModel.blocked" in smoke_script
-    assert "[bool]$FlashModel.startup_prompt" in smoke_script
-    assert "[bool]$FlashModel.include_in_startup_prompt" in smoke_script
 
 
 def test_release_docs_cover_private_access_and_checksum_comparison() -> None:
@@ -103,10 +100,8 @@ def test_release_docs_cover_private_access_and_checksum_comparison() -> None:
         assert f"{release_archive}.sha256" in document
 
 
-def test_readme_distinguishes_python_versions_and_flash_visibility() -> None:
+def test_readme_distinguishes_python_versions() -> None:
     readme = _read("README.md")
 
     assert "macOS 需要 Python 3.10 或更高版本" in readme
     assert "Windows 启动器固定使用 Python 3.12" in readme
-    assert "模型卡可以选择查看技术状态与 blocked 原因" in readme
-    assert "当前不可下载、不可运行" in readme

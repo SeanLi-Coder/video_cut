@@ -9,13 +9,11 @@ import pytest
 from app.ai_models import (
     AI_MODELS,
     DEFAULT_AI_MODEL_ID,
-    FLASHVSR_V1_1_FULL_ID,
     SEEDVR2_3B_FP16_ID,
     SWIFTVR_5B_BF16_ID,
     catalog_metadata,
     get_ai_model,
     model_compatibility,
-    model_metadata,
     startup_model_metadata,
 )
 
@@ -24,7 +22,6 @@ def test_catalog_has_stable_ids_and_default() -> None:
     assert list(AI_MODELS) == [
         SEEDVR2_3B_FP16_ID,
         SWIFTVR_5B_BF16_ID,
-        FLASHVSR_V1_1_FULL_ID,
     ]
     assert DEFAULT_AI_MODEL_ID == SEEDVR2_3B_FP16_ID
     assert get_ai_model("  SEEDVR2-3B-FP16 ") is AI_MODELS[DEFAULT_AI_MODEL_ID]
@@ -83,20 +80,6 @@ def test_catalog_artifact_manifests_match_the_pinned_hugging_face_snapshots() ->
                 "f7ade5b8f7f4ff8b4e26a581772ebe5bcfb6a619ece2dd3483c5395c2d7e1a31",
             ),
         },
-        FLASHVSR_V1_1_FULL_ID: {
-            "LQ_proj_in.ckpt": (
-                575_694_948,
-                "d6d011cdaaba6a52645086caa08fa04124e746f6ca568140a24007591142bfd2",
-            ),
-            "Wan2.1_VAE.pth": (
-                507_609_880,
-                "38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981",
-            ),
-            "diffusion_pytorch_model_streaming_dmd.safetensors": (
-                5_676_070_392,
-                "bd28180edcf3446c028e32fc6b731a80bf7e4da2ab4caac3186b9499964d37be",
-            ),
-        },
     }
     actual = {
         model_id: {item.relative_path: (item.size_bytes, item.sha256) for item in spec.files}
@@ -129,28 +112,6 @@ def test_swiftvr_is_experimental_cuda_1080p_only() -> None:
     assert "NVIDIA CUDA" in str(reason)
 
 
-def test_flashvsr_is_cuda_visible_but_blocked_and_not_prompted() -> None:
-    spec = get_ai_model(FLASHVSR_V1_1_FULL_ID)
-    assert spec.status == "blocked"
-    assert spec.precision == "BF16"
-    assert spec.model_revision == "27561b186ded3402d7c975f4fd722e2885b6135f"
-    assert spec.supported_backends == ("cuda",)
-    assert spec.total_download_bytes == 6_759_375_220
-
-    cuda = model_metadata(spec, "cuda")
-    assert cuda["visible"] is True
-    assert cuda["runnable"] is False
-    assert cuda["compatible"] is False
-    assert cuda["blocked"] is True
-    assert cuda["startup_prompt"] is False
-    assert cuda["include_in_startup_prompt"] is False
-    assert "Block-Sparse-Attention" in str(cuda["compatibility_reason"])
-
-    mps = model_metadata(spec, "mps")
-    assert mps["visible"] is False
-    assert mps["runnable"] is False
-
-
 def test_backend_catalog_metadata_is_json_safe_and_ordered() -> None:
     cuda = catalog_metadata("cuda", visible_only=True)
     assert [item["id"] for item in cuda] == list(AI_MODELS)
@@ -163,7 +124,7 @@ def test_backend_catalog_metadata_is_json_safe_and_ordered() -> None:
     assert mps[0]["total_download_gb"] == 7.3
 
 
-def test_startup_metadata_excludes_blocked_models() -> None:
+def test_startup_metadata_contains_supported_models() -> None:
     assert [item["id"] for item in startup_model_metadata("cuda")] == [
         SEEDVR2_3B_FP16_ID,
         SWIFTVR_5B_BF16_ID,

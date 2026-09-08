@@ -38,20 +38,8 @@ const FALLBACK_AI_MODELS = [
     download_size_bytes: 20_167_236_623,
     compatibility_reason: "SwiftVR 仅支持 NVIDIA CUDA；正在等待本机能力信息。",
   },
-  {
-    id: "flashvsr-v1-1-full",
-    name: "FlashVSR v1.1 Full",
-    description: "使用完整 LCSA 路径的 4× 视频超分模型；RTX 50 支持尚待验证。",
-    precision: "BF16",
-    status: "blocked",
-    blocked: true,
-    compatible: false,
-    runnable: false,
-    supported_targets: ["1080p", "2k", "4k"],
-    download_size_bytes: 6_759_375_220,
-    blocked_reason: "FlashVSR 的官方 Block-Sparse-Attention 尚未在 Windows RTX 50 上完成兼容性与质量验证。",
-  },
 ];
+const AVAILABLE_AI_MODEL_IDS = new Set(FALLBACK_AI_MODELS.map((model) => model.id));
 
 const state = {
   appToken: "",
@@ -911,7 +899,8 @@ function normalizeAiModel(value, fallback = {}) {
 }
 
 function applyAiModelCatalog(payload) {
-  const received = Array.isArray(payload?.models) ? payload.models : [];
+  const received = (Array.isArray(payload?.models) ? payload.models : [])
+    .filter((model) => AVAILABLE_AI_MODEL_IDS.has(String(model?.id || "").toLowerCase()));
   const byId = new Map(received.map((model) => [String(model?.id || "").toLowerCase(), model]));
   const ordered = [];
   for (const fallback of FALLBACK_AI_MODELS) {
@@ -1661,7 +1650,7 @@ async function requestPreview(range, options = {}) {
 
 function aiModelChoiceDetail(model, { manager = false } = {}) {
   const targets = aiModelTargetsLabel(model).replaceAll(" · ", " / ");
-  if (model.blocked) return "完整质量路径保留，等待 RTX 50 兼容验证";
+  if (model.blocked) return "此模型当前版本暂未开放";
   const backends = Array.isArray(model.supported_backends)
     ? model.supported_backends
       .filter((backend) => String(backend).toLowerCase() === "cuda")

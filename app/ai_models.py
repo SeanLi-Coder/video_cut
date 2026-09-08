@@ -27,7 +27,6 @@ KNOWN_MODEL_STATUSES: tuple[AIModelStatus, ...] = (
 
 SEEDVR2_3B_FP16_ID = "seedvr2-3b-fp16"
 SWIFTVR_5B_BF16_ID = "swiftvr-5b-bf16"
-FLASHVSR_V1_1_FULL_ID = "flashvsr-v1-1-full"
 DEFAULT_AI_MODEL_ID = SEEDVR2_3B_FP16_ID
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -172,8 +171,6 @@ _SEEDVR2_REPOSITORY = "numz/SeedVR2_comfyUI"
 _SEEDVR2_REVISION = "09ced71023636e9bc8cdf9cdecfb2625d1e691e8"
 _SWIFTVR_REPOSITORY = "H-oliday/SwiftVR"
 _SWIFTVR_REVISION = "743ed2530c550764905400f38eb6cc41af5abc80"
-_FLASHVSR_REPOSITORY = "JunhaoZhuang/FlashVSR-v1.1"
-_FLASHVSR_REVISION = "27561b186ded3402d7c975f4fd722e2885b6135f"
 
 
 AI_MODELS: dict[str, AIModelSpec] = {
@@ -252,49 +249,6 @@ AI_MODELS: dict[str, AIModelSpec] = {
         supported_backends=("cuda",),
         supported_targets=("1080p",),
         startup_prompt=True,
-    ),
-    FLASHVSR_V1_1_FULL_ID: AIModelSpec(
-        id=FLASHVSR_V1_1_FULL_ID,
-        name="FlashVSR v1.1 Full",
-        description="使用完整 LCSA 路径的 4× 视频超分模型；RTX 50 支持尚待验证。",
-        precision="BF16",
-        status="blocked",
-        model_repository=_FLASHVSR_REPOSITORY,
-        model_revision=_FLASHVSR_REVISION,
-        source_url="https://github.com/OpenImagingLab/FlashVSR",
-        license="Apache-2.0",
-        runtime_kind="flashvsr",
-        files=(
-            _model_file(
-                _FLASHVSR_REPOSITORY,
-                _FLASHVSR_REVISION,
-                "LQ_proj_in.ckpt",
-                575_694_948,
-                "d6d011cdaaba6a52645086caa08fa04124e746f6ca568140a24007591142bfd2",
-            ),
-            _model_file(
-                _FLASHVSR_REPOSITORY,
-                _FLASHVSR_REVISION,
-                "Wan2.1_VAE.pth",
-                507_609_880,
-                "38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981",
-            ),
-            _model_file(
-                _FLASHVSR_REPOSITORY,
-                _FLASHVSR_REVISION,
-                "diffusion_pytorch_model_streaming_dmd.safetensors",
-                5_676_070_392,
-                "bd28180edcf3446c028e32fc6b731a80bf7e4da2ab4caac3186b9499964d37be",
-            ),
-        ),
-        supported_backends=("cuda",),
-        supported_targets=("1080p", "2k", "4k"),
-        startup_prompt=False,
-        blocked_reason=(
-            "FlashVSR 的官方 Block-Sparse-Attention 尚未在 Windows RTX 50 / sm_120 "
-            "完成兼容性与质量验证；在验证前不会运行，也不会用会降低质量的 dense "
-            "attention 或 Tiny 模型替代。"
-        ),
     ),
 }
 
@@ -413,7 +367,6 @@ __all__ = [
     "AI_MODELS",
     "AITarget",
     "DEFAULT_AI_MODEL_ID",
-    "FLASHVSR_V1_1_FULL_ID",
     "KNOWN_AI_BACKENDS",
     "KNOWN_AI_TARGETS",
     "SEEDVR2_3B_FP16_ID",

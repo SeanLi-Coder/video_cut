@@ -32,7 +32,7 @@
 
 本节只适用于 Windows 11 RTX/CUDA 版本。macOS 启动时不会检查、询问或下载 AI 模型，也不会配置 AI 下载代理。
 
-Windows 本地服务启动后，Windows Console 会逐个询问是否立即准备兼容但尚未完整就绪的 AI 模型。输入 `y` 并按 Enter 会安装所需环境、下载缺少的文件，并显示百分比、速度和预计剩余时间；输入 `n` 或直接按 Enter 会跳过这个模型并继续启动，不会禁用基础视频功能，也不会阻止以后再下载。RTX 5090 会询问稳定版 SeedVR2 和实验版 SwiftVR；处于 blocked 状态的 FlashVSR 不会进入启动询问。
+Windows 本地服务启动后，Windows Console 会逐个询问是否立即准备兼容但尚未完整就绪的 AI 模型。输入 `y` 并按 Enter 会安装所需环境、下载缺少的文件，并显示百分比、速度和预计剩余时间；输入 `n` 或直接按 Enter 会跳过这个模型并继续启动，不会禁用基础视频功能，也不会阻止以后再下载。RTX 5090 会询问稳定版 SeedVR2 和实验版 SwiftVR。
 
 普通下载支持断点续传。如果网页下载曾失败、取消，或磁盘上留有部分文件，下次运行 Windows 启动器会显示 `Continue, restart from zero, or skip? [c/r/N]`：输入 `c` 从已下载位置继续，输入 `r` 只清理当前这个模型的权重并从零重下，输入 `n` 或直接按 Enter 跳过。清理不会删除已安装的 AI runtime，也不会影响其他模型。即使本地网页服务已经在运行，再次运行 `LocalVideoCutter.exe` 或 `start.bat` 也会先显示可恢复下载的模型，然后再重新打开网页。
 
@@ -127,19 +127,16 @@ Windows AI 超清的默认文件名为：
 
 ## Windows AI 超清：模型选择与使用边界
 
-本项目使用固定 revision 和 SHA-256 的模型目录，不会在失败后偷偷改成 FP8、GGUF、逐帧 Real-ESRGAN 或其他低质量替代方案。**SeedVR2 3B FP16** 仍是稳定版和默认选项；Windows RTX 5090 另外提供实验性的 **SwiftVR 5B BF16**。**FlashVSR v1.1 Full** 的模型卡可以选择查看技术状态与 blocked 原因，但当前不可下载、不可运行。
+本项目使用固定 revision 和 SHA-256 的模型目录，不会在失败后偷偷改成 FP8、GGUF、逐帧 Real-ESRGAN 或其他低质量替代方案。**SeedVR2 3B FP16** 仍是稳定版和默认选项；Windows RTX 5090 另外提供实验性的 **SwiftVR 5B BF16**。
 
 | 模型 | 状态 | 可用设备 | 当前目标档位 | 权重下载 | 启动时询问 |
 |---|---|---|---|---:|---|
 | SeedVR2 3B FP16 | stable、默认 | Windows 11 RTX 5090 CUDA | 1080p、2K、4K | 约 7.3 GB | 是 |
 | SwiftVR 5B BF16 | experimental | 仅 Windows 11 RTX 5090 CUDA | 仅 1080p | 约 20.2 GB | 是 |
-| FlashVSR v1.1 Full | blocked | RTX 5090 的 CUDA 页面中仅可见 | 暂不开放 | 不允许下载 | 否 |
 
 SeedVR2 会同时利用相邻帧恢复细节，能减少逐帧图像模型常见的纹理闪烁。选择 3B FP16 不是为了省时间：SeedVR2 官方论文的专家盲测中，蒸馏后的普通 3B 模型相对普通 7B 模型，在 Visual Quality 和包含时序一致性的 Overall Quality 上都高出 16%。后加的 7B sharp checkpoint 没有对应官方盲测，不能把“更锐”直接当成“总体更好”。依据见 [SeedVR2 论文](https://arxiv.org/html/2506.05301)和[官方项目](https://github.com/ByteDance-Seed/SeedVR)。这里的“默认”表示本项目当前 Windows CUDA 质量优先方案，并不是声称它对所有素材和硬件绝对领先。
 
 SwiftVR 是 5B BF16 的流式一阶段视频修复模型。本版本把它作为 Windows RTX 5090 的可选实验路径，并且只开放 1080p；它不会取代稳定默认值，也不会在 SeedVR2 失败时自动接管。它的安装、模型文件和任务进度与 SeedVR2 独立。当前适配是在 Apple M2 开发机完成的，还没有经过真实 RTX 5090 推理验收，因此请先用短片核对显存峰值、速度、帧数、颜色、音频和成片质量，再决定是否处理长片。
-
-[FlashVSR](https://github.com/OpenImagingLab/FlashVSR) 的论文结果值得关注，但 Full 高质量路径依赖 [Block-Sparse-Attention](https://github.com/mit-han-lab/Block-Sparse-Attention)。官方 BSA 目前尚未完成 Windows RTX 50 / `sm_120` 的兼容性与质量验证，所以本项目将 FlashVSR 标为 blocked：模型卡会说明原因，但下载和运行按钮保持禁用，也不会出现在启动下载询问中。程序不会用 dense attention 或 Tiny 模型冒充 Full 质量版本。
 
 目标档位定义如下；2K 在本工具中明确指常见的 QHD，而不是 DCI 2K：
 
@@ -155,7 +152,7 @@ Windows 11 + NVIDIA GeForce RTX 5090 上，SeedVR2 使用 PyTorch `2.12.1` 的 C
 
 启动器会在本地网页服务就绪后检查当前设备兼容、允许启动提示且尚未完整准备的模型。若至少有一个任务尚未开始，会先显示 `AI download proxy [Enter=keep, s=set/change, c=clear]`，网页和命令行共用这份设置。新下载随后显示 `Download this model now? [y/N]`；检测到失败、取消或残留的部分文件时，会改为显示 `Continue, restart from zero, or skip? [c/r/N]`。`c` 使用 HTTP Range 从断点续传，`r` 只删除所选模型的已有权重和 `.download` 文件后从零重下，`n` 或直接按 Enter 跳过。重下不会删除该模型的 runtime 或任何其他模型。某个模型准备失败不会阻止基础工具启动。已有实例运行时再次启动程序，也会检查并显示恢复提示；如果同一模型仍在下载，则直接在命令行接管其进度显示。自动化或无人值守启动可传入 `--skip-model-prompt`，它会同时跳过命令行代理与模型询问，不会隐藏网页模型管理功能。
 
-也可以在独立的“AI 模型管理”标签页按模型提前安装、继续下载、取消或删除本地模型。删除需要再次确认，只移除所选模型的权重与断点文件，运行环境和其他模型不受影响。安装过程会创建隔离环境，下载固定 revision 的运行器与权重，并逐文件校验 SHA-256。SeedVR2 下载约 7.3 GB 的 3B FP16 与 VAE 权重；SwiftVR 下载约 20.2 GB 的 5B BF16 权重。blocked 的 FlashVSR 不会开始下载。
+也可以在独立的“AI 模型管理”标签页按模型提前安装、继续下载、取消或删除本地模型。删除需要再次确认，只移除所选模型的权重与断点文件，运行环境和其他模型不受影响。安装过程会创建隔离环境，下载固定 revision 的运行器与权重，并逐文件校验 SHA-256。SeedVR2 下载约 7.3 GB 的 3B FP16 与 VAE 权重；SwiftVR 下载约 20.2 GB 的 5B BF16 权重。
 
 模型管理页支持查看每个模型的实时百分比、下载容量、速度、耗时和预计剩余时间。中途取消会停止下载或安装进程；已完整下载的文件会保留，`.download` 临时文件也会保留，普通重试会自动断点续传。如果用户在启动窗口明确选择从零重下，程序只会清理所选模型的权重和校验记录，保留 runtime 与其他模型。AI 视频任务中途取消时会停止整个 AI/FFmpeg 进程组并删除未完成成片。已通过完整性检查的模型不会在下次启动时重复安装或下载。
 
@@ -233,7 +230,7 @@ ffprobe -version
 
 便携版 EXE 是一键启动器，旁边的 `app`、`vendor` 和 requirements 文件是程序本体的一部分，不能只单独复制 EXE。启动器会查找兼容的 Python，建立项目内独立环境，并检查 FFmpeg、FFprobe、`nvidia-smi` 和 RTX 5090。缺少 Python 3.12 或 FFmpeg 时会在可用的情况下通过 WinGet 自动安装；请保留启动窗口，按其中提示处理系统确认。模型不会打进 ZIP。
 
-本地网页服务就绪后，启动窗口会依次询问是否准备尚未完整就绪的 SeedVR2 和实验版 SwiftVR。输入 `y` 安装环境、下载缺少文件并在窗口中查看进度，输入 `n` 或直接按 Enter 跳过；跳过后浏览器仍会正常打开。以后可随时在网页“AI 模型管理”中逐个下载、继续下载、取消并查看进度。网页下载失败、取消或留下部分文件后，再次运行 `LocalVideoCutter.exe` 会显示 `Continue, restart from zero, or skip? [c/r/N]`：`c` 断点续传，`r` 只清理该模型权重后从零重下，`n` 或直接按 Enter 跳过。清理不会动 runtime 或其他模型；即使网页服务已经在运行，再次双击启动器也会显示恢复提示。FlashVSR 是 blocked 状态，不会询问或下载。如果需要无人值守启动，可在 PowerShell 中运行 `LocalVideoCutter.exe --skip-model-prompt`，但普通用户直接双击即可。
+本地网页服务就绪后，启动窗口会依次询问是否准备尚未完整就绪的 SeedVR2 和实验版 SwiftVR。输入 `y` 安装环境、下载缺少文件并在窗口中查看进度，输入 `n` 或直接按 Enter 跳过；跳过后浏览器仍会正常打开。以后可随时在网页“AI 模型管理”中逐个下载、继续下载、取消并查看进度。网页下载失败、取消或留下部分文件后，再次运行 `LocalVideoCutter.exe` 会显示 `Continue, restart from zero, or skip? [c/r/N]`：`c` 断点续传，`r` 只清理该模型权重后从零重下，`n` 或直接按 Enter 跳过。清理不会动 runtime 或其他模型；即使网页服务已经在运行，再次双击启动器也会显示恢复提示。如果需要无人值守启动，可在 PowerShell 中运行 `LocalVideoCutter.exe --skip-model-prompt`，但普通用户直接双击即可。
 
 便携包应放在桌面、下载目录或其他普通用户可写目录，不要放入 `Program Files`。程序数据会写在便携包内部的 `.venv` 和 `data` 目录，因此移动到另一台 Windows 电脑时应复制整个文件夹；第一次在新电脑上仍会按该机器重新准备运行环境。
 
@@ -257,7 +254,7 @@ ffmpeg -version
 
 - Web 服务只监听 `127.0.0.1`，不向局域网或公网开放。
 - 所选视频直接从原位置读取，不会上传到服务器，也不会复制到项目目录。
-- 预览、最终剪辑、逐帧截图和永久旋转都由本机 FFmpeg 完成；Windows AI 超清由本机已选择的 SeedVR2 或 SwiftVR、对应的 PyTorch CUDA 环境以及 FFmpeg 完成。blocked 的 FlashVSR 不会执行。
+- 预览、最终剪辑、逐帧截图和永久旋转都由本机 FFmpeg 完成；Windows AI 超清由本机已选择的 SeedVR2 或 SwiftVR、对应的 PyTorch CUDA 环境以及 FFmpeg 完成。
 - 剪辑与逐帧截图的保存目录设置记录在项目内的 `data/settings.json`；永久旋转和 Windows AI 超清始终使用原视频同级目录。视频内容不会写入该配置。
 - 首次安装依赖时会访问 Homebrew、WinGet 或 PyPI；Windows 第一次 AI 任务还会从固定 GitHub/Hugging Face 地址下载运行器和模型，但视频素材始终不会上传。
 
@@ -293,15 +290,15 @@ brew install python ffmpeg
 
 先在 PowerShell 运行 `nvidia-smi`。如果没有命令、未列出 RTX 5090，或驱动分支低于 R580，请从 NVIDIA 官网安装新驱动并重启。只安装 CUDA Toolkit 不能代替显卡驱动，本项目本身也不需要 CUDA Toolkit。
 
-如果 `nvidia-smi` 正常，但模型页仍不可用，请关闭旧的启动窗口，重新运行 `LocalVideoCutter.exe`（源码版运行 `start.bat`），让模型各自的 AI 环境完成校验。SeedVR2 使用 PyTorch `2.12.1` `cu130`，SwiftVR 使用 PyTorch `2.10.0` `cu130`；不要把系统里另一个 Python 环境的 `torch` 版本当成本项目环境。FlashVSR 显示 blocked 属于预期状态，并不是重新安装 PyTorch 就能解除。
+如果 `nvidia-smi` 正常，但模型页仍不可用，请关闭旧的启动窗口，重新运行 `LocalVideoCutter.exe`（源码版运行 `start.bat`），让模型各自的 AI 环境完成校验。SeedVR2 使用 PyTorch `2.12.1` `cu130`，SwiftVR 使用 PyTorch `2.10.0` `cu130`；不要把系统里另一个 Python 环境的 `torch` 版本当成本项目环境。
 
 ### Windows SmartScreen 显示“未知发布者”
 
 当前 GitHub Release 没有商业代码签名证书，Windows 可能在第一次运行时显示 SmartScreen 提示。请只使用本仓库 Releases 中的 ZIP，并同时下载同页对应的 `.zip.sha256` 文件；确认来源后点击“更多信息”再选择“仍要运行”。SHA-256 可以在 PowerShell 中检查：
 
 ```powershell
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.0.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.0.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.1.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.1.zip.sha256
 ```
 
 第一条命令输出中的 `Hash` 必须与 `.zip.sha256` 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行该文件，应重新下载并再次核对。
@@ -399,4 +396,4 @@ video_cut/
 
 [MIT](LICENSE)
 
-SeedVR2、SwiftVR 与 FlashVSR 的上游代码和模型使用各自项目声明的 Apache License 2.0。本仓库不把大模型权重打进源码包或 Windows 便携 ZIP；SeedVR2 和 SwiftVR 由用户选择后从固定 revision 下载并校验，blocked 的 FlashVSR 不会下载或运行。适配器、许可副本、固定来源和修改说明见 [`vendor/`](vendor/)。
+SeedVR2 与 SwiftVR 的上游代码和模型使用各自项目声明的 Apache License 2.0。本仓库不把大模型权重打进源码包或 Windows 便携 ZIP；它们由用户选择后从固定 revision 下载并校验。适配器、许可副本、固定来源和修改说明见 [`vendor/`](vendor/)。

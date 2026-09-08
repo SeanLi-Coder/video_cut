@@ -19,7 +19,6 @@ from app.ai_enhance import (
 )
 from app.ai_models import (
     DEFAULT_AI_MODEL_ID,
-    FLASHVSR_V1_1_FULL_ID,
     SWIFTVR_5B_BF16_ID,
 )
 from app.main import ApplicationState, _user_media_error, create_app
@@ -152,16 +151,11 @@ def test_cuda_catalog_lists_models_side_by_side_with_safe_statuses(
     assert list(models) == [
         DEFAULT_AI_MODEL_ID,
         SWIFTVR_5B_BF16_ID,
-        FLASHVSR_V1_1_FULL_ID,
     ]
     assert models[DEFAULT_AI_MODEL_ID]["prepared"] is True
     assert models[SWIFTVR_5B_BF16_ID]["compatible"] is True
     assert models[SWIFTVR_5B_BF16_ID]["supported_targets"] == ["1080p"]
     assert models[SWIFTVR_5B_BF16_ID]["downloaded"] is False
-    assert models[FLASHVSR_V1_1_FULL_ID]["visible"] is True
-    assert models[FLASHVSR_V1_1_FULL_ID]["compatible"] is False
-    assert models[FLASHVSR_V1_1_FULL_ID]["startup_prompt"] is False
-    assert "Block-Sparse-Attention" in models[FLASHVSR_V1_1_FULL_ID]["compatibility_reason"]
 
 
 def test_swiftvr_partial_download_is_isolated_and_counts_nested_paths(
@@ -544,7 +538,7 @@ def test_restart_download_api_requires_token_and_normalizes_model_id(
         assert not artifact.exists()
 
 
-def test_restart_download_api_does_not_delete_blocked_model(
+def test_restart_download_api_rejects_unknown_model(
     tmp_path: Path,
     ffmpeg: str,
     ffprobe: str,
@@ -557,22 +551,15 @@ def test_restart_download_api_does_not_delete_blocked_model(
     )
     manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
     state.ai_enhancements = manager
-    artifact = _model_artifact_path(manager, FLASHVSR_V1_1_FULL_ID)
-    artifact.write_bytes(b"blocked model must remain")
-    partial = artifact.with_suffix(artifact.suffix + ".download")
-    partial.write_bytes(b"blocked partial must remain")
 
     with TestClient(create_app(state)) as client:
         token = client.get("/api/bootstrap").json()["app_token"]
         response = client.post(
-            f"/api/ai-models/{FLASHVSR_V1_1_FULL_ID}/download/restart",
+            "/api/ai-models/missing/download/restart",
             headers={"X-App-Token": token},
         )
 
-    assert response.status_code == 400
-    assert "Block-Sparse-Attention" in response.json()["detail"]
-    assert artifact.read_bytes() == b"blocked model must remain"
-    assert partial.read_bytes() == b"blocked partial must remain"
+    assert response.status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -778,7 +765,7 @@ def test_delete_model_rejects_symlinked_parent_without_deleting_target(
     assert outside_artifact.read_bytes() == b"outside target must remain"
 
 
-def test_delete_model_api_is_authenticated_and_allows_blocked_catalog_entries(
+def test_delete_model_api_is_authenticated_and_rejects_unknown_models(
     tmp_path: Path,
     ffmpeg: str,
     ffprobe: str,
@@ -791,14 +778,14 @@ def test_delete_model_api_is_authenticated_and_allows_blocked_catalog_entries(
     )
     manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
     state.ai_enhancements = manager
-    artifact = _model_artifact_path(manager, FLASHVSR_V1_1_FULL_ID)
-    artifact.write_bytes(b"blocked model can be deleted")
-    endpoint = f"/api/ai-models/{FLASHVSR_V1_1_FULL_ID.upper()}/download"
+    artifact = _model_artifact_path(manager, SWIFTVR_5B_BF16_ID)
+    artifact.write_bytes(b"model can be deleted")
+    endpoint = f"/api/ai-models/{SWIFTVR_5B_BF16_ID.upper()}/download"
 
     with TestClient(create_app(state)) as client:
         unauthorized = client.delete(endpoint)
         assert unauthorized.status_code == 403
-        assert artifact.read_bytes() == b"blocked model can be deleted"
+        assert artifact.read_bytes() == b"model can be deleted"
 
         token = client.get("/api/bootstrap").json()["app_token"]
         headers = {"X-App-Token": token}
@@ -808,9 +795,9 @@ def test_delete_model_api_is_authenticated_and_allows_blocked_catalog_entries(
     assert deleted.status_code == 200, deleted.text
     assert deleted.headers["Cache-Control"] == "no-store"
     payload = deleted.json()
-    assert payload["model_id"] == FLASHVSR_V1_1_FULL_ID
+    assert payload["model_id"] == SWIFTVR_5B_BF16_ID
     assert payload["deleted"] is True
-    assert payload["deleted_bytes"] == len(b"blocked model can be deleted")
+    assert payload["deleted_bytes"] == len(b"model can be deleted")
     assert payload["runtime_preserved"] is True
     assert payload["download"]["downloaded_bytes"] == 0
     assert not artifact.exists()
@@ -984,7 +971,7 @@ def test_swiftvr_installer_imports_runtime_dependencies_before_marker(
     assert marker.is_file()
 
 
-def test_model_specific_api_exposes_catalog_and_blocks_flash_download(
+def test_model_specific_api_exposes_catalog_and_rejects_unknown_models(
     tmp_path: Path,
     ffmpeg: str,
     ffprobe: str,
@@ -1003,6 +990,10 @@ def test_model_specific_api_exposes_catalog_and_blocks_flash_download(
         response = client.get("/api/ai-models", headers=headers)
         assert response.status_code == 200
         assert response.json()["default_model_id"] == DEFAULT_AI_MODEL_ID
+        assert [model["id"] for model in response.json()["models"]] == [
+            DEFAULT_AI_MODEL_ID,
+            SWIFTVR_5B_BF16_ID,
+        ]
 
         swift = client.get(
             f"/api/ai-models/{SWIFTVR_5B_BF16_ID}/download",
@@ -1032,13 +1023,6 @@ def test_model_specific_api_exposes_catalog_and_blocks_flash_download(
         )
         assert legacy_cancel.status_code == 200
         assert legacy_cancel.json()["model_id"] == DEFAULT_AI_MODEL_ID
-
-        blocked = client.post(
-            f"/api/ai-models/{FLASHVSR_V1_1_FULL_ID}/download",
-            headers=headers,
-        )
-        assert blocked.status_code == 400
-        assert "Block-Sparse-Attention" in blocked.json()["detail"]
 
         missing = client.get("/api/ai-models/missing/download", headers=headers)
         assert missing.status_code == 404

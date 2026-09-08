@@ -223,17 +223,27 @@ def test_frontend_supports_selectable_ai_model_catalog() -> None:
     for model_id, model_name in (
         ("seedvr2-3b-fp16", "SeedVR2 3B FP16"),
         ("swiftvr-5b-bf16", "SwiftVR 5B BF16"),
-        ("flashvsr-v1-1-full", "FlashVSR v1.1 Full"),
     ):
         assert model_id in javascript
         assert model_id in html
         assert model_name in javascript
         assert model_name in html
 
+    for removed_copy in (
+        "flashvsr-v1-1-full",
+        "FlashVSR",
+        "Block-Sparse-Attention",
+        "等待 RTX 50 兼容验证",
+    ):
+        assert removed_copy not in javascript
+        assert removed_copy not in html
+
     assert 'apiRequest("/api/ai-models")' in javascript
     assert "/api/ai-models/${encodeURIComponent(modelId)}/download" in javascript
     assert "/api/ai-models/${encodeURIComponent(modelId)}/download/cancel" in javascript
     assert "model_id: state.selectedAiModelId" in javascript
+    assert "const AVAILABLE_AI_MODEL_IDS" in javascript
+    assert "AVAILABLE_AI_MODEL_IDS.has" in javascript
     assert "function aiModelCanRun" in javascript
     assert "function aiModelReadyToEnhance" in javascript
     assert "model?.id === DEFAULT_AI_MODEL_ID" in javascript
@@ -251,9 +261,8 @@ def test_frontend_supports_selectable_ai_model_catalog() -> None:
     assert 'id="model-selector"' in html
     assert 'id="model-compatibility-note"' in html
     assert 'data-status="experimental"' in html
-    assert 'data-status="blocked"' in html
+    assert 'data-status="blocked"' not in html
     assert "仅 1080p" in html
-    assert "Block-Sparse-Attention 尚未验证" in html
 
 
 def test_frontend_can_delete_an_installed_ai_model_with_confirmation() -> None:
