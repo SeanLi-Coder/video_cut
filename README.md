@@ -1,6 +1,6 @@
-# 本地视频剪辑、逐帧截图、永久旋转与 AI 超清
+# 本地视频剪辑、逐帧截图、永久旋转与 Windows AI 超清
 
-一个面向 macOS 和 Windows 11 的跨平台本地视频处理工具，提供“剪辑视频”“逐帧截图”“永久旋转”和“AI 超清”四种模式，并带独立的 AI 模型预下载与进度管理页面。macOS 双击 `start.command`，Windows 便携版双击 `LocalVideoCutter.exe` 即可启动；视频不会上传，原文件也不会被修改。
+一个面向 macOS 和 Windows 11 的本地视频处理工具。macOS 版本只提供“剪辑视频”“逐帧截图”和“永久旋转”，不会显示 AI 超清、模型管理或下载代理入口；Windows RTX/CUDA 版本另外提供“AI 超清”和独立的模型管理页面。macOS 双击 `start.command`，Windows 便携版双击 `LocalVideoCutter.exe` 即可启动；视频不会上传，原文件也不会被修改。
 
 ## 零基础使用方法
 
@@ -28,35 +28,37 @@
 
 第一次安装需要联网，可能持续几分钟。启动时打开的 Terminal 或 Windows Console 窗口在工具运行期间需要保持打开。
 
-### 3. 提前下载 AI 模型（可选）
+### 3. Windows 提前下载 AI 模型（可选）
 
-服务启动后，Terminal 或 Windows Console 会逐个询问是否立即准备当前设备兼容但尚未完整就绪的 AI 模型。输入 `y` 并按 Enter 会安装所需环境、下载缺少的文件，并显示百分比、速度和预计剩余时间；输入 `n` 或直接按 Enter 会跳过这个模型并继续启动，不会禁用基础视频功能，也不会阻止以后再下载。Apple Silicon 只会询问稳定版 SeedVR2；Windows RTX 5090 还会询问实验版 SwiftVR。处于 blocked 状态的 FlashVSR 不会进入启动询问。
+本节只适用于 Windows 11 RTX/CUDA 版本。macOS 启动时不会检查、询问或下载 AI 模型，也不会配置 AI 下载代理。
 
-普通下载支持断点续传。如果网页下载曾失败、取消，或磁盘上留有部分文件，下次运行启动器会显示 `Continue, restart from zero, or skip? [c/r/N]`：输入 `c` 从已下载位置继续，输入 `r` 只清理当前这个模型的权重并从零重下，输入 `n` 或直接按 Enter 跳过。清理不会删除已安装的 AI runtime，也不会影响其他模型。即使本地网页服务已经在运行，再次运行 `start.command`、`LocalVideoCutter.exe` 或 `start.bat` 也会先显示可恢复下载的模型，然后再重新打开网页。
+Windows 本地服务启动后，Windows Console 会逐个询问是否立即准备兼容但尚未完整就绪的 AI 模型。输入 `y` 并按 Enter 会安装所需环境、下载缺少的文件，并显示百分比、速度和预计剩余时间；输入 `n` 或直接按 Enter 会跳过这个模型并继续启动，不会禁用基础视频功能，也不会阻止以后再下载。RTX 5090 会询问稳定版 SeedVR2 和实验版 SwiftVR；处于 blocked 状态的 FlashVSR 不会进入启动询问。
+
+普通下载支持断点续传。如果网页下载曾失败、取消，或磁盘上留有部分文件，下次运行 Windows 启动器会显示 `Continue, restart from zero, or skip? [c/r/N]`：输入 `c` 从已下载位置继续，输入 `r` 只清理当前这个模型的权重并从零重下，输入 `n` 或直接按 Enter 跳过。清理不会删除已安装的 AI runtime，也不会影响其他模型。即使本地网页服务已经在运行，再次运行 `LocalVideoCutter.exe` 或 `start.bat` 也会先显示可恢复下载的模型，然后再重新打开网页。
 
 如果下载模型需要代理，启动窗口会在第一个新下载或恢复任务之前显示当前设置：在 `AI download proxy [Enter=keep, s=set/change, c=clear]` 处直接按 Enter 沿用，输入 `s` 后可填写例如 `socks5://127.0.0.1:7897` 或 `http://127.0.0.1:7897`，输入 `c` 则清除。代理账号可选，密码输入不会回显；保存后启动器会先做一次连接测试并显示延迟，再继续询问是否下载模型。只有正在进行的任务不会重新询问或中途切换代理。
 
-也可以全部跳过，等浏览器打开后进入独立的“AI 模型管理”标签页。页面上方可以填写、测试、保存或清除同一份下载代理；下方每个模型都有自己的状态、兼容性说明和下载按钮，无需先选择视频或保存目录。页面会显示实际检测到的设备名称、后端、显存或统一内存，以及当前阶段、百分比、已下载容量、下载速度、已用时间和预计剩余时间。切换回“视频处理”不会中断；刷新页面后也会自动找回正在运行的任务。取消后已下载部分会保留，下次点击“继续下载”会断点续传。已下载或部分下载的模型可在二次确认后单独删除；删除只清理该模型的权重、VAE、校验缓存和断点文件，保留其运行环境及其他模型。全部文件通过 SHA-256 校验后，模型才能运行。
+也可以全部跳过，等浏览器打开后进入独立的“AI 模型管理”标签页。页面上方可以填写、测试、保存或清除同一份下载代理；下方每个模型都有自己的状态、兼容性说明和下载按钮，无需先选择视频或保存目录。页面会显示实际检测到的设备名称、CUDA 后端与显存，以及当前阶段、百分比、已下载容量、下载速度、已用时间和预计剩余时间。切换回“视频处理”不会中断；刷新页面后也会自动找回正在运行的任务。取消后已下载部分会保留，下次点击“继续下载”会断点续传。已下载或部分下载的模型可在二次确认后单独删除；删除只清理该模型的权重、VAE、校验缓存和断点文件，保留其运行环境及其他模型。全部文件通过 SHA-256 校验后，模型才能运行。
 
-应用内代理支持 `http://`、`https://`、`socks5://` 和 `socks5h://`，会同时用于 AI 运行器、模型权重和隔离环境依赖下载。`socks5://` 在本机解析目标域名；如果本地 DNS 也受限，可改用由代理端解析域名的 `socks5h://`。每个任务在开始时固定代理设置，页面中途修改只对下一次新开始或重试生效。代理设置保存在本机项目的 `data/settings.json`，API 和页面不会回传已保存的密码；在共用电脑或复制整个项目目录前，建议先点“清除代理”。首次创建应用自身的 `.venv`、Homebrew 或 WinGet 下载发生在网页服务启动之前，因此这几个最早步骤仍需使用系统/终端代理。
+应用内代理支持 `http://`、`https://`、`socks5://` 和 `socks5h://`，会同时用于 AI 运行器、模型权重和隔离环境依赖下载。`socks5://` 在本机解析目标域名；如果本地 DNS 也受限，可改用由代理端解析域名的 `socks5h://`。每个任务在开始时固定代理设置，页面中途修改只对下一次新开始或重试生效。代理设置保存在本机项目的 `data/settings.json`，API 和页面不会回传已保存的密码；在共用电脑或复制整个项目目录前，建议先点“清除代理”。首次创建应用自身的 `.venv` 或 WinGet 下载发生在网页服务启动之前，因此这几个最早步骤仍需使用 Windows 系统代理。
 
-SeedVR2 权重约 7.3 GB，SwiftVR 权重约 20.2 GB，运行环境还会另外占用空间。Apple Silicon 只安装 SeedVR2 建议至少留出约 12 GB，Windows RTX 5090 只安装 SeedVR2 建议至少留出约 18 GB；Windows 同时安装 SeedVR2 与 SwiftVR 建议至少留出约 60 GB。启动时预下载不是强制步骤：SeedVR2 可以在第一次任务时自动准备；SwiftVR 必须先在启动窗口输入 `y`，或稍后到“AI 模型管理”完成准备，网页才会允许开始 SwiftVR 任务。
+SeedVR2 权重约 7.3 GB，SwiftVR 权重约 20.2 GB，运行环境还会另外占用空间。Windows RTX 5090 只安装 SeedVR2 建议至少留出约 18 GB；同时安装 SeedVR2 与 SwiftVR 建议至少留出约 60 GB。启动时预下载不是强制步骤：SeedVR2 可以在第一次任务时自动准备；SwiftVR 必须先在启动窗口输入 `y`，或稍后到“AI 模型管理”完成准备，网页才会允许开始 SwiftVR 任务。
 
 ### 4. 选择视频和保存位置
 
 1. 在网页中点击“选择视频”，从系统文件选择窗口选取本地视频。
 2. 使用“剪辑视频”或“逐帧截图”时，点击“选择文件夹”选取保存目录。这个目录会被记住，下次启动仍可使用，也可以随时更换。
 
-永久旋转和 AI 超清都不需要、也不会让用户选择保存目录：新视频固定生成在原视频同级目录，页面会在选择原片后显示实际位置。
+永久旋转不需要、也不会让用户选择保存目录：新视频固定生成在原视频同级目录，页面会在选择原片后显示实际位置。Windows 的 AI 超清同样固定保存到原视频同级目录。
 
 ### 5. 选择功能
 
-页面顶部可以选择：
+macOS 页面顶部只显示前三项；Windows RTX/CUDA 版本另外显示第四项：
 
 - **剪辑视频**：把所选范围保存为一段新视频。
 - **逐帧截图**：把所选范围内的每一帧保存为无损图片；填写或修改起始时间后，结束时间默认自动设为起点后 5 秒（视频剩余不足 5 秒时到视频结尾）。仍可手动修改结束时间，但单次范围最多 5 秒，超过时页面会立即提示并禁止开始。
 - **永久旋转**：把整段视频顺时针旋转 90°、180°、270° 或 360°，方向真正写进画面并生成同级新文件。
-- **AI 超清**：先选择当前设备上可运行的模型，再处理整段视频。稳定版 SeedVR2 3B FP16 支持 1080p、2K QHD 和 4K UHD；Windows RTX 5090 上的实验版 SwiftVR 5B BF16 当前只开放 1080p。
+- **AI 超清（仅 Windows RTX/CUDA）**：先选择当前设备上可运行的模型，再处理整段视频。稳定版 SeedVR2 3B FP16 支持 1080p、2K QHD 和 4K UHD；实验版 SwiftVR 5B BF16 当前只开放 1080p。macOS 页面没有此模式。
 
 剪辑和逐帧截图始终只有“起始时间”和“结束时间”两个文本参数。支持以下格式：
 
@@ -70,15 +72,15 @@ SeedVR2 权重约 7.3 GB，SwiftVR 权重约 20.2 GB，运行环境还会另外�
 
 永久旋转不需要填写时间，只需点击 90°、180°、270° 或 360°。右侧画面会立即按新角度预览；换一个角度，预览也会立即更新。360° 看起来与原方向相同，但仍会生成一份已固化方向、已清除旋转标记的新视频。
 
-AI 超清也不需要填写时间。选择一个目标清晰度即可；右侧播放的是整段原片内容预览，不是假装实时生成的 AI 效果。AI 成片需要完整计算后才能查看。
+Windows 的 AI 超清不需要填写时间。选择一个目标清晰度即可；右侧播放的是整段原片内容预览，不是假装实时生成的 AI 效果。AI 成片需要完整计算后才能查看。
 
 ### 6. 预览并输出
 
 两个时间都有效后，页面会生成对应片段的预览。修改任意一个时间，预览会按新范围重新生成；逐帧截图模式下修改起始时间时，结束时间也会自动跟随为起点后 5 秒。
 
-剪辑模式下点击“确定并导出”；逐帧截图模式下点击“确定并截图”；永久旋转模式下点击“确定并旋转”；AI 模式下点击“确定并开始 AI 超清”。完成后可以直接点击“在文件夹中显示”。四种操作都会创建新内容，原视频始终保留不变。
+剪辑模式下点击“确定并导出”；逐帧截图模式下点击“确定并截图”；永久旋转模式下点击“确定并旋转”。Windows AI 模式下点击“确定并开始 AI 超清”。完成后可以直接点击“在文件夹中显示”。所有操作都会创建新内容，原视频始终保留不变。
 
-运行中的剪辑、逐帧截图、永久旋转和 AI 超清会显示动态预计剩余时间。开始阶段尚无足够速度样本时会显示“正在估算”，进入校验、音频封装等短暂阶段后会显示“正在收尾”；预计时间会根据实际处理速度持续修正，并不是完成时间承诺。
+运行中的剪辑、逐帧截图和永久旋转会显示动态预计剩余时间；Windows 的 AI 超清也会显示。开始阶段尚无足够速度样本时会显示“正在估算”，进入校验、音频封装等短暂阶段后会显示“正在收尾”；预计时间会根据实际处理速度持续修正，并不是完成时间承诺。
 
 剪辑视频的默认文件名为：
 
@@ -113,7 +115,7 @@ AI 超清也不需要填写时间。选择一个目标清晰度即可；右侧�
 
 例如 `旅行_rotated_90.mp4`。如果素材需要 MOV 或无损 FFV1 容器，扩展名会自动改为 `.mov` 或 `.mkv`；同名时同样自动添加 `_2`、`_3`，绝不覆盖旧文件。
 
-AI 超清的默认文件名为：
+Windows AI 超清的默认文件名为：
 
 ```text
 原文件名_ai_1080p.mp4
@@ -123,17 +125,17 @@ AI 超清的默认文件名为：
 
 成片固定保存在原视频同级目录。如果主音轨无法安全放进 MP4，程序会按音频编码自动改用 MOV 或 MKV；同名文件同样自动编号，不会覆盖旧文件。
 
-## AI 超清：模型选择与使用边界
+## Windows AI 超清：模型选择与使用边界
 
 本项目使用固定 revision 和 SHA-256 的模型目录，不会在失败后偷偷改成 FP8、GGUF、逐帧 Real-ESRGAN 或其他低质量替代方案。**SeedVR2 3B FP16** 仍是稳定版和默认选项；Windows RTX 5090 另外提供实验性的 **SwiftVR 5B BF16**。**FlashVSR v1.1 Full** 的模型卡可以选择查看技术状态与 blocked 原因，但当前不可下载、不可运行。
 
 | 模型 | 状态 | 可用设备 | 当前目标档位 | 权重下载 | 启动时询问 |
 |---|---|---|---|---:|---|
-| SeedVR2 3B FP16 | stable、默认 | Apple Silicon MPS；Windows 11 RTX 5090 CUDA | 1080p、2K、4K | 约 7.3 GB | 是 |
+| SeedVR2 3B FP16 | stable、默认 | Windows 11 RTX 5090 CUDA | 1080p、2K、4K | 约 7.3 GB | 是 |
 | SwiftVR 5B BF16 | experimental | 仅 Windows 11 RTX 5090 CUDA | 仅 1080p | 约 20.2 GB | 是 |
 | FlashVSR v1.1 Full | blocked | RTX 5090 的 CUDA 页面中仅可见 | 暂不开放 | 不允许下载 | 否 |
 
-SeedVR2 会同时利用相邻帧恢复细节，能减少逐帧图像模型常见的纹理闪烁。选择 3B FP16 不是为了省时间：SeedVR2 官方论文的专家盲测中，蒸馏后的普通 3B 模型相对普通 7B 模型，在 Visual Quality 和包含时序一致性的 Overall Quality 上都高出 16%。后加的 7B sharp checkpoint 没有对应官方盲测，不能把“更锐”直接当成“总体更好”。依据见 [SeedVR2 论文](https://arxiv.org/html/2506.05301)和[官方项目](https://github.com/ByteDance-Seed/SeedVR)。这里的“默认”表示本项目当前成熟、跨 MPS/CUDA 的质量优先方案，并不是声称它对所有素材和硬件绝对领先。
+SeedVR2 会同时利用相邻帧恢复细节，能减少逐帧图像模型常见的纹理闪烁。选择 3B FP16 不是为了省时间：SeedVR2 官方论文的专家盲测中，蒸馏后的普通 3B 模型相对普通 7B 模型，在 Visual Quality 和包含时序一致性的 Overall Quality 上都高出 16%。后加的 7B sharp checkpoint 没有对应官方盲测，不能把“更锐”直接当成“总体更好”。依据见 [SeedVR2 论文](https://arxiv.org/html/2506.05301)和[官方项目](https://github.com/ByteDance-Seed/SeedVR)。这里的“默认”表示本项目当前 Windows CUDA 质量优先方案，并不是声称它对所有素材和硬件绝对领先。
 
 SwiftVR 是 5B BF16 的流式一阶段视频修复模型。本版本把它作为 Windows RTX 5090 的可选实验路径，并且只开放 1080p；它不会取代稳定默认值，也不会在 SeedVR2 失败时自动接管。它的安装、模型文件和任务进度与 SeedVR2 独立。当前适配是在 Apple M2 开发机完成的，还没有经过真实 RTX 5090 推理验收，因此请先用短片核对显存峰值、速度、帧数、颜色、音频和成片质量，再决定是否处理长片。
 
@@ -149,12 +151,7 @@ SwiftVR 是 5B BF16 的流式一阶段视频修复模型。本版本把它作为
 
 画面保持原始宽高比，不拉伸、不裁边；超宽或其他比例会落在对应边界以内。同分辨率可以做 restoration；如果某个档位会缩小原片，该按钮会禁用。
 
-稳定或实验模型支持以下本地加速路径：
-
-- Apple Silicon Mac：SeedVR2 使用 PyTorch MPS。
-- Windows 11 + NVIDIA GeForce RTX 5090：SeedVR2 使用 PyTorch `2.12.1` 的 CUDA 13.0（`cu130`）官方 wheel；SwiftVR 使用隔离的 PyTorch `2.10.0` `cu130` 环境。
-
-SeedVR2 的两条路径使用完全相同的 3B FP16 权重和 PyTorch SDPA attention。RTX 5090 路径不会默认换成 FP8，也不会默认安装 SageAttention、Apex、FlashAttention 或额外 Triton kernel；这样可以保留 FP16 质量并避免把一次性编译、第三方二进制兼容性变成稳定路径的前置条件。程序不会因显存不足静默降低模型精度，也不会把一个模型的任务悄悄换给另一个模型。
+Windows 11 + NVIDIA GeForce RTX 5090 上，SeedVR2 使用 PyTorch `2.12.1` 的 CUDA 13.0（`cu130`）官方 wheel；SwiftVR 使用隔离的 PyTorch `2.10.0` `cu130` 环境。SeedVR2 不会默认换成 FP8，也不会默认安装 SageAttention、Apex、FlashAttention 或额外 Triton kernel；这样可以保留 FP16 质量并避免把一次性编译、第三方二进制兼容性变成稳定路径的前置条件。程序不会因显存不足静默降低模型精度，也不会把一个模型的任务悄悄换给另一个模型。
 
 启动器会在本地网页服务就绪后检查当前设备兼容、允许启动提示且尚未完整准备的模型。若至少有一个任务尚未开始，会先显示 `AI download proxy [Enter=keep, s=set/change, c=clear]`，网页和命令行共用这份设置。新下载随后显示 `Download this model now? [y/N]`；检测到失败、取消或残留的部分文件时，会改为显示 `Continue, restart from zero, or skip? [c/r/N]`。`c` 使用 HTTP Range 从断点续传，`r` 只删除所选模型的已有权重和 `.download` 文件后从零重下，`n` 或直接按 Enter 跳过。重下不会删除该模型的 runtime 或任何其他模型。某个模型准备失败不会阻止基础工具启动。已有实例运行时再次启动程序，也会检查并显示恢复提示；如果同一模型仍在下载，则直接在命令行接管其进度显示。自动化或无人值守启动可传入 `--skip-model-prompt`，它会同时跳过命令行代理与模型询问，不会隐藏网页模型管理功能。
 
@@ -162,7 +159,7 @@ SeedVR2 的两条路径使用完全相同的 3B FP16 权重和 PyTorch SDPA atte
 
 模型管理页支持查看每个模型的实时百分比、下载容量、速度、耗时和预计剩余时间。中途取消会停止下载或安装进程；已完整下载的文件会保留，`.download` 临时文件也会保留，普通重试会自动断点续传。如果用户在启动窗口明确选择从零重下，程序只会清理所选模型的权重和校验记录，保留 runtime 与其他模型。AI 视频任务中途取消时会停止整个 AI/FFmpeg 进程组并删除未完成成片。已通过完整性检查的模型不会在下次启动时重复安装或下载。
 
-Apple Silicon 有不同统一内存容量，RTX 5090 提供独立显存。SeedVR2 会根据当前设备和目标尺寸调整同一个 FP16 模型的时序 batch，不会降低模型精度；RTX 5090 默认对 1080p、2K、4K 分别使用 `21`、`13`、`5` 帧 batch。1080p 的 `21` 来自上游 24 GB+ FP16 推荐配置，2K 与 4K 按像素量和 32 GB 显存保守缩小。batch 越高通常越有利于时序一致性，但三档仍必须在实机用短片验证显存峰值。1080p、2K、4K 的内存需求相差很大，4K 仍可能因可用内存不足而明确失败。SwiftVR 当前只允许 1080p，不会为了接受 2K/4K 请求而静默改变参数。4K 是本工具的输出尺寸档位，不代表任一模型对任意素材都给出了 4K 质量保证。关闭占用大量内存或显存的软件后重试，或选择较低目标档位。时序生成模型在重度退化或大幅运动素材上仍可能恢复失败，原本已经很清晰的素材也可能被过度生成或锐化；AI 生成的细节不是原片中可证明存在的真实细节。
+SeedVR2 会根据目标尺寸调整同一个 FP16 模型的时序 batch，不会降低模型精度；RTX 5090 默认对 1080p、2K、4K 分别使用 `21`、`13`、`5` 帧 batch。1080p 的 `21` 来自上游 24 GB+ FP16 推荐配置，2K 与 4K 按像素量和 32 GB 显存保守缩小。batch 越高通常越有利于时序一致性，但三档仍必须在实机用短片验证显存峰值。1080p、2K、4K 的显存需求相差很大，4K 仍可能因可用显存不足而明确失败。SwiftVR 当前只允许 1080p，不会为了接受 2K/4K 请求而静默改变参数。4K 是本工具的输出尺寸档位，不代表任一模型对任意素材都给出了 4K 质量保证。关闭占用大量显存的软件后重试，或选择较低目标档位。时序生成模型在重度退化或大幅运动素材上仍可能恢复失败，原本已经很清晰的素材也可能被过度生成或锐化；AI 生成的细节不是原片中可证明存在的真实细节。
 
 > RTX 5090 验收状态：SeedVR2 CUDA 与 SwiftVR 的当前适配代码是在 Apple M2 开发机上完成，可通过静态检查、mock 设备测试和无 CUDA 的自动化测试，但这些不能替代真实显卡运行。正式处理重要长视频前，仍必须在实际的 Windows 11 + RTX 5090 电脑上完成各模型安装、短片推理、显存峰值、取消任务和成片校验；在这一步完成前，不应把“M2 上测试通过”理解为“5090 实机已经验收”。
 
@@ -200,10 +197,9 @@ AI 视频从模型输出的 sRGB full-range RGB 显式进行 transfer、matrix�
 
 ## 安装要求与自动处理边界
 
-基础功能支持 macOS 和 Windows 11：macOS 需要 Python 3.10 或更高版本，Windows 启动器固定使用 Python 3.12；两者都需要包含所需编码器的 FFmpeg。AI 超清还需要带 `libplacebo` 与 `zscale` 的 FFmpeg Full，以及下面一种设备：
+基础功能支持 macOS 和 Windows 11：macOS 需要 Python 3.10 或更高版本，Windows 启动器固定使用 Python 3.12；两者都需要包含所需编码器的标准 FFmpeg。macOS 版本只保留剪辑、逐帧截图和永久旋转，不安装 AI 环境，也不会出现 AI 模型或下载代理提示。
 
-- Apple Silicon（M 系列芯片）、足够的统一内存和至少约 12 GB 模型/环境磁盘空间；`libplacebo` 还需要 MoltenVK。此设备只运行 SeedVR2。
-- NVIDIA GeForce RTX 5090，以及 R580 或更新分支的 NVIDIA 驱动。只安装 SeedVR2 建议至少留出约 18 GB；同时安装约 20.2 GB 权重的 SwiftVR 建议至少留出约 60 GB。两个 CUDA 模型使用各自固定的 `cu130` PyTorch 环境，wheel 已包含所需 CUDA 用户态运行库，**不需要另外安装 CUDA Toolkit**。
+Windows AI 超清需要带 `libplacebo` 与 `zscale` 的 FFmpeg Full、NVIDIA GeForce RTX 5090，以及 R580 或更新分支的 NVIDIA 驱动。只安装 SeedVR2 建议至少留出约 18 GB；同时安装约 20.2 GB 权重的 SwiftVR 建议至少留出约 60 GB。两个 CUDA 模型使用各自固定的 `cu130` PyTorch 环境，wheel 已包含所需 CUDA 用户态运行库，**不需要另外安装 CUDA Toolkit**。
 
 AI 成片会写入原视频所在磁盘，该磁盘还需要单独预留成片空间。RTX 5090 的驱动不会由本工具自动升级；如果 `nvidia-smi` 不可用或驱动过旧，基础视频功能仍可使用，AI 模型页会显示具体原因。
 
@@ -212,7 +208,7 @@ AI 成片会写入原视频所在磁盘，该磁盘还需要单独预留成片�
 `start.command` 会优先查找 Apple Silicon Homebrew 的 `/opt/homebrew/bin/python3`、Intel Homebrew 的 `/usr/local/bin/python3`，再检查当前 `PATH` 中的 `python3`。
 
 - 已安装 Homebrew 但缺少合适的 Python 时，启动脚本会尝试执行 `brew install python`。
-- Apple Silicon Mac 缺少 FFmpeg Full 或 MoltenVK 时，启动器会分别尝试执行 `brew install ffmpeg-full` 和 `brew install molten-vk`；`ffmpeg-full` 是 keg-only，不需要手动 link。基础功能在安装失败时仍可使用。
+- 缺少标准 FFmpeg 时，启动器会尝试执行 `brew install ffmpeg`。
 - 工具不会自动安装 Homebrew。若 Mac 上没有 Homebrew，请先按照 [Homebrew 官网](https://brew.sh/)安装，再重新双击 `start.command`。
 - 自动安装需要网络连接，并可能要求你在 Terminal 中确认系统提示或输入当前 Mac 账号密码。
 - macOS 自带的旧版 `/usr/bin/python3` 不会被替换或修改。
@@ -220,15 +216,15 @@ AI 成片会写入原视频所在磁盘，该磁盘还需要单独预留成片�
 也可以先手动安装 macOS 依赖：
 
 ```bash
-brew install python ffmpeg-full molten-vk
+brew install python ffmpeg
 ```
 
 然后检查：
 
 ```bash
 python3 --version
-/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg -version
-/opt/homebrew/opt/ffmpeg-full/bin/ffprobe -version
+ffmpeg -version
+ffprobe -version
 ```
 
 ### Windows 11 + RTX 5090
@@ -255,15 +251,15 @@ ffmpeg -version
 
 正常情况下，在启动工具的终端窗口按 `Control + C`。如果已经找不到那个窗口，macOS 双击 `stop.command`，Windows 双击 `stop.bat`；Windows 便携版也支持在命令行执行 `LocalVideoCutter.exe --stop`。
 
-导出过程中关闭工具会取消当前导出并清理未完成的临时文件；已经成功完成的文件不会被删除。AI 任务的完整模型缓存不会随取消而删除。
+导出过程中关闭工具会取消当前导出并清理未完成的临时文件；已经成功完成的文件不会被删除。Windows AI 任务的完整模型缓存不会随取消而删除。
 
 ## 隐私与本地处理
 
 - Web 服务只监听 `127.0.0.1`，不向局域网或公网开放。
 - 所选视频直接从原位置读取，不会上传到服务器，也不会复制到项目目录。
-- 预览、最终剪辑、逐帧截图和永久旋转都由本机 FFmpeg 完成；AI 超清由本机已选择的 SeedVR2 或 SwiftVR、对应的 PyTorch MPS/CUDA 环境，以及 FFmpeg 完成。blocked 的 FlashVSR 不会执行。
-- 剪辑与逐帧截图的保存目录设置记录在项目内的 `data/settings.json`；永久旋转和 AI 超清始终使用原视频同级目录。视频内容不会写入该配置。
-- 首次安装依赖时会访问 Homebrew 或 PyPI；第一次 AI 任务还会从固定 GitHub/Hugging Face 地址下载运行器和模型，但视频素材始终不会上传。
+- 预览、最终剪辑、逐帧截图和永久旋转都由本机 FFmpeg 完成；Windows AI 超清由本机已选择的 SeedVR2 或 SwiftVR、对应的 PyTorch CUDA 环境以及 FFmpeg 完成。blocked 的 FlashVSR 不会执行。
+- 剪辑与逐帧截图的保存目录设置记录在项目内的 `data/settings.json`；永久旋转和 Windows AI 超清始终使用原视频同级目录。视频内容不会写入该配置。
+- 首次安装依赖时会访问 Homebrew、WinGet 或 PyPI；Windows 第一次 AI 任务还会从固定 GitHub/Hugging Face 地址下载运行器和模型，但视频素材始终不会上传。
 
 请只处理你本人拥有、已获授权或法律允许使用的视频。
 
@@ -288,7 +284,7 @@ chmod +x start.command stop.command
 先安装 Homebrew，然后执行：
 
 ```bash
-brew install python ffmpeg-full molten-vk
+brew install python ffmpeg
 ```
 
 完全关闭旧 Terminal 后重新双击 `start.command`。Apple Silicon Mac 的 Homebrew 通常位于 `/opt/homebrew`。
@@ -304,15 +300,15 @@ brew install python ffmpeg-full molten-vk
 当前 GitHub Release 没有商业代码签名证书，Windows 可能在第一次运行时显示 SmartScreen 提示。请只使用本仓库 Releases 中的 ZIP，并同时下载同页对应的 `.zip.sha256` 文件；确认来源后点击“更多信息”再选择“仍要运行”。SHA-256 可以在 PowerShell 中检查：
 
 ```powershell
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.9.2.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.9.2.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.0.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.0.zip.sha256
 ```
 
 第一条命令输出中的 `Hash` 必须与 `.zip.sha256` 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行该文件，应重新下载并再次核对。
 
 ### 无法选择视频或保存位置
 
-macOS 请检查“系统设置 → 隐私与安全性 → 文件与文件夹”，允许 Terminal 访问视频所在目录。Windows 请检查文件是否仍被其他程序独占，以及目标目录是否允许当前账号写入。外接磁盘还需要确认磁盘已挂载且保存位置可写。AI 超清和永久旋转固定写入原视频所在文件夹；如果原片在只读目录、只读外接盘或无写入权限的网络位置，请先把原片复制到可写目录再处理。
+macOS 请检查“系统设置 → 隐私与安全性 → 文件与文件夹”，允许 Terminal 访问视频所在目录。Windows 请检查文件是否仍被其他程序独占，以及目标目录是否允许当前账号写入。外接磁盘还需要确认磁盘已挂载且保存位置可写。永久旋转以及 Windows AI 超清固定写入原视频所在文件夹；如果原片在只读目录、只读外接盘或无写入权限的网络位置，请先把原片复制到可写目录再处理。
 
 ### 浏览器没有自动打开
 
@@ -326,11 +322,11 @@ macOS 请检查“系统设置 → 隐私与安全性 → 文件与文件夹”�
 
 精确剪辑和永久旋转都需要高质量重编码，并非简单复制数据。4K、HEVC、10-bit 和长视频会明显更慢；旋转整段视频需要的空间按原视频所在磁盘计算。逐帧截图使用无损图片，即使只有 5 秒，4K/60 fps 也可能产生数百张图片和数 GB 数据；请保持 Terminal 和网页开启，并确保保存位置有足够空间。为保证长 GOP 视频不漏掉目标范围开头的帧，截图会从视频轨起点精确解码到所选位置，因此截取长视频靠后的范围也可能需要等待；页面会持续显示状态，并可随时安全取消。
 
-### AI 超清一直很慢，或者提示内存/显存不足
+### Windows AI 超清一直很慢，或者提示显存不足
 
 这是预期行为。SeedVR2 3B FP16 和 SwiftVR 5B BF16 都是数十亿参数的时序生成模型，本项目优先质量而不是速度，并且最终还会用 CPU 做高质量 10-bit HEVC 编码。几分钟原片可能需要数小时甚至更久。页面会持续显示安装、下载、AI 计算、回封装和验证阶段；可以安全取消。
 
-如果提示 MPS 统一内存或 CUDA 显存不足，请先关闭大型应用和其他 GPU 程序，再选择较低目标档位。程序不会静默换成量化模型或另一个模型。即使同为 M 系列芯片，不同统一内存配置对 4K 的可行性也不同；RTX 5090 上的其他显存占用也会影响可用 batch。SwiftVR 只支持 1080p，无法通过选择 2K/4K 来改善其质量。
+如果提示 CUDA 显存不足，请先关闭大型应用和其他 GPU 程序，再选择较低目标档位。程序不会静默换成量化模型或另一个模型。RTX 5090 上的其他显存占用也会影响可用 batch。SwiftVR 只支持 1080p，无法通过选择 2K/4K 来改善其质量。
 
 ### 更新后仍打开旧页面
 
@@ -355,7 +351,7 @@ python -m pytest
 让启动器完成依赖、FFmpeg、单实例锁和安全退出检查，但不自动打开浏览器：
 
 ```bash
-python launcher.py --no-browser --skip-model-prompt
+python launcher.py --no-browser
 ```
 
 GitHub Actions 会在 macOS、Windows 和 Ubuntu 环境中检查 Python 代码并运行可执行的测试。全部平台测试通过后，Windows runner 才会构建便携 ZIP；它会把成品解压到带空格和中文的路径，以 `--skip-model-prompt` 启动 EXE、检查网页与便携数据目录，再通过同一个 EXE 安全停止。自动化测试能够覆盖平台分支、命令生成和模拟设备探测，但云端 runner 没有 RTX 5090，不能替代前文的真实 5090 推理验收。
@@ -371,7 +367,7 @@ video_cut/
 ├── windows_exe.py            # Windows 便携 EXE 的最小入口
 ├── launcher.py               # macOS Python 环境、依赖、FFmpeg 与进程管理
 ├── launcher_windows.py       # Windows 环境、依赖、FFmpeg 与进程管理
-├── launcher_models.py        # 启动时逐个询问并显示 AI 模型下载进度
+├── launcher_models.py        # Windows 启动时逐个询问并显示 AI 模型下载进度
 ├── process_guard.py          # 首次安装阶段的子进程与锁守护
 ├── run.py                    # 仅供启动器调用的 Uvicorn 服务入口
 ├── stop.py                   # 带实例身份校验的停止逻辑
@@ -388,7 +384,6 @@ video_cut/
 ├── tests/                    # 自动化测试
 ├── .github/workflows/        # GitHub Actions
 ├── requirements.txt          # 运行依赖
-├── requirements-ai.txt       # Apple Silicon MPS 的固定 AI 依赖入口
 ├── requirements-ai-cuda.txt  # SeedVR2 的 RTX 5090 CUDA 13.0 固定依赖
 ├── requirements-ai-swiftvr-cuda.txt # SwiftVR 的隔离 CUDA 13.0 固定依赖
 ├── requirements-ai-common.txt# 两种 AI 后端共用的固定依赖

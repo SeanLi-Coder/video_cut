@@ -180,7 +180,7 @@ AI_MODELS: dict[str, AIModelSpec] = {
     SEEDVR2_3B_FP16_ID: AIModelSpec(
         id=SEEDVR2_3B_FP16_ID,
         name="SeedVR2 3B FP16",
-        description="质量优先的时序视频修复模型，兼容 Apple Silicon 与 RTX 5090。",
+        description="质量优先的时序视频修复模型，面向 RTX 5090。",
         precision="FP16",
         status="stable",
         model_repository=_SEEDVR2_REPOSITORY,

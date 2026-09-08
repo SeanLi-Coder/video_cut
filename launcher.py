@@ -5,7 +5,6 @@ import contextlib
 import hashlib
 import json
 import os
-import platform
 import secrets
 import shutil
 import signal
@@ -38,25 +37,6 @@ PROCESS_GUARD_PATH = PROJECT_ROOT / "process_guard.py"
 APP_ID = "com.seanli.local-video-cutter"
 DEFAULT_PORT = 8777
 MINIMUM_PYTHON = (3, 10)
-FFMPEG_FULL_PREFIXES = (
-    Path("/opt/homebrew/opt/ffmpeg-full"),
-    Path("/usr/local/opt/ffmpeg-full"),
-)
-MOLTEN_VK_PREFIXES = (
-    Path("/opt/homebrew/opt/molten-vk"),
-    Path("/usr/local/opt/molten-vk"),
-)
-FFMPEG_FULL_SMOKE_FILTER = (
-    "setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:"
-    "colorspace=bt2020nc,"
-    "libplacebo=format=gbrp16le:colorspace=gbr:color_primaries=bt709:"
-    "color_trc=iec61966-2-1:range=full:tonemapping=bt.2446a:"
-    "gamut_mode=perceptual:peak_detect=true:contrast_recovery=0:dithering=none,"
-    "setparams=range=full:color_primaries=bt709:"
-    "color_trc=iec61966-2-1:colorspace=gbr,format=gbrp16le,"
-    "zscale=matrix=bt709:range=limited:primaries=bt709:transfer=bt709:"
-    "chromal=left:dither=error_diffusion,format=yuv420p10le"
-)
 _LOCAL_PROXY_HANDLER = ProxyHandler({})
 _LOCAL_HTTP_OPENER = build_opener(_LOCAL_PROXY_HANDLER)
 
@@ -205,160 +185,12 @@ def _prepare_environment(
     return python
 
 
-def _find_ffmpeg_full(brew: str | None) -> tuple[Path, Path] | None:
-    prefixes = list(FFMPEG_FULL_PREFIXES)
-    if brew:
-        try:
-            completed = subprocess.run(
-                [brew, "--prefix", "ffmpeg-full"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            completed = None
-        if completed is not None and completed.returncode == 0:
-            value = completed.stdout.strip()
-            if value:
-                prefixes.insert(0, Path(value))
-    for prefix in prefixes:
-        full_ffmpeg = prefix / "bin" / "ffmpeg"
-        full_ffprobe = prefix / "bin" / "ffprobe"
-        if full_ffmpeg.is_file() and full_ffprobe.is_file():
-            return full_ffmpeg.resolve(), full_ffprobe.resolve()
-    return None
-
-
-def _find_molten_vk_icd(brew: str | None) -> Path | None:
-    prefixes = list(MOLTEN_VK_PREFIXES)
-    if brew:
-        try:
-            completed = subprocess.run(
-                [brew, "--prefix", "molten-vk"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            completed = None
-        if completed is not None and completed.returncode == 0:
-            value = completed.stdout.strip()
-            if value:
-                prefixes.insert(0, Path(value))
-    for prefix in prefixes:
-        candidate = prefix / "etc" / "vulkan" / "icd.d" / "MoltenVK_icd.json"
-        if candidate.is_file():
-            return candidate.resolve()
-    return None
-
-
-def _configure_molten_vk_environment(icd_path: Path | None) -> None:
-    if icd_path is None:
-        return
-    value = str(icd_path)
-    os.environ["VK_DRIVER_FILES"] = value
-    os.environ["VK_ICD_FILENAMES"] = value
-
-
-def _ffmpeg_full_check(ffmpeg: Path) -> tuple[bool, str]:
-    command = [
-        str(ffmpeg),
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        "color=black:size=64x64:rate=1:duration=1",
-        "-vf",
-        FFMPEG_FULL_SMOKE_FILTER,
-        "-frames:v",
-        "1",
-        "-c:v",
-        "libx265",
-        "-pix_fmt",
-        "yuv420p10le",
-        "-f",
-        "null",
-        "-",
-    ]
-    detail = ""
-    for _attempt in range(2):
-        try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=45,
-            )
-        except subprocess.TimeoutExpired:
-            detail = "FFmpeg color-pipeline check timed out"
-            continue
-        except OSError as exc:
-            detail = str(exc)
-            continue
-        if completed.returncode == 0:
-            return True, ""
-        lines = completed.stderr.strip().splitlines()
-        detail = " | ".join(lines[-6:])[-1000:] if lines else f"exit code {completed.returncode}"
-    return False, detail
-
-
-def _ffmpeg_full_usable(ffmpeg: Path) -> bool:
-    return _ffmpeg_full_check(ffmpeg)[0]
-
-
 def _media_executables(
     *,
     stop_requested: threading.Event,
     lock_fd: int,
 ) -> tuple[Path, Path]:
-    apple_silicon = sys.platform == "darwin" and platform.machine().lower() in {
-        "arm64",
-        "aarch64",
-    }
     brew = shutil.which("brew")
-
-    if apple_silicon:
-        full_paths = _find_ffmpeg_full(brew)
-        if full_paths is None and brew:
-            print("FFmpeg Full is required for AI video. Installing it with Homebrew...")
-            return_code = _run_owned(
-                [brew, "install", "ffmpeg-full"],
-                stop_requested=stop_requested,
-                lock_fd=lock_fd,
-            )
-            if return_code == 0:
-                full_paths = _find_ffmpeg_full(brew)
-
-        if full_paths is not None:
-            molten_vk_icd = _find_molten_vk_icd(brew)
-            if molten_vk_icd is None and brew:
-                print(
-                    "MoltenVK is required for libplacebo on macOS. Installing it with Homebrew..."
-                )
-                return_code = _run_owned(
-                    [brew, "install", "molten-vk"],
-                    stop_requested=stop_requested,
-                    lock_fd=lock_fd,
-                )
-                if return_code == 0:
-                    molten_vk_icd = _find_molten_vk_icd(brew)
-            _configure_molten_vk_environment(molten_vk_icd)
-            usable, detail = _ffmpeg_full_check(full_paths[0])
-            if not usable:
-                print(
-                    "FFmpeg Full was found, but its AI color-pipeline check failed. "
-                    f"The full binary will still be used. Detail: {detail}"
-                )
-            return full_paths
-
-        if brew:
-            print("FFmpeg Full could not be installed. Basic video tools will remain available.")
-
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     if ffmpeg and ffprobe:
@@ -544,12 +376,13 @@ def _open_existing_instance(
                 and record.get("project_root") == str(PROJECT_ROOT)
             ):
                 print(f"Local Video Cutter is already running at http://127.0.0.1:{port}")
-                prompt_for_missing_models(
-                    port,
-                    threading.Event(),
-                    skip=skip_model_prompt,
-                    recovery_only=True,
-                )
+                if sys.platform != "darwin":
+                    prompt_for_missing_models(
+                        port,
+                        threading.Event(),
+                        skip=skip_model_prompt,
+                        recovery_only=True,
+                    )
                 if not no_browser:
                     _open_browser(port)
                 return True
@@ -758,11 +591,12 @@ def launch(
                     }
                 )
                 print(f"Local Video Cutter is ready at http://127.0.0.1:{port}")
-                prompt_for_missing_models(
-                    port,
-                    stop_requested,
-                    skip=skip_model_prompt,
-                )
+                if sys.platform != "darwin":
+                    prompt_for_missing_models(
+                        port,
+                        stop_requested,
+                        skip=skip_model_prompt,
+                    )
                 if not no_browser:
                     _open_browser(port)
             while process.poll() is None and not stop_requested.wait(0.25):
@@ -811,7 +645,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Start the Local Video Cutter")
     parser.add_argument("--port", type=_port_argument, default=DEFAULT_PORT)
     parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--skip-model-prompt", action="store_true")
+    parser.add_argument("--skip-model-prompt", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if sys.version_info < MINIMUM_PYTHON:
         print("Python 3.10 or newer is required.")

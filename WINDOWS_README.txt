@@ -1,4 +1,6 @@
-Windows 11 / RTX 5090 便携版使用方法
+Local Video Cutter v1.10.0 — Windows 11 / RTX 5090 便携版使用方法
+
+AI 超清、模型管理、模型下载与代理设置仅在 Windows RTX/CUDA 版本提供；macOS 版本只保留剪辑、逐帧截图和永久旋转。
 
 1. 必须先完整解压 ZIP。请把整个文件夹放到桌面、下载目录或其他可写目录。
 2. 不要只复制 LocalVideoCutter.exe；app、vendor、launcher_models.py 和 requirements 文件必须与 EXE 一起保留。
@@ -31,8 +33,8 @@ RTX 5090 需要已经正确安装 R580 或更新分支的 NVIDIA 驱动；程序
 
 这是未购买商业代码签名证书的未签名构建。Windows SmartScreen 可能首次显示“未知发布者”。本项目 GitHub 仓库是 private 仓库，下载 Releases 前必须登录已获访问权限的 GitHub 账号；如果 RTX 5090 电脑不方便登录，请先在有权限的电脑上下载并核对，再复制完整 ZIP。请同时下载同页对应的 .zip.sha256 文件，在 PowerShell 运行：
 
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.9.2.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.9.2.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.0.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.0.zip.sha256
 
 第一条命令输出中的 Hash 必须与 .zip.sha256 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行；完全相同且确认来源后，才可在 SmartScreen 中点击“更多信息”再选择“仍要运行”。
 

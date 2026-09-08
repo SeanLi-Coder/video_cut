@@ -1239,6 +1239,7 @@ def test_ai_api_starts_without_configured_output_directory(
         settings_path=tmp_path / "settings.json",
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     source = state.register_video(sample_video)
     manager = AIEnhancementManager(
@@ -1478,6 +1479,7 @@ def test_ai_model_download_api_starts_without_video_and_recovers_progress(
         settings_path=tmp_path / "settings.json",
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     manager = AIEnhancementManager(
         ffmpeg=ffmpeg,
@@ -1583,6 +1585,7 @@ def test_ai_model_download_api_cancels_and_keeps_resumable_state(
         settings_path=tmp_path / "settings.json",
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     manager = AIEnhancementManager(
         ffmpeg=ffmpeg,
@@ -1698,6 +1701,7 @@ def test_ai_api_creates_verified_10bit_video_and_copies_audio_packets(
         settings_path=tmp_path / "settings.json",
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     state.ai_enhancements = AIEnhancementManager(
         ffmpeg=ffmpeg,

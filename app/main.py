@@ -199,10 +199,10 @@ def _user_media_error(exc: MediaError) -> str:
         "Export job was not found": "找不到这次导出任务，请刷新页面后重试。",
         "Unsupported AI enhancement target": "请选择 1080p、2K QHD 或 4K UHD。",
         "AI enhancement is only supported on Apple Silicon Mac": (
-            "AI 超清需要 Apple Silicon MPS 或 NVIDIA GeForce RTX 5090。"
+            "AI 超清当前只在 Windows 11 + NVIDIA GeForce RTX 5090 版开放。"
         ),
         "AI enhancement requires Apple Silicon MPS or an RTX 5090": (
-            "AI 超清需要 Apple Silicon MPS 或 NVIDIA GeForce RTX 5090。"
+            "AI 超清当前需要 Windows 11 和 NVIDIA GeForce RTX 5090。"
         ),
         "NVIDIA driver R580 or newer is required for RTX 5090": (
             "RTX 5090 的 CUDA 13.0 环境需要 NVIDIA R580 或更高版本驱动。"
@@ -385,9 +385,15 @@ class ApplicationState:
         settings_path: Path = SETTINGS_PATH,
         ffmpeg: str | None = None,
         ffprobe: str | None = None,
+        ai_features_enabled: bool | None = None,
     ) -> None:
         self.app_token = secrets.token_urlsafe(32)
         self.settings = SettingsStore(settings_path)
+        self.ai_features_enabled = (
+            sys.platform != "darwin"
+            if ai_features_enabled is None
+            else bool(ai_features_enabled)
+        )
         self._lock = threading.RLock()
         self._videos: dict[str, VideoSource] = {}
         self._video_order: deque[str] = deque()
@@ -417,12 +423,13 @@ class ApplicationState:
             )
         with contextlib.suppress(MediaError):
             self.rotations = RotationManager(ffmpeg=resolved_ffmpeg, ffprobe=resolved_ffprobe)
-        self.ai_enhancements = AIEnhancementManager(
-            ffmpeg=resolved_ffmpeg,
-            ffprobe=resolved_ffprobe,
-            base_python=os.environ.get("VIDEO_CUT_AI_BASE_PYTHON"),
-            download_proxy_provider=self.ai_download_proxy,
-        )
+        if self.ai_features_enabled:
+            self.ai_enhancements = AIEnhancementManager(
+                ffmpeg=resolved_ffmpeg,
+                ffprobe=resolved_ffprobe,
+                base_python=os.environ.get("VIDEO_CUT_AI_BASE_PYTHON"),
+                download_proxy_provider=self.ai_download_proxy,
+            )
 
     def output_directory(self) -> Path | None:
         value = self.settings.load().get("output_directory")
@@ -588,6 +595,7 @@ def _video_payload(
     source: VideoSource,
     *,
     color_pipeline_available: bool = True,
+    ai_features_enabled: bool = True,
 ) -> dict[str, Any]:
     metadata = source.metadata
     return {
@@ -612,9 +620,13 @@ def _video_payload(
         "directory_display": _display_path(source.path.parent),
         "preview_url": f"/api/videos/{source.id}/content",
         "preview_mode": "original",
-        "ai_targets": ai_target_options(
-            source,
-            color_pipeline_available=color_pipeline_available,
+        "ai_targets": (
+            ai_target_options(
+                source,
+                color_pipeline_available=color_pipeline_available,
+            )
+            if ai_features_enabled
+            else []
         ),
     }
 
@@ -696,6 +708,15 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         if not x_app_token or not secrets.compare_digest(x_app_token, state.app_token):
             raise HTTPException(status_code=403, detail="页面连接已失效，请刷新后重试。")
 
+    def require_ai_features() -> None:
+        if not state.ai_features_enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="此系统版本不提供 AI 超清与模型管理。",
+            )
+
+    ai_api_dependencies = [Depends(require_app_token), Depends(require_ai_features)]
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> FileResponse:
         return FileResponse(
@@ -714,8 +735,11 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "ffmpeg_ready": state.exports is not None,
             "frame_export_ready": state.frame_exports is not None,
             "rotation_ready": state.rotations is not None,
+            "ai_features_enabled": state.ai_features_enabled,
             "ai_enhance_ready": bool(
-                state.ai_enhancements and state.ai_enhancements.runtime_status()["ready"]
+                state.ai_features_enabled
+                and state.ai_enhancements
+                and state.ai_enhancements.runtime_status()["ready"]
             ),
         }
 
@@ -724,16 +748,14 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         directory = state.output_directory()
         ai_runtime = (
             state.ai_enhancements.runtime_status()
-            if state.ai_enhancements is not None
+            if state.ai_features_enabled and state.ai_enhancements is not None
             else {
                 "supported": False,
                 "ready": False,
                 "prepared": False,
                 "installed": False,
                 "models_downloaded": False,
-                "model_name": "SeedVR2 3B FP16",
-                "first_download_gb": 7.3,
-                "message": "AI 超清运行器未就绪。",
+                "message": "此系统版本不提供 AI 超清与模型管理。",
             }
         )
         return {
@@ -743,7 +765,8 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "ffmpeg_ready": state.exports is not None,
             "frame_export_ready": state.frame_exports is not None,
             "rotation_ready": state.rotations is not None,
-            "ai_enhance_ready": bool(ai_runtime["ready"]),
+            "ai_features_enabled": state.ai_features_enabled,
+            "ai_enhance_ready": bool(state.ai_features_enabled and ai_runtime["ready"]),
             "ai_runtime": ai_runtime,
             "default_ai_model_id": DEFAULT_AI_MODEL_ID,
             "max_frame_seconds": MAX_FRAME_EXTRACTION_SECONDS,
@@ -768,6 +791,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
                 color_pipeline_available=bool(
                     state.ai_enhancements and state.ai_enhancements.color_pipeline_available
                 ),
+                ai_features_enabled=state.ai_features_enabled,
             ),
             "suggested_start": format_timecode(0),
             "suggested_end": format_timecode(source.metadata["duration"]),
@@ -992,7 +1016,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
         return {"job_id": job.id, "output_name": job.output_path.name}
 
-    @app.post("/api/ai-enhancements", dependencies=[Depends(require_app_token)])
+    @app.post("/api/ai-enhancements", dependencies=ai_api_dependencies)
     def create_ai_enhancement(request: AIEnhancementRequest) -> dict[str, Any]:
         try:
             if state.ai_enhancements is None:
@@ -1007,18 +1031,18 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
         return {"job_id": job.id, "output_name": job.output_path.name}
 
-    @app.get("/api/ai-models", dependencies=[Depends(require_app_token)])
+    @app.get("/api/ai-models", dependencies=ai_api_dependencies)
     def ai_models() -> dict[str, Any]:
         if state.ai_enhancements is None:
             raise HTTPException(status_code=503, detail="AI 超清尚未就绪。")
         return state.ai_enhancements.model_catalog_status()
 
-    @app.get("/api/ai-download-proxy", dependencies=[Depends(require_app_token)])
+    @app.get("/api/ai-download-proxy", dependencies=ai_api_dependencies)
     def ai_download_proxy(response: Response) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-store"
         return state.ai_download_proxy_payload()
 
-    @app.put("/api/ai-download-proxy", dependencies=[Depends(require_app_token)])
+    @app.put("/api/ai-download-proxy", dependencies=ai_api_dependencies)
     async def update_ai_download_proxy(request: Request, response: Response) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-store"
         try:
@@ -1034,7 +1058,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=detail) from exc
         return proxy.public_payload()
 
-    @app.delete("/api/ai-download-proxy", dependencies=[Depends(require_app_token)])
+    @app.delete("/api/ai-download-proxy", dependencies=ai_api_dependencies)
     def clear_ai_download_proxy(response: Response) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-store"
         try:
@@ -1046,7 +1070,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             ) from exc
         return direct_proxy_payload()
 
-    @app.post("/api/ai-download-proxy/test", dependencies=[Depends(require_app_token)])
+    @app.post("/api/ai-download-proxy/test", dependencies=ai_api_dependencies)
     async def check_ai_download_proxy(request: Request, response: Response) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-store"
         try:
@@ -1078,7 +1102,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
 
     @app.get(
         "/api/ai-models/{model_id}/download",
-        dependencies=[Depends(require_app_token)],
+        dependencies=ai_api_dependencies,
     )
     def ai_model_download_status_for_model(model_id: str) -> dict[str, Any]:
         try:
@@ -1095,7 +1119,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
 
     @app.post(
         "/api/ai-models/{model_id}/download",
-        dependencies=[Depends(require_app_token)],
+        dependencies=ai_api_dependencies,
     )
     def start_ai_model_download_for_model(model_id: str) -> dict[str, Any]:
         try:
@@ -1109,7 +1133,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
 
     @app.post(
         "/api/ai-models/{model_id}/download/cancel",
-        dependencies=[Depends(require_app_token)],
+        dependencies=ai_api_dependencies,
     )
     def cancel_ai_model_download_for_model(
         model_id: str,
@@ -1132,7 +1156,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
 
     @app.post(
         "/api/ai-models/{model_id}/download/restart",
-        dependencies=[Depends(require_app_token)],
+        dependencies=ai_api_dependencies,
     )
     def restart_ai_model_download_for_model(model_id: str) -> dict[str, Any]:
         try:
@@ -1146,7 +1170,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
 
     @app.delete(
         "/api/ai-models/{model_id}/download",
-        dependencies=[Depends(require_app_token)],
+        dependencies=ai_api_dependencies,
     )
     def delete_ai_model_for_model(model_id: str, response: Response) -> dict[str, Any]:
         response.headers["Cache-Control"] = "no-store"
@@ -1159,7 +1183,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         except MediaError as exc:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
 
-    @app.get("/api/ai-model-download", dependencies=[Depends(require_app_token)])
+    @app.get("/api/ai-model-download", dependencies=ai_api_dependencies)
     def ai_model_download_status() -> dict[str, Any]:
         if state.ai_enhancements is None:
             raise HTTPException(status_code=503, detail="AI 超清尚未就绪。")
@@ -1168,7 +1192,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             snapshot["error"] = _user_media_error(MediaError(str(snapshot["error"])))
         return snapshot
 
-    @app.post("/api/ai-model-download", dependencies=[Depends(require_app_token)])
+    @app.post("/api/ai-model-download", dependencies=ai_api_dependencies)
     def start_ai_model_download() -> dict[str, Any]:
         try:
             if state.ai_enhancements is None:
@@ -1179,7 +1203,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
 
     @app.post(
         "/api/ai-model-download/cancel",
-        dependencies=[Depends(require_app_token)],
+        dependencies=ai_api_dependencies,
     )
     def cancel_ai_model_download(
         request: AIModelDownloadCancelRequest | None = None,
@@ -1335,7 +1359,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
 
     @app.get(
         "/api/ai-enhancements/{job_id}",
-        dependencies=[Depends(require_app_token)],
+        dependencies=ai_api_dependencies,
     )
     def ai_enhancement_status(job_id: str) -> dict[str, Any]:
         snapshot = ai_enhancement_job(job_id).snapshot()
@@ -1345,7 +1369,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
 
     @app.post(
         "/api/ai-enhancements/{job_id}/cancel",
-        dependencies=[Depends(require_app_token)],
+        dependencies=ai_api_dependencies,
     )
     def cancel_ai_enhancement(job_id: str) -> dict[str, Any]:
         try:
@@ -1356,7 +1380,7 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
 
     @app.post(
         "/api/ai-enhancements/{job_id}/reveal",
-        dependencies=[Depends(require_app_token)],
+        dependencies=ai_api_dependencies,
     )
     def reveal_ai_enhancement(job_id: str) -> dict[str, bool]:
         job = ai_enhancement_job(job_id)

@@ -15,7 +15,7 @@ const FALLBACK_AI_MODELS = [
   {
     id: DEFAULT_AI_MODEL_ID,
     name: "SeedVR2 3B FP16",
-    description: "质量优先的时序视频修复模型，兼容 Apple Silicon 与 RTX 5090。",
+    description: "质量优先的时序视频修复模型，面向 RTX 5090。",
     precision: "FP16",
     status: "stable",
     stable: true,
@@ -56,6 +56,8 @@ const FALLBACK_AI_MODELS = [
 const state = {
   appToken: "",
   appReady: false,
+  aiFeaturesEnabled: false,
+  aiFeaturesResolved: false,
   ffmpegReady: false,
   frameExportReady: false,
   rotationReady: false,
@@ -129,6 +131,7 @@ const elements = {
   systemBannerTitle: byId("system-banner-title"),
   systemBannerMessage: byId("system-banner-message"),
   reloadButton: byId("reload-button"),
+  workspaceTabs: byId("workspace-tabs"),
   videoWorkspaceTab: byId("video-workspace-tab"),
   modelWorkspaceTab: byId("model-workspace-tab"),
   videoWorkspace: byId("video-workspace"),
@@ -137,6 +140,7 @@ const elements = {
   modeFramesButton: byId("mode-frames-button"),
   modeRotateButton: byId("mode-rotate-button"),
   modeEnhanceButton: byId("mode-enhance-button"),
+  modeSwitch: byId("mode-switch"),
   pageTitle: byId("page-title"),
   heroCopy: byId("hero-copy"),
   journeySource: byId("journey-source"),
@@ -504,7 +508,7 @@ function buildAiProxyRequestBody() {
 
 function renderAiProxySettings() {
   const busy = state.aiProxyBusy;
-  const controlsDisabled = !state.appReady || !state.aiProxyLoaded || Boolean(busy);
+  const controlsDisabled = !aiFeaturesAvailable() || !state.appReady || !state.aiProxyLoaded || Boolean(busy);
   const draft = readAiProxyDraft();
   const sameProxy = aiProxyDraftMatchesSaved(draft);
   const canClearPassword = state.aiProxy.hasPassword && sameProxy;
@@ -581,7 +585,7 @@ function showAiProxyRequestError(error, fallbackMessage) {
 }
 
 async function refreshAiProxySettings() {
-  if (!state.appReady) {
+  if (!aiFeaturesAvailable() || !state.appReady) {
     renderAiProxySettings();
     return;
   }
@@ -611,7 +615,7 @@ async function refreshAiProxySettings() {
 
 async function saveAiProxySettings(event) {
   event.preventDefault();
-  if (!state.appReady || !state.aiProxyLoaded || state.aiProxyBusy) return;
+  if (!aiFeaturesAvailable() || !state.appReady || !state.aiProxyLoaded || state.aiProxyBusy) return;
   const request = buildAiProxyRequestBody();
   if (!request.body) {
     state.aiProxyError = request.error;
@@ -651,7 +655,7 @@ async function saveAiProxySettings(event) {
 }
 
 async function clearAiProxySettings() {
-  if (!state.appReady || !state.aiProxyLoaded || state.aiProxyBusy || !state.aiProxy.configured) return;
+  if (!aiFeaturesAvailable() || !state.appReady || !state.aiProxyLoaded || state.aiProxyBusy || !state.aiProxy.configured) return;
   const requestSerial = ++state.aiProxyRequestSerial;
   state.aiProxyBusy = "clear";
   state.aiProxyError = "";
@@ -679,7 +683,7 @@ async function clearAiProxySettings() {
 }
 
 async function testAiProxyDraft() {
-  if (!state.appReady || !state.aiProxyLoaded || state.aiProxyBusy) return;
+  if (!aiFeaturesAvailable() || !state.appReady || !state.aiProxyLoaded || state.aiProxyBusy) return;
   const request = buildAiProxyRequestBody();
   if (!request.body) {
     state.aiProxyError = request.error;
@@ -851,8 +855,12 @@ function isRotateMode() {
   return state.operation === "rotate";
 }
 
+function aiFeaturesAvailable() {
+  return state.aiFeaturesResolved && state.aiFeaturesEnabled;
+}
+
 function isEnhanceMode() {
-  return state.operation === "enhance";
+  return aiFeaturesAvailable() && state.operation === "enhance";
 }
 
 function usesSourceDirectory() {
@@ -1655,14 +1663,13 @@ function aiModelChoiceDetail(model, { manager = false } = {}) {
   const targets = aiModelTargetsLabel(model).replaceAll(" · ", " / ");
   if (model.blocked) return "完整质量路径保留，等待 RTX 50 兼容验证";
   const backends = Array.isArray(model.supported_backends)
-    ? model.supported_backends.map((backend) => (
-      String(backend).toLowerCase() === "cuda" ? "RTX" : "Mac"
-    )).join(" / ")
-    : model.id === DEFAULT_AI_MODEL_ID
-      ? "Mac / RTX"
-      : "RTX 5090";
+    ? model.supported_backends
+      .filter((backend) => String(backend).toLowerCase() === "cuda")
+      .map(() => "RTX")
+      .join(" / ")
+    : "RTX 5090";
   const prefix = manager && model.default ? "默认 · " : "";
-  return `${prefix}${backends || "本机"} · ${targets}`;
+  return `${prefix}${backends || "RTX 5090"} · ${targets}`;
 }
 
 function createAiModelChoice(model, className, { manager = false } = {}) {
@@ -1871,6 +1878,7 @@ function changeOperation(operation) {
     state.exporting
     || state.selectingVideo
     || !["clip", "frames", "rotate", "enhance"].includes(operation)
+    || (operation === "enhance" && !aiFeaturesAvailable())
     || operation === state.operation
   ) {
     return;
@@ -2563,11 +2571,13 @@ function stopModelDownloadPolling() {
 }
 
 function scheduleModelDownloadPoll(pollSerial, delay = MODEL_DOWNLOAD_POLL_MS) {
+  if (!aiFeaturesAvailable()) return;
   window.clearTimeout(state.modelDownloadPollTimer);
   state.modelDownloadPollTimer = window.setTimeout(() => pollModelDownload(pollSerial), delay);
 }
 
 function startModelDownloadPolling(delay = 0, modelId = state.modelDownloadModelId) {
+  if (!aiFeaturesAvailable()) return;
   stopModelDownloadPolling();
   state.modelDownloadModelId = modelId;
   const pollSerial = state.modelDownloadPollSerial;
@@ -2575,7 +2585,7 @@ function startModelDownloadPolling(delay = 0, modelId = state.modelDownloadModel
 }
 
 async function pollModelDownload(pollSerial) {
-  if (pollSerial !== state.modelDownloadPollSerial) return;
+  if (!aiFeaturesAvailable() || pollSerial !== state.modelDownloadPollSerial) return;
   const wasActive = modelDownloadIsActive();
   const modelId = state.modelDownloadModelId || state.selectedAiModelId;
   try {
@@ -2631,7 +2641,7 @@ async function pollModelDownload(pollSerial) {
 }
 
 async function refreshModelDownloadStatus({ reconnect = true } = {}) {
-  if (!state.appReady) {
+  if (!aiFeaturesAvailable() || !state.appReady) {
     renderModelManager();
     return;
   }
@@ -2665,7 +2675,8 @@ async function refreshModelDownloadStatus({ reconnect = true } = {}) {
 async function startModelDownload() {
   const model = selectedAiModel();
   if (
-    !state.appReady
+    !aiFeaturesAvailable()
+    || !state.appReady
     || state.modelDownloadStarting
     || state.modelDownloadCancelling
     || state.modelDeleteModelId
@@ -2701,7 +2712,7 @@ async function startModelDownload() {
 }
 
 async function cancelModelDownload() {
-  if (!modelDownloadIsActive() || state.modelDownloadCancelling || state.modelDeleteModelId) return;
+  if (!aiFeaturesAvailable() || !modelDownloadIsActive() || state.modelDownloadCancelling || state.modelDeleteModelId) return;
   state.modelDownloadCancelling = true;
   let requestSucceeded = false;
   renderModelManager();
@@ -2752,7 +2763,8 @@ async function deleteSelectedAiModel() {
   const model = selectedAiModel();
   const modelId = model?.id || "";
   if (
-    !state.appReady
+    !aiFeaturesAvailable()
+    || !state.appReady
     || !state.multiModelApiAvailable
     || !modelId
     || state.modelDeleteModelId
@@ -2807,7 +2819,7 @@ async function deleteSelectedAiModel() {
 }
 
 async function refreshAiModels({ preserveOnError = false } = {}) {
-  if (!state.appReady) return;
+  if (!aiFeaturesAvailable() || !state.appReady) return;
   state.modelCatalogLoading = true;
   renderModelManager();
   let catalogRefreshFailed = false;
@@ -2860,7 +2872,8 @@ function selectAiModel(modelId) {
   const normalized = String(modelId || "").toLowerCase();
   const model = state.aiModels.find((item) => item.id === normalized);
   if (
-    !model
+    !aiFeaturesAvailable()
+    || !model
     || model.id === state.selectedAiModelId
     || state.exporting
     || state.modelDownloadStarting
@@ -2890,11 +2903,36 @@ function selectAiModel(modelId) {
 }
 
 function workspaceFromLocation() {
-  return window.location.hash === "#ai-model" ? "model" : "video";
+  return aiFeaturesAvailable() && window.location.hash === "#ai-model" ? "model" : "video";
 }
 
-function switchWorkspace(workspace, { updateHistory = true, focus = false } = {}) {
-  const nextWorkspace = workspace === "model" ? "model" : "video";
+function applyAiFeatureAvailability(enabled) {
+  state.aiFeaturesEnabled = enabled === true;
+  state.aiFeaturesResolved = true;
+  const available = aiFeaturesAvailable();
+
+  elements.workspaceTabs.hidden = !available;
+  elements.modelWorkspaceTab.hidden = !available;
+  elements.modeEnhanceButton.hidden = !available;
+  elements.modeEnhanceButton.disabled = !available;
+  elements.modeSwitch.classList.toggle("is-basic-only", !available);
+  elements.modelWorkspace.inert = !available;
+
+  if (!available) {
+    stopModelDownloadPolling();
+    if (state.operation === "enhance") state.operation = "clip";
+    if (window.location.hash === "#ai-model") {
+      window.history.replaceState({}, "", "#video");
+    }
+  }
+  switchWorkspace(workspaceFromLocation(), { updateHistory: false, refreshModel: false });
+}
+
+function switchWorkspace(workspace, { updateHistory = true, focus = false, refreshModel = true } = {}) {
+  const nextWorkspace = aiFeaturesAvailable() && workspace === "model" ? "model" : "video";
+  if (state.aiFeaturesResolved && !aiFeaturesAvailable() && window.location.hash === "#ai-model") {
+    window.history.replaceState({}, "", "#video");
+  }
   state.workspace = nextWorkspace;
   const modelSelected = nextWorkspace === "model";
   elements.videoWorkspaceTab.setAttribute("aria-selected", modelSelected ? "false" : "true");
@@ -2912,7 +2950,7 @@ function switchWorkspace(workspace, { updateHistory = true, focus = false } = {}
   }
   if (modelSelected) {
     renderModelManager();
-    if (state.appReady && !modelDownloadIsActive()) void refreshModelDownloadStatus();
+    if (refreshModel && state.appReady && !modelDownloadIsActive()) void refreshModelDownloadStatus();
   }
 }
 
@@ -3426,7 +3464,7 @@ function renderControls() {
   elements.modeClipButton.disabled = controlsLocked || state.selectingVideo;
   elements.modeFramesButton.disabled = controlsLocked || state.selectingVideo;
   elements.modeRotateButton.disabled = controlsLocked || state.selectingVideo;
-  elements.modeEnhanceButton.disabled = controlsLocked || state.selectingVideo;
+  elements.modeEnhanceButton.disabled = !aiFeaturesAvailable() || controlsLocked || state.selectingVideo;
   for (const option of elements.rotationOptions) {
     option.disabled = !state.video || controlsLocked || state.selectingVideo;
   }
@@ -3476,13 +3514,15 @@ async function bootstrap() {
     state.ffmpegReady = Boolean(result.ffmpeg_ready);
     state.frameExportReady = Boolean(result.frame_export_ready);
     state.rotationReady = Boolean(result.rotation_ready);
-    state.aiEnhanceReady = Boolean(result.ai_enhance_ready);
+    const aiFeaturesEnabled = result.ai_features_enabled === true;
+    state.aiEnhanceReady = aiFeaturesEnabled && Boolean(result.ai_enhance_ready);
     state.aiRuntime = result.ai_runtime && typeof result.ai_runtime === "object" ? result.ai_runtime : {};
     const maxFrameSeconds = Number(result.max_frame_seconds);
     state.maxFrameSeconds = Number.isFinite(maxFrameSeconds) && maxFrameSeconds > 0
       ? maxFrameSeconds
       : DEFAULT_MAX_FRAME_SECONDS;
     state.outputDirectory = normalizeDirectory(result.output_directory);
+    applyAiFeatureAvailability(aiFeaturesEnabled);
 
     const appName = result.app_name || "本地视频剪辑";
     elements.appName.textContent = appName;
@@ -3501,8 +3541,10 @@ async function bootstrap() {
     } else {
       hideSystemBanner();
     }
-    await refreshAiProxySettings();
-    await refreshAiModels();
+    if (aiFeaturesAvailable()) {
+      await refreshAiProxySettings();
+      await refreshAiModels();
+    }
   } catch (error) {
     state.appReady = false;
     elements.versionLabel.textContent = "本地服务未连接";
@@ -3519,6 +3561,7 @@ elements.modelWorkspaceTab.addEventListener("click", () => switchWorkspace("mode
 elements.videoWorkspaceTab.addEventListener("keydown", handleWorkspaceTabKeydown);
 elements.modelWorkspaceTab.addEventListener("keydown", handleWorkspaceTabKeydown);
 elements.openModelManagerButton.addEventListener("click", () => {
+  if (!aiFeaturesAvailable()) return;
   switchWorkspace("model", { focus: true });
   elements.modelWorkspace.scrollIntoView({ behavior: "smooth", block: "start" });
 });
@@ -3533,6 +3576,7 @@ elements.aiProxyUsername.addEventListener("input", markAiProxyDraftChanged);
 elements.aiProxyPassword.addEventListener("input", markAiProxyDraftChanged);
 elements.aiProxyClearPassword.addEventListener("change", handleAiProxyClearPasswordChange);
 function handleAiModelSelection(event) {
+  if (!aiFeaturesAvailable()) return;
   const option = event.target.closest("[data-model-id]");
   if (!option || !event.currentTarget.contains(option) || option.disabled) return;
   selectAiModel(option.dataset.modelId);

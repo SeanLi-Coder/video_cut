@@ -28,6 +28,18 @@ def test_posix_local_control_requests_disable_system_proxies() -> None:
         assert module._LOCAL_PROXY_HANDLER.proxies == {}
 
 
+def test_macos_launcher_help_has_no_ai_model_option(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(launcher.sys, "platform", "darwin")
+
+    with pytest.raises(SystemExit) as exit_info:
+        launcher.main(["--help"])
+
+    assert exit_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "--skip-model-prompt" not in output
+    assert "model" not in output.lower()
+
+
 def _health(port: int) -> dict[str, Any] | None:
     try:
         with urlopen(
@@ -57,7 +69,7 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
-def test_existing_instance_checks_only_recoverable_models_before_opening(monkeypatch) -> None:
+def test_existing_macos_instance_opens_without_ai_model_prompt(monkeypatch) -> None:
     record = {
         "instance_id": "existing-instance",
         "server_pid": 42_424,
@@ -85,78 +97,61 @@ def test_existing_instance_checks_only_recoverable_models_before_opening(monkeyp
         "prompt_for_missing_models",
         lambda port, *_args, **kwargs: events.append(("prompt", port, kwargs)),
     )
+    monkeypatch.setattr(launcher.sys, "platform", "darwin")
 
     assert launcher._open_existing_instance(lock_handle=object()) is True
-    assert events == [
-        ("prompt", 8_777, {"skip": False, "recovery_only": True}),
-        ("browser", 8_777, {}),
-    ]
+    assert events == [("browser", 8_777, {})]
 
 
-def test_media_executables_prefers_smoke_tested_ffmpeg_full(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    full_ffmpeg = tmp_path / "ffmpeg-full" / "bin" / "ffmpeg"
-    full_ffprobe = tmp_path / "ffmpeg-full" / "bin" / "ffprobe"
-    full_ffmpeg.parent.mkdir(parents=True)
-    full_ffmpeg.touch()
-    full_ffprobe.touch()
-    molten_vk_icd = tmp_path / "MoltenVK_icd.json"
-    molten_vk_icd.touch()
-    monkeypatch.setattr(launcher.sys, "platform", "darwin")
-    monkeypatch.setattr(launcher.platform, "machine", lambda: "arm64")
-    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/opt/homebrew/bin/brew")
+def test_non_macos_existing_instance_keeps_ai_model_recovery_prompt(monkeypatch) -> None:
+    record = {
+        "instance_id": "existing-instance",
+        "server_pid": 42_424,
+        "port": 8_777,
+        "project_root": str(launcher.PROJECT_ROOT),
+    }
+    events: list[tuple[str, int, dict[str, object]]] = []
+    monkeypatch.setattr(launcher, "_read_record", lambda: record)
     monkeypatch.setattr(
         launcher,
-        "_find_ffmpeg_full",
-        lambda _brew: (full_ffmpeg, full_ffprobe),
+        "_health",
+        lambda _port: {
+            "app_id": launcher.APP_ID,
+            "instance_id": "existing-instance",
+            "server_pid": 42_424,
+        },
     )
-    monkeypatch.setattr(launcher, "_find_molten_vk_icd", lambda _brew: molten_vk_icd)
-    monkeypatch.setattr(launcher, "_ffmpeg_full_check", lambda _path: (True, ""))
-    monkeypatch.setenv("VK_DRIVER_FILES", "previous")
-    monkeypatch.setenv("VK_ICD_FILENAMES", "previous")
-
-    result = launcher._media_executables(
-        stop_requested=threading.Event(),
-        lock_fd=-1,
+    monkeypatch.setattr(launcher, "_open_browser", lambda _port: None)
+    monkeypatch.setattr(
+        launcher,
+        "prompt_for_missing_models",
+        lambda port, *_args, **kwargs: events.append(("prompt", port, kwargs)),
     )
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
 
-    assert result == (full_ffmpeg, full_ffprobe)
-    assert os.environ["VK_DRIVER_FILES"] == str(molten_vk_icd)
-    assert os.environ["VK_ICD_FILENAMES"] == str(molten_vk_icd)
+    assert launcher._open_existing_instance(lock_handle=object()) is True
+    assert events == [("prompt", 8_777, {"skip": False, "recovery_only": True})]
 
 
-def test_media_executables_keeps_full_binary_when_runtime_smoke_fails(
+def test_macos_media_executables_use_standard_ffmpeg_without_ai_setup(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    full_ffmpeg = tmp_path / "ffmpeg-full" / "bin" / "ffmpeg"
-    full_ffprobe = tmp_path / "ffmpeg-full" / "bin" / "ffprobe"
-    molten_vk_icd = tmp_path / "MoltenVK_icd.json"
-    for path in (full_ffmpeg, full_ffprobe, molten_vk_icd):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
+    ffmpeg = tmp_path / "bin" / "ffmpeg"
+    ffprobe = tmp_path / "bin" / "ffprobe"
+    ffmpeg.parent.mkdir(parents=True)
+    ffmpeg.touch()
+    ffprobe.touch()
     commands: list[list[str]] = []
     monkeypatch.setattr(launcher.sys, "platform", "darwin")
-    monkeypatch.setattr(launcher.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(
         launcher.shutil,
         "which",
         lambda name: {
             "brew": "/opt/homebrew/bin/brew",
+            "ffmpeg": str(ffmpeg),
+            "ffprobe": str(ffprobe),
         }.get(name),
-    )
-    monkeypatch.setattr(
-        launcher,
-        "_find_ffmpeg_full",
-        lambda _brew: (full_ffmpeg, full_ffprobe),
-    )
-    monkeypatch.setattr(launcher, "_find_molten_vk_icd", lambda _brew: molten_vk_icd)
-    monkeypatch.setattr(
-        launcher,
-        "_ffmpeg_full_check",
-        lambda _path: (False, "simulated Vulkan failure"),
     )
 
     def record(command, **_kwargs):
@@ -171,36 +166,38 @@ def test_media_executables_keeps_full_binary_when_runtime_smoke_fails(
     )
 
     assert commands == []
-    assert result == (full_ffmpeg, full_ffprobe)
+    assert result == (ffmpeg.resolve(), ffprobe.resolve())
 
 
-def test_media_executables_installs_missing_molten_vk(
+def test_macos_media_executables_install_only_standard_ffmpeg_when_missing(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    full_ffmpeg = tmp_path / "ffmpeg-full" / "bin" / "ffmpeg"
-    full_ffprobe = tmp_path / "ffmpeg-full" / "bin" / "ffprobe"
-    molten_vk_icd = tmp_path / "molten-vk" / "MoltenVK_icd.json"
-    for path in (full_ffmpeg, full_ffprobe, molten_vk_icd):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
+    ffmpeg = tmp_path / "bin" / "ffmpeg"
+    ffprobe = tmp_path / "bin" / "ffprobe"
+    ffmpeg.parent.mkdir(parents=True)
+    ffmpeg.touch()
+    ffprobe.touch()
     commands: list[list[str]] = []
-    icd_results = iter((None, molten_vk_icd))
+    installed = False
     monkeypatch.setattr(launcher.sys, "platform", "darwin")
-    monkeypatch.setattr(launcher.platform, "machine", lambda: "arm64")
-    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/opt/homebrew/bin/brew")
-    monkeypatch.setattr(
-        launcher,
-        "_find_ffmpeg_full",
-        lambda _brew: (full_ffmpeg, full_ffprobe),
-    )
-    monkeypatch.setattr(launcher, "_find_molten_vk_icd", lambda _brew: next(icd_results))
-    monkeypatch.setattr(launcher, "_ffmpeg_full_check", lambda _path: (True, ""))
+
+    def which(name: str) -> str | None:
+        if name == "brew":
+            return "/opt/homebrew/bin/brew"
+        if installed and name == "ffmpeg":
+            return str(ffmpeg)
+        if installed and name == "ffprobe":
+            return str(ffprobe)
+        return None
 
     def record(command, **_kwargs):
+        nonlocal installed
         commands.append(command)
+        installed = True
         return 0
 
+    monkeypatch.setattr(launcher.shutil, "which", which)
     monkeypatch.setattr(launcher, "_run_owned", record)
 
     result = launcher._media_executables(
@@ -208,52 +205,12 @@ def test_media_executables_installs_missing_molten_vk(
         lock_fd=-1,
     )
 
-    assert commands == [["/opt/homebrew/bin/brew", "install", "molten-vk"]]
-    assert result == (full_ffmpeg, full_ffprobe)
-
-
-def test_media_executables_installs_missing_full_then_molten_vk(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    full_ffmpeg = tmp_path / "ffmpeg-full" / "bin" / "ffmpeg"
-    full_ffprobe = tmp_path / "ffmpeg-full" / "bin" / "ffprobe"
-    molten_vk_icd = tmp_path / "molten-vk" / "MoltenVK_icd.json"
-    for path in (full_ffmpeg, full_ffprobe, molten_vk_icd):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-    commands: list[list[str]] = []
-    full_results = iter((None, (full_ffmpeg, full_ffprobe)))
-    icd_results = iter((None, molten_vk_icd))
-    monkeypatch.setattr(launcher.sys, "platform", "darwin")
-    monkeypatch.setattr(launcher.platform, "machine", lambda: "arm64")
-    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/opt/homebrew/bin/brew")
-    monkeypatch.setattr(launcher, "_find_ffmpeg_full", lambda _brew: next(full_results))
-    monkeypatch.setattr(launcher, "_find_molten_vk_icd", lambda _brew: next(icd_results))
-    monkeypatch.setattr(launcher, "_ffmpeg_full_check", lambda _path: (True, ""))
-
-    def record(command, **_kwargs):
-        commands.append(command)
-        return 0
-
-    monkeypatch.setattr(launcher, "_run_owned", record)
-
-    result = launcher._media_executables(
-        stop_requested=threading.Event(),
-        lock_fd=-1,
-    )
-
-    assert commands == [
-        ["/opt/homebrew/bin/brew", "install", "ffmpeg-full"],
-        ["/opt/homebrew/bin/brew", "install", "molten-vk"],
-    ]
-    assert result == (full_ffmpeg, full_ffprobe)
-    assert os.environ["VK_DRIVER_FILES"] == str(molten_vk_icd)
-    assert os.environ["VK_ICD_FILENAMES"] == str(molten_vk_icd)
+    assert commands == [["/opt/homebrew/bin/brew", "install", "ffmpeg"]]
+    assert result == (ffmpeg.resolve(), ffprobe.resolve())
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher lifecycle")
-def test_launch_passes_molten_vk_environment_to_backend(
+def test_macos_launch_starts_backend_without_ai_model_prompt(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -261,7 +218,6 @@ def test_launch_passes_molten_vk_environment_to_backend(
     python = tmp_path / "python"
     ffmpeg = tmp_path / "ffmpeg"
     ffprobe = tmp_path / "ffprobe"
-    molten_vk_icd = tmp_path / "MoltenVK_icd.json"
     captured_environment: dict[str, str] = {}
     records: list[dict[str, object]] = []
     lifecycle_events: list[str] = []
@@ -282,7 +238,6 @@ def test_launch_passes_molten_vk_environment_to_backend(
             return self.returncode
 
     def select_media(**_kwargs):
-        launcher._configure_molten_vk_environment(molten_vk_icd)
         return ffmpeg, ffprobe
 
     def start_backend(_command, **kwargs):
@@ -313,6 +268,7 @@ def test_launch_passes_molten_vk_environment_to_backend(
     monkeypatch.setattr(launcher, "_media_executables", select_media)
     monkeypatch.setattr(launcher.subprocess, "Popen", start_backend)
     monkeypatch.setattr(launcher, "_terminate_group", lambda _process: None)
+    monkeypatch.setattr(launcher.sys, "platform", "darwin")
     monkeypatch.setattr(launcher.secrets, "token_hex", lambda _size: "test-instance")
     monkeypatch.setattr(launcher.secrets, "token_urlsafe", lambda _size: "test-token")
     monkeypatch.setattr(
@@ -320,19 +276,14 @@ def test_launch_passes_molten_vk_environment_to_backend(
         "_health",
         lambda _port: {"app_id": launcher.APP_ID, "instance_id": "test-instance"},
     )
-    monkeypatch.delenv("VK_DRIVER_FILES", raising=False)
-    monkeypatch.delenv("VK_ICD_FILENAMES", raising=False)
-
     result = launcher.launch(base_python=python, preferred_port=0, no_browser=True)
 
     assert result == 0
-    assert captured_environment["VK_DRIVER_FILES"] == str(molten_vk_icd)
-    assert captured_environment["VK_ICD_FILENAMES"] == str(molten_vk_icd)
     assert captured_environment["VIDEO_CUT_FFMPEG"] == str(ffmpeg)
     assert captured_environment["VIDEO_CUT_FFPROBE"] == str(ffprobe)
     assert records[-1]["phase"] == "running"
     assert records[-1]["control_port"] == 42_425
-    assert lifecycle_events == ["prompt", "close"]
+    assert lifecycle_events == ["close"]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor inheritance")

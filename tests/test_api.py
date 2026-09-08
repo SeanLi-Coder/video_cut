@@ -109,6 +109,77 @@ def test_cancelled_native_dialog_is_not_an_error(
         assert response.json() == {"cancelled": True}
 
 
+def test_macos_disables_ai_runtime_payloads_and_all_ai_apis(
+    monkeypatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    monkeypatch.setattr(main_module.sys, "platform", "darwin")
+    monkeypatch.setattr(main_module, "select_video_file", lambda: sample_video)
+
+    def unexpected_ai_manager(**_kwargs):
+        raise AssertionError("macOS must not initialize the AI runtime")
+
+    monkeypatch.setattr(main_module, "AIEnhancementManager", unexpected_ai_manager)
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+    )
+    assert state.ai_features_enabled is False
+    assert state.ai_enhancements is None
+
+    blocked_requests = [
+        ("POST", "/api/ai-enhancements", {"video_id": "missing", "target": "1080p"}),
+        ("GET", "/api/ai-models", None),
+        ("GET", "/api/ai-download-proxy", None),
+        ("PUT", "/api/ai-download-proxy", {}),
+        ("DELETE", "/api/ai-download-proxy", None),
+        ("POST", "/api/ai-download-proxy/test", {}),
+        ("GET", "/api/ai-models/model/download", None),
+        ("POST", "/api/ai-models/model/download", None),
+        ("POST", "/api/ai-models/model/download/cancel", None),
+        ("POST", "/api/ai-models/model/download/restart", None),
+        ("DELETE", "/api/ai-models/model/download", None),
+        ("GET", "/api/ai-model-download", None),
+        ("POST", "/api/ai-model-download", None),
+        ("POST", "/api/ai-model-download/cancel", None),
+        ("GET", "/api/ai-enhancements/job", None),
+        ("POST", "/api/ai-enhancements/job/cancel", None),
+        ("POST", "/api/ai-enhancements/job/reveal", None),
+    ]
+
+    with TestClient(create_app(state)) as client:
+        health = client.get("/api/health").json()
+        bootstrap = client.get("/api/bootstrap").json()
+        assert health["ai_features_enabled"] is False
+        assert health["ai_enhance_ready"] is False
+        assert bootstrap["ai_features_enabled"] is False
+        assert bootstrap["ai_enhance_ready"] is False
+        assert bootstrap["ai_runtime"] == {
+            "supported": False,
+            "ready": False,
+            "prepared": False,
+            "installed": False,
+            "models_downloaded": False,
+            "message": "此系统版本不提供 AI 超清与模型管理。",
+        }
+        headers = {"X-App-Token": bootstrap["app_token"]}
+
+        selected = client.post("/api/videos/select", headers=headers)
+        assert selected.status_code == 200, selected.text
+        assert selected.json()["video"]["ai_targets"] == []
+
+        for method, path, payload in blocked_requests:
+            response = client.request(method, path, headers=headers, json=payload)
+            assert response.status_code == 404, (method, path, response.text)
+            assert response.json()["detail"] == "此系统版本不提供 AI 超清与模型管理。"
+
+    assert state.settings.load() == {}
+
+
 def test_rotation_api_requires_token_validates_angle_and_creates_a_new_sibling_file(
     monkeypatch,
     tmp_path: Path,

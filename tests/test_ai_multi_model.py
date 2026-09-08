@@ -519,6 +519,7 @@ def test_restart_download_api_requires_token_and_normalizes_model_id(
         settings_path=tmp_path / "settings.json",
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
     state.ai_enhancements = manager
@@ -552,6 +553,7 @@ def test_restart_download_api_does_not_delete_blocked_model(
         settings_path=tmp_path / "settings.json",
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
     state.ai_enhancements = manager
@@ -785,6 +787,7 @@ def test_delete_model_api_is_authenticated_and_allows_blocked_catalog_entries(
         settings_path=tmp_path / "settings.json",
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     manager = _restartable_manager(tmp_path, ffmpeg, ffprobe)
     state.ai_enhancements = manager
@@ -990,6 +993,7 @@ def test_model_specific_api_exposes_catalog_and_blocks_flash_download(
         settings_path=tmp_path / "settings.json",
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     state.ai_enhancements = _manager(tmp_path, ffmpeg, ffprobe)
 

@@ -149,6 +149,7 @@ def test_proxy_api_reports_corrupt_settings_without_echoing_password(
         settings_path=settings_path,
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     sentinel = "must-never-be-returned"
 
@@ -483,6 +484,7 @@ def test_proxy_api_persists_masks_tests_and_clears_without_losing_output_directo
         settings_path=tmp_path / "settings.json",
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     state.set_output_directory(tmp_path)
     tested: list[str] = []
@@ -545,6 +547,7 @@ def test_proxy_api_validation_error_does_not_echo_password(
         settings_path=tmp_path / "settings.json",
         ffmpeg=ffmpeg,
         ffprobe=ffprobe,
+        ai_features_enabled=True,
     )
     sentinel = "do-not-echo-this-secret"
     with TestClient(create_app(state)) as client:

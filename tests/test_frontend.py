@@ -120,6 +120,56 @@ def test_frontend_ai_output_is_fixed_to_source_directory() -> None:
     assert "output_directory" not in start_export
 
 
+def test_frontend_hides_and_disables_ai_when_bootstrap_capability_is_off() -> None:
+    javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    styles = (PROJECT_ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="workspace-tabs" role="tablist" aria-label="选择页面" hidden' in html
+    assert 'id="model-workspace-tab"' in html
+    assert 'aria-controls="model-workspace" tabindex="-1" hidden' in html
+    assert 'id="mode-enhance-button" type="button" aria-pressed="false" hidden' in html
+    assert 'id="model-workspace" role="tabpanel"' in html
+    assert 'aria-labelledby="model-workspace-tab" hidden inert' in html
+    assert 'class="mode-switch is-basic-only" id="mode-switch"' in html
+    assert ".mode-switch.is-basic-only" in styles
+    assert "grid-template-columns: repeat(3, minmax(0, 1fr));" in styles
+
+    assert "aiFeaturesEnabled: false" in javascript
+    assert "aiFeaturesResolved: false" in javascript
+    assert "function aiFeaturesAvailable()" in javascript
+    assert "function applyAiFeatureAvailability(enabled)" in javascript
+    assert "const aiFeaturesEnabled = result.ai_features_enabled === true;" in javascript
+    assert (
+        "state.aiEnhanceReady = aiFeaturesEnabled && Boolean(result.ai_enhance_ready);"
+        in javascript
+    )
+    assert "elements.workspaceTabs.hidden = !available;" in javascript
+    assert "elements.modelWorkspaceTab.hidden = !available;" in javascript
+    assert "elements.modeEnhanceButton.hidden = !available;" in javascript
+    assert "elements.modelWorkspace.inert = !available;" in javascript
+    assert 'elements.modeSwitch.classList.toggle("is-basic-only", !available);' in javascript
+    assert 'window.location.hash === "#ai-model"' in javascript
+    assert 'window.history.replaceState({}, "", "#video");' in javascript
+
+    change_operation = javascript.split("function changeOperation(operation)", 1)[1].split(
+        "\nfunction resetExportResult", 1
+    )[0]
+    assert 'operation === "enhance" && !aiFeaturesAvailable()' in change_operation
+
+    switch_workspace = javascript.split("function switchWorkspace(workspace", 1)[1].split(
+        "\nfunction handleWorkspaceTabKeydown", 1
+    )[0]
+    assert 'aiFeaturesAvailable() && workspace === "model"' in switch_workspace
+
+    bootstrap = javascript.split("async function bootstrap()", 1)[1].split(
+        "\nelements.videoWorkspaceTab.addEventListener", 1
+    )[0]
+    ai_requests = bootstrap.split("if (aiFeaturesAvailable()) {", 1)[1]
+    assert "await refreshAiProxySettings();" in ai_requests
+    assert "await refreshAiModels();" in ai_requests
+
+
 def test_frontend_renders_detected_ai_backend_without_platform_hardcoding() -> None:
     javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
