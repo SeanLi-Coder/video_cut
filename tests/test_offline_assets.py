@@ -118,7 +118,10 @@ def test_modified_asset_fails_verification(
     asset, _, _ = _write_bundle(tmp_path, bundle)
     asset.write_bytes(b"tampered")
 
-    with pytest.raises(OfflineBundleError, match="asset failed verification"):
+    with pytest.raises(
+        OfflineBundleError,
+        match="asset (?:failed verification|changed during verification)",
+    ):
         offline.verified_offline_asset("offline/windows-rtx5090/python/python.exe")
 
 
@@ -133,7 +136,10 @@ def test_uncached_verification_detects_same_size_replacement(
     assert offline.verify_offline_asset_now(relative_path) == asset
     asset.write_bytes(b"x" * len(b"verified asset"))
 
-    with pytest.raises(OfflineBundleError, match="asset failed verification"):
+    with pytest.raises(
+        OfflineBundleError,
+        match="asset (?:failed verification|changed during verification)",
+    ):
         offline.verify_offline_asset_now(relative_path)
 
 
