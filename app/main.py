@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,6 +26,14 @@ from .ai_enhance import AIEnhancementManager, ai_target_options
 from .ai_models import DEFAULT_AI_MODEL_ID
 from .build_info import APP_ID, APP_NAME, APP_VERSION
 from .dialogs import DialogError, select_output_directory, select_video_file
+from .download_proxy import (
+    DownloadProxy,
+    ProxyConfigurationError,
+    direct_proxy_payload,
+    download_proxy_from_storage,
+    test_download_proxy,
+    updated_download_proxy,
+)
 from .media import (
     MAX_FRAME_EXTRACTION_SECONDS,
     ExportManager,
@@ -42,7 +50,7 @@ from .media import (
     validate_time_range,
 )
 from .paths import APPLICATION_ROOT, RESOURCE_ROOT
-from .storage import SettingsStore
+from .storage import SettingsStore, SettingsStoreError
 
 PROJECT_ROOT = APPLICATION_ROOT
 STATIC_ROOT = RESOURCE_ROOT / "app" / "static"
@@ -83,6 +91,21 @@ class AIModelDownloadCancelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     job_id: str | None = None
+
+
+def _proxy_request_fields(payload: object) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        raise ProxyConfigurationError("代理设置格式无效，请刷新页面后重试。")
+    allowed = {"url", "username", "password", "password_action"}
+    if any(not isinstance(key, str) or key not in allowed for key in payload):
+        raise ProxyConfigurationError("代理设置包含未知字段，请刷新页面后重试。")
+    result: dict[str, str] = {}
+    for key in allowed:
+        value = payload.get(key, "")
+        if not isinstance(value, str):
+            raise ProxyConfigurationError("代理设置格式无效，请重新输入。")
+        result[key] = value
+    return result
 
 
 @dataclass(frozen=True)
@@ -386,6 +409,7 @@ class ApplicationState:
             ffmpeg=resolved_ffmpeg,
             ffprobe=resolved_ffprobe,
             base_python=os.environ.get("VIDEO_CUT_AI_BASE_PYTHON"),
+            download_proxy_provider=self.ai_download_proxy,
         )
 
     def output_directory(self) -> Path | None:
@@ -405,8 +429,53 @@ class ApplicationState:
         resolved = path.expanduser().resolve()
         if not resolved.is_dir() or not os.access(resolved, os.W_OK | os.X_OK):
             raise MediaError("The output directory is not writable")
-        self.settings.save({"output_directory": str(resolved)})
+        self.settings.update({"output_directory": str(resolved)})
         return resolved
+
+    def ai_download_proxy(self) -> DownloadProxy | None:
+        return download_proxy_from_storage(self.settings.load().get("ai_download_proxy"))
+
+    def ai_download_proxy_payload(self) -> dict[str, Any]:
+        proxy = self.ai_download_proxy()
+        return proxy.public_payload() if proxy is not None else direct_proxy_payload()
+
+    def resolve_ai_download_proxy(
+        self,
+        *,
+        url: object,
+        username: object,
+        password: object,
+        password_action: object,
+    ) -> DownloadProxy:
+        return updated_download_proxy(
+            current=self.ai_download_proxy(),
+            url=url,
+            username=username,
+            password=password,
+            password_action=password_action,
+        )
+
+    def set_ai_download_proxy(
+        self,
+        *,
+        url: object,
+        username: object,
+        password: object,
+        password_action: object,
+    ) -> DownloadProxy:
+        with self._lock:
+            proxy = self.resolve_ai_download_proxy(
+                url=url,
+                username=username,
+                password=password,
+                password_action=password_action,
+            )
+            self.settings.update({"ai_download_proxy": proxy.storage_payload()})
+        return proxy
+
+    def clear_ai_download_proxy(self) -> None:
+        with self._lock:
+            self.settings.update({"ai_download_proxy": None})
 
     def register_video(self, path: Path) -> VideoSource:
         if self.ffprobe is None:
@@ -935,6 +1004,69 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         if state.ai_enhancements is None:
             raise HTTPException(status_code=503, detail="AI 超清尚未就绪。")
         return state.ai_enhancements.model_catalog_status()
+
+    @app.get("/api/ai-download-proxy", dependencies=[Depends(require_app_token)])
+    def ai_download_proxy(response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        return state.ai_download_proxy_payload()
+
+    @app.put("/api/ai-download-proxy", dependencies=[Depends(require_app_token)])
+    async def update_ai_download_proxy(request: Request, response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            fields = _proxy_request_fields(await request.json())
+            proxy = state.set_ai_download_proxy(**fields)
+        except SettingsStoreError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="代理设置暂时无法安全保存，请检查应用数据目录后重试。",
+            ) from exc
+        except (ValueError, UnicodeDecodeError) as exc:
+            detail = str(exc) if isinstance(exc, ProxyConfigurationError) else "代理设置格式无效。"
+            raise HTTPException(status_code=400, detail=detail) from exc
+        return proxy.public_payload()
+
+    @app.delete("/api/ai-download-proxy", dependencies=[Depends(require_app_token)])
+    def clear_ai_download_proxy(response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            state.clear_ai_download_proxy()
+        except SettingsStoreError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="代理设置暂时无法安全保存，请检查应用数据目录后重试。",
+            ) from exc
+        return direct_proxy_payload()
+
+    @app.post("/api/ai-download-proxy/test", dependencies=[Depends(require_app_token)])
+    async def check_ai_download_proxy(request: Request, response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            try:
+                raw_payload = await request.json()
+            except ValueError:
+                raw_payload = {}
+            if raw_payload in ({}, None):
+                proxy = state.ai_download_proxy()
+                if proxy is None:
+                    raise ProxyConfigurationError("请先填写或保存代理地址。")
+            else:
+                fields = _proxy_request_fields(raw_payload)
+                proxy = state.resolve_ai_download_proxy(**fields)
+            latency_ms, message = await run_in_threadpool(test_download_proxy, proxy)
+        except ProxyConfigurationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="代理连接测试失败，请检查地址、端口、账号和代理程序是否正在运行。",
+            ) from exc
+        return {
+            **proxy.public_payload(),
+            "test_success": True,
+            "latency_ms": latency_ms,
+            "test_message": message,
+        }
 
     @app.get(
         "/api/ai-models/{model_id}/download",

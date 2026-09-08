@@ -9,13 +9,19 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from app.paths import APPLICATION_ROOT
 
 PROJECT_ROOT = APPLICATION_ROOT
 RECORD_PATH = PROJECT_ROOT / "data" / "runtime" / "runtime.json"
 APP_ID = "com.seanli.local-video-cutter"
+_LOCAL_PROXY_HANDLER = ProxyHandler({})
+_LOCAL_HTTP_OPENER = build_opener(_LOCAL_PROXY_HANDLER)
+
+
+def _open_local_http(request: Request, timeout: float):
+    return _LOCAL_HTTP_OPENER.open(request, timeout=timeout)
 
 
 def _windows_pid_is_alive(pid: int) -> bool:
@@ -84,7 +90,7 @@ def _request_starting_stop(record: dict[str, Any]) -> tuple[int, bool]:
 
 def _request_json(request: Request, timeout: float = 1.0) -> dict[str, Any] | None:
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with _open_local_http(request, timeout) as response:
             payload = json.loads(response.read(32_768).decode("utf-8"))
     except (
         HTTPError,

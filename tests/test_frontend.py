@@ -9,11 +9,11 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_frontend_has_only_two_editable_text_parameters() -> None:
+def test_frontend_video_workflow_has_only_two_time_parameters() -> None:
     html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
     assert 'id="start-time"' in html
     assert 'id="end-time"' in html
-    assert html.count("<input") == 2
+    assert html.count('data-video-parameter="time"') == 2
     assert 'id="mode-clip-button"' in html
     assert 'id="mode-frames-button"' in html
     assert 'id="mode-rotate-button"' in html
@@ -178,3 +178,58 @@ def test_frontend_supports_selectable_ai_model_catalog() -> None:
     assert 'data-status="blocked"' in html
     assert "仅 1080p" in html
     assert "Block-Sparse-Attention 尚未验证" in html
+
+
+def test_frontend_ai_proxy_editor_keeps_password_out_of_state_and_tests_draft() -> None:
+    javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    styles = (PROJECT_ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    for element_id in (
+        "ai-proxy-form",
+        "ai-proxy-url",
+        "ai-proxy-username",
+        "ai-proxy-password",
+        "ai-proxy-clear-password",
+        "ai-proxy-test-button",
+        "ai-proxy-clear-button",
+        "ai-proxy-save-button",
+        "ai-proxy-test-result",
+        "ai-proxy-next-task-note",
+    ):
+        assert f'id="{element_id}"' in html
+    assert 'id="ai-proxy-password" type="password"' in html
+    assert 'name="proxy-' not in html
+    assert "支持 HTTP、HTTPS 和 SOCKS5" in html
+    assert "只影响下一次新开始或重试" in html
+
+    assert 'apiRequest("/api/ai-download-proxy")' in javascript
+    assert 'apiRequest("/api/ai-download-proxy", {' in javascript
+    assert 'method: "PUT"' in javascript
+    assert 'method: "DELETE"' in javascript
+    assert 'post("/api/ai-download-proxy/test", request.body)' in javascript
+    assert "password_action: aiProxyPasswordAction" in javascript
+    assert 'return "keep"' in javascript
+    assert 'return "replace"' in javascript
+    assert 'return "clear"' in javascript
+    assert "payload.test_success" in javascript
+    assert "payload.latency_ms" in javascript
+    assert "payload.test_message" in javascript
+    assert "await refreshAiProxySettings()" in javascript
+
+    assert "state.aiProxy.password" not in javascript
+    assert 'elements.aiProxyPassword.value = ""' in javascript
+    password_assignments = [
+        line.strip()
+        for line in javascript.splitlines()
+        if "elements.aiProxyPassword.value =" in line
+    ]
+    assert password_assignments
+    assert all('elements.aiProxyPassword.value = "";' in line for line in password_assignments)
+    test_function = javascript.split("async function testAiProxyDraft()", 1)[1].split(
+        "\nfunction showToast", 1
+    )[0]
+    assert "populateAiProxyForm" not in test_function
+    assert "state.aiProxy =" not in test_function
+    assert ".proxy-settings-card" in styles
+    assert ".proxy-fields" in styles

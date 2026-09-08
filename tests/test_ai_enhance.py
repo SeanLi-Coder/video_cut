@@ -292,11 +292,11 @@ def test_model_file_download_resumes_and_records_verified_hash(
 
     requests = []
 
-    def fake_urlopen(request, timeout):
-        requests.append((request, timeout))
+    def fake_urlopen(request, *, timeout, proxy):
+        requests.append((request, timeout, proxy))
         return Response(content[4:])
 
-    monkeypatch.setattr(ai_module, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ai_module, "open_network_request", fake_urlopen)
     job = AIModelDownloadJob(id="download", total_bytes=len(content))
     manager._download_model_file(
         job,
@@ -310,6 +310,7 @@ def test_model_file_download_resumes_and_records_verified_hash(
     assert destination.read_bytes() == content
     assert not partial.exists()
     assert requests[0][0].get_header("Range") == "bytes=4-"
+    assert requests[0][1:] == (30, None)
     assert job.snapshot()["downloaded_bytes"] == len(content)
     assert job.snapshot()["download_speed_bps"] >= 0
     cache = json.loads(manager.model_validation_cache_path.read_text(encoding="utf-8"))
@@ -345,7 +346,11 @@ def test_model_file_download_safely_restarts_when_server_ignores_range(
         def __exit__(self, *_args):
             self.close()
 
-    monkeypatch.setattr(ai_module, "urlopen", lambda _request, timeout: Response(content))
+    monkeypatch.setattr(
+        ai_module,
+        "open_network_request",
+        lambda _request, *, timeout, proxy: Response(content),
+    )
     job = AIModelDownloadJob(id="download", total_bytes=len(content))
     manager._download_model_file(
         job,
@@ -380,7 +385,7 @@ def test_complete_model_partial_is_verified_without_network(
     def unexpected_network(*_args, **_kwargs):
         raise AssertionError("network should not be used for a complete verified partial")
 
-    monkeypatch.setattr(ai_module, "urlopen", unexpected_network)
+    monkeypatch.setattr(ai_module, "open_network_request", unexpected_network)
     job = AIModelDownloadJob(id="download", total_bytes=len(content))
     manager._download_model_file(
         job,
@@ -414,7 +419,7 @@ def test_model_download_cancelled_during_retry_is_not_reported_as_failure(
         job.cancel_event.set()
         raise ai_module.URLError("network stopped")
 
-    monkeypatch.setattr(ai_module, "urlopen", cancel_then_fail)
+    monkeypatch.setattr(ai_module, "open_network_request", cancel_then_fail)
     with pytest.raises(InterruptedError):
         manager._download_model_file(
             job,
@@ -1217,7 +1222,7 @@ def test_runtime_download_cancelled_during_retry_is_not_reported_as_failure(
         job.cancel_event.set()
         raise ai_module.URLError("network stopped")
 
-    monkeypatch.setattr(ai_module, "urlopen", cancel_then_fail)
+    monkeypatch.setattr(ai_module, "open_network_request", cancel_then_fail)
     with pytest.raises(InterruptedError):
         manager._download_archive(job, tmp_path / "runtime.zip")
     assert calls == 1

@@ -23,7 +23,7 @@ from fractions import Fraction
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from .ai_models import (
     DEFAULT_AI_MODEL_ID,
@@ -31,6 +31,13 @@ from .ai_models import (
     catalog_metadata,
     get_ai_model,
     model_compatibility,
+)
+from .download_proxy import (
+    DownloadProxy,
+    open_network_request,
+    proxy_process_environment,
+    redact_proxy_credentials,
+    stage_pysocks_module,
 )
 from .media import (
     ExportManager,
@@ -726,6 +733,7 @@ class AIEnhancementJob:
     expected_width: int
     expected_height: int
     model_id: str = DEFAULT_AI_MODEL_ID
+    download_proxy: DownloadProxy | None = field(default=None, repr=False)
     input_frame_count: int | None = None
     input_frame_rate: str | None = None
     expected_duration: float | None = None
@@ -792,6 +800,7 @@ class AIEnhancementJob:
 class AIModelDownloadJob:
     id: str
     model_id: str = DEFAULT_AI_MODEL_ID
+    download_proxy: DownloadProxy | None = field(default=None, repr=False)
     status: str = "queued"
     stage: str = "queued"
     progress: float = 0.0
@@ -857,12 +866,14 @@ class AIEnhancementManager:
         device_uuid: str | None = None,
         device_memory_bytes: int | None = None,
         inference_runner: InferenceRunner | None = None,
+        download_proxy_provider: Callable[[], DownloadProxy | None] | None = None,
     ) -> None:
         self.ffmpeg = str(Path(ffmpeg).resolve())
         self.ffprobe = str(Path(ffprobe).resolve())
         self.runtime_root = runtime_root.expanduser().resolve()
         self.base_python = str(Path(base_python or sys.executable).resolve())
         self.inference_runner = inference_runner
+        self.download_proxy_provider = download_proxy_provider
         detected_device = _detect_compute_device() if compute_backend is None else None
         selected_backend = compute_backend or (
             detected_device.backend if detected_device is not None else None
@@ -909,6 +920,11 @@ class AIEnhancementManager:
         self._active_job_id: str | None = None
         self._latest_model_download_job_id: str | None = None
         self._latest_model_download_job_ids: dict[str, str] = {}
+
+    def _download_proxy_snapshot(self) -> DownloadProxy | None:
+        if self.download_proxy_provider is None:
+            return None
+        return self.download_proxy_provider()
 
     @property
     def code_root(self) -> Path:
@@ -1770,6 +1786,7 @@ class AIEnhancementManager:
             job = AIModelDownloadJob(
                 id=uuid.uuid4().hex,
                 model_id=model_id,
+                download_proxy=self._download_proxy_snapshot(),
                 downloaded_bytes=(
                     0
                     if discard_existing
@@ -1899,6 +1916,7 @@ class AIEnhancementManager:
             expected_width=expected_width,
             expected_height=expected_height,
             model_id=model_id,
+            download_proxy=self._download_proxy_snapshot(),
         )
         with self._lock:
             if self._active_job_locked() is not None:
@@ -2144,7 +2162,7 @@ class AIEnhancementManager:
                 **({"Range": f"bytes={existing}-"} if existing else {}),
             },
         )
-        with urlopen(request, timeout=30) as response:
+        with open_network_request(request, timeout=30, proxy=job.download_proxy) as response:
             status = int(getattr(response, "status", 200))
             append = existing > 0 and status == 206
             if append:
@@ -2450,7 +2468,10 @@ class AIEnhancementManager:
             with job.lock:
                 job.status = "failed"
                 job.stage = "failed"
-                job.error = str(exc) or exc.__class__.__name__
+                job.error = redact_proxy_credentials(
+                    str(exc) or exc.__class__.__name__,
+                    job.download_proxy,
+                )
                 job.message = "AI 模型准备失败；已下载部分会保留以便重试"
                 job.download_speed_bps = 0.0
                 job.finished_at = time.time()
@@ -2458,6 +2479,7 @@ class AIEnhancementManager:
             with job.lock:
                 process = job.process
                 job.process = None
+                job.download_proxy = None
             if process is not None and process.poll() is None:
                 self._escalate_process_stop(process)
             with self._lock:
@@ -2482,7 +2504,11 @@ class AIEnhancementManager:
                 },
             )
             try:
-                with urlopen(request, timeout=30) as response:
+                with open_network_request(
+                    request,
+                    timeout=30,
+                    proxy=job.download_proxy,
+                ) as response:
                     status = int(getattr(response, "status", 200))
                     append = existing > 0 and status == 206
                     if append:
@@ -2643,7 +2669,8 @@ class AIEnhancementManager:
         if job.cancel_event.is_set():
             raise InterruptedError
         if return_code != 0:
-            raise MediaError(self._friendly_process_error(recent, return_code))
+            message = self._friendly_process_error(recent, return_code)
+            raise MediaError(redact_proxy_credentials(message, job.download_proxy))
         return recent
 
     def _friendly_process_error(self, recent: deque[str], return_code: int) -> str:
@@ -2673,6 +2700,19 @@ class AIEnhancementManager:
         detail = recent[-1] if recent else f"process exited with code {return_code}"
         detail = re.sub(r"\x1b\[[0-9;]*m", "", detail)
         return f"AI 超清进程未完成：{detail[-500:]}"
+
+    @staticmethod
+    def _download_process_environment(
+        job: AIWorkerJob,
+        staging: Path,
+    ) -> dict[str, str]:
+        socks_directory = None
+        if job.download_proxy is not None and job.download_proxy.scheme in {"socks5", "socks5h"}:
+            socks_directory = stage_pysocks_module(staging / "proxy-bootstrap")
+        return proxy_process_environment(
+            job.download_proxy,
+            socks_module_directory=socks_directory,
+        )
 
     @staticmethod
     def _apply_runtime_patch(patch_path: Path, root: Path) -> None:
@@ -2806,6 +2846,7 @@ class AIEnhancementManager:
                 "--disable-pip-version-check",
                 "--no-input",
             ]
+            download_environment = self._download_process_environment(job, staging)
             if self.compute_backend == "cuda":
                 pip_options.append("--no-cache-dir")
                 self._run_process(
@@ -2815,6 +2856,7 @@ class AIEnhancementManager:
                         "-r",
                         str(AI_CUDA_REQUIREMENTS_PATH),
                     ],
+                    env=download_environment,
                 )
                 dependency_path = AI_COMMON_REQUIREMENTS_PATH
             else:
@@ -2826,6 +2868,7 @@ class AIEnhancementManager:
                     "-r",
                     str(dependency_path),
                 ],
+                env=download_environment,
             )
             self._verify_compute_runtime(job, python)
             self._run_process(
@@ -2918,6 +2961,7 @@ class AIEnhancementManager:
                     "-r",
                     str(AI_SWIFTVR_REQUIREMENTS_PATH),
                 ],
+                env=self._download_process_environment(job, staging),
             )
             self._verify_compute_runtime(job, python)
             self._run_process(
@@ -3704,7 +3748,10 @@ class AIEnhancementManager:
             with job.lock:
                 job.status = "failed"
                 job.stage = "failed"
-                job.error = str(exc) or exc.__class__.__name__
+                job.error = redact_proxy_credentials(
+                    str(exc) or exc.__class__.__name__,
+                    job.download_proxy,
+                )
                 job.message = "AI 超清失败，原视频未被修改"
                 job.finished_at = time.time()
         finally:
@@ -3714,6 +3761,7 @@ class AIEnhancementManager:
             with job.lock:
                 process = job.process
                 job.process = None
+                job.download_proxy = None
             if process is not None and process.poll() is None:
                 self._escalate_process_stop(process)
             with self._lock:

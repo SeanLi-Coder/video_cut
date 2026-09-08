@@ -74,6 +74,19 @@ const state = {
   modelDownloadPollSerial: 0,
   modelDownloadPollFailures: 0,
   modelDownloadRequestError: "",
+  aiProxy: {
+    configured: false,
+    url: "",
+    username: "",
+    hasPassword: false,
+    displayUrl: "直接连接",
+  },
+  aiProxyLoaded: false,
+  aiProxyDirty: false,
+  aiProxyBusy: "",
+  aiProxyError: "",
+  aiProxyTestResult: "",
+  aiProxyRequestSerial: 0,
   operation: "clip",
   rotationDegrees: 90,
   enhanceTarget: "",
@@ -157,6 +170,19 @@ const elements = {
   activeAiModelBadge: byId("active-ai-model-badge"),
   aiRuntimeInlineNote: byId("ai-runtime-inline-note"),
   openModelManagerButton: byId("open-model-manager-button"),
+  aiProxyForm: byId("ai-proxy-form"),
+  aiProxyUrl: byId("ai-proxy-url"),
+  aiProxyUsername: byId("ai-proxy-username"),
+  aiProxyPassword: byId("ai-proxy-password"),
+  aiProxyClearPassword: byId("ai-proxy-clear-password"),
+  aiProxyStatusBadge: byId("ai-proxy-status-badge"),
+  aiProxyCurrent: byId("ai-proxy-current"),
+  aiProxyTestResult: byId("ai-proxy-test-result"),
+  aiProxyNextTaskNote: byId("ai-proxy-next-task-note"),
+  aiProxyError: byId("ai-proxy-error"),
+  aiProxyTestButton: byId("ai-proxy-test-button"),
+  aiProxyClearButton: byId("ai-proxy-clear-button"),
+  aiProxySaveButton: byId("ai-proxy-save-button"),
   modelSelector: byId("model-selector"),
   modelKicker: byId("model-kicker"),
   modelManagerHeading: byId("model-manager-heading"),
@@ -347,6 +373,340 @@ function showSystemBanner(title, message, type = "warning") {
 
 function hideSystemBanner() {
   elements.systemBanner.hidden = true;
+}
+
+function validateAiProxyUrl(value) {
+  const rawUrl = String(value || "").trim();
+  if (!rawUrl) {
+    return { valid: false, url: "", message: "请输入代理地址。" };
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch (_error) {
+    return { valid: false, url: "", message: "代理地址格式不正确，请包含 http://、https:// 或 socks5://。" };
+  }
+
+  if (!["http:", "https:", "socks5:", "socks5h:"].includes(parsed.protocol.toLowerCase())) {
+    return { valid: false, url: "", message: "代理仅支持 HTTP、HTTPS 或 SOCKS5。" };
+  }
+  if (!parsed.hostname) {
+    return { valid: false, url: "", message: "代理地址缺少主机名。" };
+  }
+  if (parsed.username || parsed.password) {
+    return { valid: false, url: "", message: "请把代理用户名和密码填写在单独的输入框中。" };
+  }
+  if ((parsed.pathname && parsed.pathname !== "/") || parsed.search || parsed.hash) {
+    return { valid: false, url: "", message: "代理地址只需填写协议、主机和端口。" };
+  }
+
+  const authority = rawUrl.slice(rawUrl.indexOf("://") + 3).replace(/\/$/, "");
+  const explicitPort = authority.match(/:(\d+)$/)?.[1] || "";
+  const port = Number(explicitPort);
+  if (!explicitPort || !Number.isInteger(port) || port < 1 || port > 65535) {
+    return { valid: false, url: "", message: "代理地址必须包含 1 到 65535 的端口，例如 :7890。" };
+  }
+
+  const bareHostname = parsed.hostname.startsWith("[") && parsed.hostname.endsWith("]")
+    ? parsed.hostname.slice(1, -1)
+    : parsed.hostname;
+  const hostname = bareHostname.includes(":") ? `[${bareHostname}]` : bareHostname;
+
+  return {
+    valid: true,
+    url: `${parsed.protocol.toLowerCase()}//${hostname.toLowerCase()}:${port}`,
+    message: "",
+  };
+}
+
+function normalizeAiProxySettings(payload) {
+  const value = payload && typeof payload === "object" ? payload : {};
+  const configured = value.configured === true;
+  const checkedUrl = validateAiProxyUrl(value.url);
+  const url = configured && checkedUrl.valid ? checkedUrl.url : "";
+  const username = configured && typeof value.username === "string" ? value.username : "";
+  let displayUrl = "直接连接";
+  if (configured && url) {
+    const characters = Array.from(username);
+    const maskedUsername = characters.length ? `${characters.slice(0, Math.min(2, characters.length)).join("")}***` : "";
+    const passwordMarker = value.has_password === true ? ":••••" : "";
+    const authorityStart = url.indexOf("://") + 3;
+    displayUrl = `${url.slice(0, authorityStart)}${maskedUsername ? `${maskedUsername}${passwordMarker}@` : ""}${url.slice(authorityStart)}`;
+  } else if (configured) {
+    displayUrl = "已配置（地址已隐藏）";
+  }
+  return {
+    configured,
+    url,
+    username,
+    hasPassword: configured && value.has_password === true,
+    displayUrl,
+  };
+}
+
+function populateAiProxyForm() {
+  elements.aiProxyUrl.value = state.aiProxy.url;
+  elements.aiProxyUsername.value = state.aiProxy.username;
+  elements.aiProxyPassword.value = "";
+  elements.aiProxyClearPassword.checked = false;
+  elements.aiProxyUrl.setAttribute("aria-invalid", "false");
+}
+
+function readAiProxyDraft() {
+  return {
+    url: elements.aiProxyUrl.value.trim(),
+    username: elements.aiProxyUsername.value.trim(),
+    password: elements.aiProxyPassword.value,
+  };
+}
+
+function aiProxyDraftMatchesSaved(draft, normalizedUrl = "") {
+  const checkedUrl = normalizedUrl
+    ? { valid: true, url: normalizedUrl }
+    : validateAiProxyUrl(draft.url);
+  return state.aiProxy.configured
+    && checkedUrl.valid
+    && checkedUrl.url === state.aiProxy.url
+    && draft.username === state.aiProxy.username;
+}
+
+function aiProxyPasswordAction(draft, normalizedUrl) {
+  const sameProxy = aiProxyDraftMatchesSaved(draft, normalizedUrl);
+  if (sameProxy && elements.aiProxyClearPassword.checked) return "clear";
+  if (draft.password) return "replace";
+  if (sameProxy && state.aiProxy.hasPassword) return "keep";
+  return "clear";
+}
+
+function buildAiProxyRequestBody() {
+  const draft = readAiProxyDraft();
+  const checkedUrl = validateAiProxyUrl(draft.url);
+  elements.aiProxyUrl.setAttribute("aria-invalid", checkedUrl.valid ? "false" : "true");
+  if (!checkedUrl.valid) {
+    return { body: null, error: checkedUrl.message };
+  }
+  return {
+    body: {
+      url: checkedUrl.url,
+      username: draft.username,
+      password: draft.password,
+      password_action: aiProxyPasswordAction(draft, checkedUrl.url),
+    },
+    error: "",
+  };
+}
+
+function renderAiProxySettings() {
+  const busy = state.aiProxyBusy;
+  const controlsDisabled = !state.appReady || !state.aiProxyLoaded || Boolean(busy);
+  const draft = readAiProxyDraft();
+  const sameProxy = aiProxyDraftMatchesSaved(draft);
+  const canClearPassword = state.aiProxy.hasPassword && sameProxy;
+  const clearPasswordActive = canClearPassword && elements.aiProxyClearPassword.checked;
+
+  elements.aiProxyUrl.disabled = controlsDisabled;
+  elements.aiProxyUsername.disabled = controlsDisabled;
+  elements.aiProxyPassword.disabled = controlsDisabled || clearPasswordActive;
+  elements.aiProxyClearPassword.disabled = controlsDisabled || !canClearPassword;
+  elements.aiProxyTestButton.disabled = controlsDisabled;
+  elements.aiProxySaveButton.disabled = controlsDisabled;
+  elements.aiProxyClearButton.disabled = controlsDisabled || !state.aiProxy.configured;
+  setButtonBusy(elements.aiProxyTestButton, busy === "test", "测试中…");
+  setButtonBusy(elements.aiProxySaveButton, busy === "save", "保存中…");
+  setButtonBusy(elements.aiProxyClearButton, busy === "clear", "清除中…");
+
+  let badgeStatus = "idle";
+  let badgeText = "直接连接";
+  if (busy === "load") [badgeStatus, badgeText] = ["running", "正在读取"];
+  else if (busy === "test") [badgeStatus, badgeText] = ["running", "正在测试"];
+  else if (busy) [badgeStatus, badgeText] = ["running", "正在保存"];
+  else if (!state.aiProxyLoaded && state.aiProxyError) [badgeStatus, badgeText] = ["failed", "读取失败"];
+  else if (!state.aiProxyLoaded) badgeText = "等待服务";
+  else if (state.aiProxyDirty) [badgeStatus, badgeText] = ["dirty", "尚未保存"];
+  else if (state.aiProxy.configured) [badgeStatus, badgeText] = ["ready", "已启用"];
+  elements.aiProxyStatusBadge.dataset.status = badgeStatus;
+  elements.aiProxyStatusBadge.textContent = badgeText;
+
+  elements.aiProxyCurrent.textContent = state.aiProxyLoaded
+    ? state.aiProxy.configured
+      ? `当前：${state.aiProxy.displayUrl}${state.aiProxy.hasPassword ? " · 密码已保存且不会回显" : ""}`
+      : "当前：直接连接（未使用代理）"
+    : state.aiProxyError
+      ? "无法读取当前代理设置，请刷新页面后重试。"
+      : "正在读取当前设置…";
+  elements.aiProxyError.textContent = state.aiProxyError;
+  elements.aiProxyError.hidden = !state.aiProxyError;
+  elements.aiProxyTestResult.textContent = state.aiProxyTestResult;
+  elements.aiProxyTestResult.hidden = !state.aiProxyTestResult;
+  elements.aiProxyNextTaskNote.textContent = modelDownloadIsActive()
+    ? "当前模型任务会继续使用启动时的连接；新设置从下一次新开始或重试生效。"
+    : "保存或清除后只影响下一次新开始或重试的模型下载。";
+}
+
+function markAiProxyDraftChanged(event) {
+  if (event.currentTarget === elements.aiProxyPassword && elements.aiProxyPassword.value) {
+    elements.aiProxyClearPassword.checked = false;
+  }
+  if (
+    [elements.aiProxyUrl, elements.aiProxyUsername].includes(event.currentTarget)
+    && elements.aiProxyClearPassword.checked
+  ) {
+    elements.aiProxyClearPassword.checked = false;
+  }
+  state.aiProxyDirty = true;
+  state.aiProxyError = "";
+  state.aiProxyTestResult = "";
+  elements.aiProxyUrl.setAttribute("aria-invalid", "false");
+  renderAiProxySettings();
+}
+
+function handleAiProxyClearPasswordChange() {
+  if (elements.aiProxyClearPassword.checked) elements.aiProxyPassword.value = "";
+  state.aiProxyDirty = true;
+  state.aiProxyError = "";
+  state.aiProxyTestResult = "";
+  renderAiProxySettings();
+}
+
+function showAiProxyRequestError(error, fallbackMessage) {
+  state.aiProxyError = error?.message || fallbackMessage;
+  state.aiProxyTestResult = "";
+  showToast(state.aiProxyError, "error");
+}
+
+async function refreshAiProxySettings() {
+  if (!state.appReady) {
+    renderAiProxySettings();
+    return;
+  }
+  const requestSerial = ++state.aiProxyRequestSerial;
+  state.aiProxyBusy = "load";
+  state.aiProxyError = "";
+  renderAiProxySettings();
+  try {
+    const payload = await apiRequest("/api/ai-download-proxy");
+    if (requestSerial !== state.aiProxyRequestSerial) return;
+    state.aiProxy = normalizeAiProxySettings(payload);
+    state.aiProxyLoaded = true;
+    state.aiProxyDirty = false;
+    state.aiProxyTestResult = "";
+    populateAiProxyForm();
+  } catch (error) {
+    if (requestSerial !== state.aiProxyRequestSerial) return;
+    state.aiProxyLoaded = false;
+    state.aiProxyError = error?.message || "无法读取 AI 模型下载代理设置。";
+  } finally {
+    if (requestSerial === state.aiProxyRequestSerial) {
+      state.aiProxyBusy = "";
+      renderAiProxySettings();
+    }
+  }
+}
+
+async function saveAiProxySettings(event) {
+  event.preventDefault();
+  if (!state.appReady || !state.aiProxyLoaded || state.aiProxyBusy) return;
+  const request = buildAiProxyRequestBody();
+  if (!request.body) {
+    state.aiProxyError = request.error;
+    state.aiProxyTestResult = "";
+    renderAiProxySettings();
+    elements.aiProxyUrl.focus();
+    return;
+  }
+
+  const requestSerial = ++state.aiProxyRequestSerial;
+  state.aiProxyBusy = "save";
+  state.aiProxyError = "";
+  state.aiProxyTestResult = "";
+  renderAiProxySettings();
+  try {
+    const payload = await apiRequest("/api/ai-download-proxy", {
+      method: "PUT",
+      body: request.body,
+    });
+    if (requestSerial !== state.aiProxyRequestSerial) return;
+    state.aiProxy = normalizeAiProxySettings(payload);
+    state.aiProxyLoaded = true;
+    state.aiProxyDirty = false;
+    populateAiProxyForm();
+    showToast(modelDownloadIsActive()
+      ? "代理已保存；当前任务不变，下次模型任务生效"
+      : "代理已保存，将用于下一次模型下载");
+  } catch (error) {
+    if (requestSerial !== state.aiProxyRequestSerial) return;
+    showAiProxyRequestError(error, "无法保存 AI 模型下载代理。");
+  } finally {
+    if (requestSerial === state.aiProxyRequestSerial) {
+      state.aiProxyBusy = "";
+      renderAiProxySettings();
+    }
+  }
+}
+
+async function clearAiProxySettings() {
+  if (!state.appReady || !state.aiProxyLoaded || state.aiProxyBusy || !state.aiProxy.configured) return;
+  const requestSerial = ++state.aiProxyRequestSerial;
+  state.aiProxyBusy = "clear";
+  state.aiProxyError = "";
+  state.aiProxyTestResult = "";
+  renderAiProxySettings();
+  try {
+    const payload = await apiRequest("/api/ai-download-proxy", { method: "DELETE" });
+    if (requestSerial !== state.aiProxyRequestSerial) return;
+    state.aiProxy = normalizeAiProxySettings(payload);
+    state.aiProxyLoaded = true;
+    state.aiProxyDirty = false;
+    populateAiProxyForm();
+    showToast(modelDownloadIsActive()
+      ? "代理已清除；当前任务不变，下次模型任务将直接连接"
+      : "代理已清除，下次模型下载将直接连接");
+  } catch (error) {
+    if (requestSerial !== state.aiProxyRequestSerial) return;
+    showAiProxyRequestError(error, "无法清除 AI 模型下载代理。");
+  } finally {
+    if (requestSerial === state.aiProxyRequestSerial) {
+      state.aiProxyBusy = "";
+      renderAiProxySettings();
+    }
+  }
+}
+
+async function testAiProxyDraft() {
+  if (!state.appReady || !state.aiProxyLoaded || state.aiProxyBusy) return;
+  const request = buildAiProxyRequestBody();
+  if (!request.body) {
+    state.aiProxyError = request.error;
+    state.aiProxyTestResult = "";
+    renderAiProxySettings();
+    elements.aiProxyUrl.focus();
+    return;
+  }
+
+  const requestSerial = ++state.aiProxyRequestSerial;
+  state.aiProxyBusy = "test";
+  state.aiProxyError = "";
+  state.aiProxyTestResult = "";
+  renderAiProxySettings();
+  try {
+    const payload = await post("/api/ai-download-proxy/test", request.body);
+    if (requestSerial !== state.aiProxyRequestSerial) return;
+    if (payload.test_success === false) {
+      throw new ApiError(payload.test_message || "代理连接测试失败。", 502, payload);
+    }
+    const latency = Number(payload.latency_ms);
+    const latencyText = Number.isFinite(latency) && latency >= 0 ? ` · ${Math.round(latency)} ms` : "";
+    state.aiProxyTestResult = `${payload.test_message || payload.message || "代理连接测试成功"}${latencyText}`;
+  } catch (error) {
+    if (requestSerial !== state.aiProxyRequestSerial) return;
+    showAiProxyRequestError(error, "代理连接测试失败。");
+  } finally {
+    if (requestSerial === state.aiProxyRequestSerial) {
+      state.aiProxyBusy = "";
+      renderAiProxySettings();
+    }
+  }
 }
 
 function showToast(message, type = "success") {
@@ -2063,6 +2423,7 @@ function renderModelManager() {
       ? "查看下载进度"
       : "管理 AI 模型";
   renderAiModelChoices();
+  renderAiProxySettings();
 }
 
 function modelDownloadPath(modelId = state.modelDownloadModelId || state.selectedAiModelId) {
@@ -2934,6 +3295,7 @@ function renderControls() {
 async function bootstrap() {
   renderControls();
   renderModelManager();
+  renderAiProxySettings();
   setPreviewStatus("", "等待选择视频");
 
   try {
@@ -2968,6 +3330,7 @@ async function bootstrap() {
     } else {
       hideSystemBanner();
     }
+    await refreshAiProxySettings();
     await refreshAiModels();
   } catch (error) {
     state.appReady = false;
@@ -2990,6 +3353,13 @@ elements.openModelManagerButton.addEventListener("click", () => {
 });
 elements.modelDownloadButton.addEventListener("click", startModelDownload);
 elements.cancelModelDownloadButton.addEventListener("click", cancelModelDownload);
+elements.aiProxyForm.addEventListener("submit", saveAiProxySettings);
+elements.aiProxyTestButton.addEventListener("click", testAiProxyDraft);
+elements.aiProxyClearButton.addEventListener("click", clearAiProxySettings);
+elements.aiProxyUrl.addEventListener("input", markAiProxyDraftChanged);
+elements.aiProxyUsername.addEventListener("input", markAiProxyDraftChanged);
+elements.aiProxyPassword.addEventListener("input", markAiProxyDraftChanged);
+elements.aiProxyClearPassword.addEventListener("change", handleAiProxyClearPasswordChange);
 function handleAiModelSelection(event) {
   const option = event.target.closest("[data-model-id]");
   if (!option || !event.currentTarget.contains(option) || option.disabled) return;

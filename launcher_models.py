@@ -1,22 +1,34 @@
 from __future__ import annotations
 
+import contextlib
+import getpass
 import json
 import math
 import queue
+import re
 import sys
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, TextIO
+from typing import Any, TextIO, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 HTTP_TIMEOUT_SECONDS = 15
 POLL_INTERVAL_SECONDS = 0.25
 MAX_STATUS_POLL_FAILURES = 3
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 ACTIVE_DOWNLOAD_STATUSES = frozenset({"queued", "running"})
+DOWNLOAD_PROXY_PATH = "/api/ai-download-proxy"
+
+# Local control requests must never inherit HTTP(S)_PROXY or ALL_PROXY. Besides
+# making startup unreliable, proxying loopback could disclose application tokens.
+_DIRECT_PROXY_HANDLER = ProxyHandler({})
+_DIRECT_LOCAL_OPENER = build_opener(_DIRECT_PROXY_HANDLER)
+urlopen = _DIRECT_LOCAL_OPENER.open
+_PROXY_USERINFO_PATTERN = re.compile(r"(?i)(https?|socks5h?)://[^\s/@]+(?::[^\s/@]*)?@")
+_POSIX_TTY_UNAVAILABLE = object()
 
 
 class ModelPromptError(RuntimeError):
@@ -70,7 +82,7 @@ def _request_json(
     data: bytes | None = None
     if token is not None:
         headers["X-App-Token"] = token
-    if method == "POST":
+    if method in {"POST", "PUT"}:
         data = json.dumps(
             dict(json_body) if json_body is not None else {},
             ensure_ascii=True,
@@ -386,6 +398,273 @@ def _readline_until_stopped(
     return None
 
 
+def _proxy_display(payload: Mapping[str, Any]) -> str:
+    if payload.get("configured") is not True:
+        return "direct connection (no proxy)"
+    display = _clean_terminal_text(
+        payload.get("display_url"),
+        fallback="configured proxy (address hidden)",
+    )
+    return _PROXY_USERINFO_PATTERN.sub(r"\1://***@", display)
+
+
+def _read_proxy_line(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    stop_requested: threading.Event,
+    prompt: str,
+) -> str | None:
+    _write(output_stream, prompt)
+    try:
+        answer = _readline_until_stopped(input_stream, stop_requested)
+    except EOFError:
+        return None
+    if answer is None or answer == "":
+        return None
+    return answer.rstrip("\r\n")
+
+
+def _getpass_until_stopped(
+    output_stream: TextIO,
+    stop_requested: threading.Event,
+    *,
+    use_posix_tty: bool,
+) -> str | None:
+    if stop_requested.is_set():
+        return None
+    password = _getpass_from_posix_tty(
+        output_stream,
+        stop_requested,
+        enabled=use_posix_tty,
+    )
+    if password is not _POSIX_TTY_UNAVAILABLE:
+        return cast(str | None, password)
+
+    result: queue.Queue[str | BaseException] = queue.Queue(maxsize=1)
+
+    def read() -> None:
+        try:
+            result.put(
+                getpass.getpass(
+                    "Proxy password (hidden; Enter clears it): ",
+                    stream=output_stream,
+                )
+            )
+        except BaseException as exc:
+            result.put(exc)
+
+    threading.Thread(target=read, name="ai-proxy-password-input", daemon=True).start()
+    while not stop_requested.wait(0.1):
+        try:
+            value = result.get_nowait()
+        except queue.Empty:
+            continue
+        if isinstance(value, BaseException):
+            if isinstance(value, (EOFError, KeyboardInterrupt)):
+                raise value
+            raise ModelPromptError("secure proxy password input failed") from value
+        return value
+    return None
+
+
+def _getpass_from_posix_tty(
+    output_stream: TextIO,
+    stop_requested: threading.Event,
+    *,
+    enabled: bool,
+) -> str | None | object:
+    if not enabled or sys.platform == "win32":
+        return _POSIX_TTY_UNAVAILABLE
+
+    import os
+    import select
+    import termios
+
+    try:
+        descriptor = os.open(
+            "/dev/tty",
+            os.O_RDWR | getattr(os, "O_NOCTTY", 0),
+        )
+    except OSError:
+        return _POSIX_TTY_UNAVAILABLE
+
+    original_attributes: list[Any] | None = None
+    prompt_written = False
+    try:
+        original_attributes = termios.tcgetattr(descriptor)
+        hidden_attributes = list(original_attributes)
+        hidden_attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(descriptor, termios.TCSAFLUSH, hidden_attributes)
+        _write(output_stream, "Proxy password (hidden; Enter clears it): ")
+        prompt_written = True
+        while not stop_requested.is_set():
+            try:
+                readable, _, _ = select.select([descriptor], [], [], 0.1)
+            except InterruptedError:
+                continue
+            if not readable:
+                continue
+            value = os.read(descriptor, 65_536)
+            if not value:
+                raise EOFError
+            line = value.split(b"\n", 1)[0].rstrip(b"\r")
+            encoding = os.device_encoding(descriptor) or "utf-8"
+            return line.decode(encoding)
+        return None
+    except (EOFError, KeyboardInterrupt):
+        raise
+    except BaseException as exc:
+        raise ModelPromptError("secure proxy password input failed") from exc
+    finally:
+        if original_attributes is not None:
+            with contextlib.suppress(OSError, termios.error):
+                termios.tcsetattr(descriptor, termios.TCSADRAIN, original_attributes)
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        if prompt_written:
+            _write(output_stream, "\n")
+
+
+def _test_saved_download_proxy(
+    port: int,
+    token: str,
+    output: TextIO,
+) -> None:
+    try:
+        result = _request_json(
+            port,
+            f"{DOWNLOAD_PROXY_PATH}/test",
+            method="POST",
+            token=token,
+        )
+        if result.get("test_success") is not True:
+            raise ModelPromptError("local API did not confirm proxy connectivity")
+        latency = _finite_number(result.get("latency_ms"))
+        if latency is None or latency < 0:
+            _write(output, "Proxy connection test succeeded.\n")
+        else:
+            _write(output, f"Proxy connection test succeeded ({latency:.0f} ms).\n")
+    except ModelPromptError as exc:
+        _write(
+            output,
+            "Proxy setting was saved, but its connection test failed "
+            f"({exc}); model selection will continue.\n",
+        )
+
+
+def _prompt_for_download_proxy(
+    port: int,
+    token: str,
+    input_stream: TextIO,
+    output_stream: TextIO,
+    stop_requested: threading.Event,
+) -> bool:
+    try:
+        current = _request_json(port, DOWNLOAD_PROXY_PATH, token=token)
+    except ModelPromptError as exc:
+        _write(
+            output_stream,
+            f"AI download proxy settings are unavailable ({exc}); model selection will continue.\n",
+        )
+        return True
+
+    _write(output_stream, f"Current AI download proxy: {_proxy_display(current)}\n")
+    while True:
+        action = _read_proxy_line(
+            input_stream,
+            output_stream,
+            stop_requested,
+            "AI download proxy [Enter=keep, s=set/change, c=clear]: ",
+        )
+        if action is None:
+            return False
+        normalized = action.strip().lower()
+        if normalized == "":
+            return True
+        if normalized == "c":
+            try:
+                _request_json(
+                    port,
+                    DOWNLOAD_PROXY_PATH,
+                    method="DELETE",
+                    token=token,
+                )
+                _write(output_stream, "AI download proxy was cleared.\n")
+            except ModelPromptError as exc:
+                _write(
+                    output_stream,
+                    f"AI download proxy could not be cleared ({exc}); "
+                    "model selection will continue.\n",
+                )
+            return True
+        if normalized != "s":
+            _write(output_stream, "Please press Enter, or enter s or c.\n")
+            continue
+
+        while True:
+            proxy_url = _read_proxy_line(
+                input_stream,
+                output_stream,
+                stop_requested,
+                "Proxy URL (http://, https://, socks5://, or socks5h://): ",
+            )
+            if proxy_url is None:
+                return False
+            proxy_url = proxy_url.strip()
+            if proxy_url:
+                break
+            _write(output_stream, "Proxy URL is required.\n")
+
+        username = _read_proxy_line(
+            input_stream,
+            output_stream,
+            stop_requested,
+            "Proxy username (optional): ",
+        )
+        if username is None:
+            return False
+        if stop_requested.is_set():
+            return False
+        try:
+            use_posix_tty = bool(input_stream.isatty())
+        except (AttributeError, OSError):
+            use_posix_tty = False
+        try:
+            password = _getpass_until_stopped(
+                output_stream,
+                stop_requested,
+                use_posix_tty=use_posix_tty,
+            )
+        except EOFError:
+            return False
+        if password is None or stop_requested.is_set():
+            return False
+
+        request_body = {
+            "url": proxy_url,
+            "username": username.strip(),
+            "password": password,
+            "password_action": "replace" if password else "clear",
+        }
+        try:
+            saved = _request_json(
+                port,
+                DOWNLOAD_PROXY_PATH,
+                method="PUT",
+                token=token,
+                json_body=request_body,
+            )
+        except ModelPromptError as exc:
+            _write(
+                output_stream,
+                f"AI download proxy could not be saved ({exc}); model selection will continue.\n",
+            )
+            return True
+        _write(output_stream, f"AI download proxy saved: {_proxy_display(saved)}\n")
+        _test_saved_download_proxy(port, token, output_stream)
+        return True
+
+
 def _read_download_choice(
     input_stream: TextIO,
     output_stream: TextIO,
@@ -477,6 +756,19 @@ def prompt_for_missing_models(
                 else "Optional AI models can be downloaded before the app opens.\n"
             ),
         )
+        if any(not model.active for model in models) and not _prompt_for_download_proxy(
+            port,
+            token,
+            source,
+            output,
+            stop_requested,
+        ):
+            if not stop_requested.is_set():
+                _write(
+                    output,
+                    "Input closed; remaining AI model downloads were skipped.\n",
+                )
+            return
         for index, model in enumerate(models, start=1):
             if stop_requested.is_set():
                 return

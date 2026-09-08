@@ -34,7 +34,11 @@
 
 普通下载支持断点续传。如果网页下载曾失败、取消，或磁盘上留有部分文件，下次运行启动器会显示 `Continue, restart from zero, or skip? [c/r/N]`：输入 `c` 从已下载位置继续，输入 `r` 只清理当前这个模型的权重并从零重下，输入 `n` 或直接按 Enter 跳过。清理不会删除已安装的 AI runtime，也不会影响其他模型。即使本地网页服务已经在运行，再次运行 `start.command`、`LocalVideoCutter.exe` 或 `start.bat` 也会先显示可恢复下载的模型，然后再重新打开网页。
 
-也可以全部跳过，等浏览器打开后进入独立的“AI 模型管理”标签页。每个模型都有自己的状态、兼容性说明和下载按钮，无需先选择视频或保存目录。页面会显示实际检测到的设备名称、后端、显存或统一内存，以及当前阶段、百分比、已下载容量、下载速度、已用时间和预计剩余时间。切换回“视频处理”不会中断；刷新页面后也会自动找回正在运行的任务。取消后已下载部分会保留，下次点击“继续下载”会断点续传。全部文件通过 SHA-256 校验后，模型才能运行。
+如果下载模型需要代理，启动窗口会在第一个新下载或恢复任务之前显示当前设置：在 `AI download proxy [Enter=keep, s=set/change, c=clear]` 处直接按 Enter 沿用，输入 `s` 后可填写例如 `socks5://127.0.0.1:7897` 或 `http://127.0.0.1:7897`，输入 `c` 则清除。代理账号可选，密码输入不会回显；保存后启动器会先做一次连接测试并显示延迟，再继续询问是否下载模型。只有正在进行的任务不会重新询问或中途切换代理。
+
+也可以全部跳过，等浏览器打开后进入独立的“AI 模型管理”标签页。页面上方可以填写、测试、保存或清除同一份下载代理；下方每个模型都有自己的状态、兼容性说明和下载按钮，无需先选择视频或保存目录。页面会显示实际检测到的设备名称、后端、显存或统一内存，以及当前阶段、百分比、已下载容量、下载速度、已用时间和预计剩余时间。切换回“视频处理”不会中断；刷新页面后也会自动找回正在运行的任务。取消后已下载部分会保留，下次点击“继续下载”会断点续传。全部文件通过 SHA-256 校验后，模型才能运行。
+
+应用内代理支持 `http://`、`https://`、`socks5://` 和 `socks5h://`，会同时用于 AI 运行器、模型权重和隔离环境依赖下载。`socks5://` 在本机解析目标域名；如果本地 DNS 也受限，可改用由代理端解析域名的 `socks5h://`。每个任务在开始时固定代理设置，页面中途修改只对下一次新开始或重试生效。代理设置保存在本机项目的 `data/settings.json`，API 和页面不会回传已保存的密码；在共用电脑或复制整个项目目录前，建议先点“清除代理”。首次创建应用自身的 `.venv`、Homebrew 或 WinGet 下载发生在网页服务启动之前，因此这几个最早步骤仍需使用系统/终端代理。
 
 SeedVR2 权重约 7.3 GB，SwiftVR 权重约 20.2 GB，运行环境还会另外占用空间。Apple Silicon 只安装 SeedVR2 建议至少留出约 12 GB，Windows RTX 5090 只安装 SeedVR2 建议至少留出约 18 GB；Windows 同时安装 SeedVR2 与 SwiftVR 建议至少留出约 60 GB。启动时预下载不是强制步骤：SeedVR2 可以在第一次任务时自动准备；SwiftVR 必须先在启动窗口输入 `y`，或稍后到“AI 模型管理”完成准备，网页才会允许开始 SwiftVR 任务。
 
@@ -152,7 +156,7 @@ SwiftVR 是 5B BF16 的流式一阶段视频修复模型。本版本把它作为
 
 SeedVR2 的两条路径使用完全相同的 3B FP16 权重和 PyTorch SDPA attention。RTX 5090 路径不会默认换成 FP8，也不会默认安装 SageAttention、Apex、FlashAttention 或额外 Triton kernel；这样可以保留 FP16 质量并避免把一次性编译、第三方二进制兼容性变成稳定路径的前置条件。程序不会因显存不足静默降低模型精度，也不会把一个模型的任务悄悄换给另一个模型。
 
-启动器会在本地网页服务就绪后检查当前设备兼容、允许启动提示且尚未完整准备的模型。新下载会显示 `Download this model now? [y/N]`；检测到失败、取消或残留的部分文件时，会改为显示 `Continue, restart from zero, or skip? [c/r/N]`。`c` 使用 HTTP Range 从断点续传，`r` 只删除所选模型的已有权重和 `.download` 文件后从零重下，`n` 或直接按 Enter 跳过。重下不会删除该模型的 runtime 或任何其他模型。某个模型准备失败不会阻止基础工具启动。已有实例运行时再次启动程序，也会检查并显示恢复提示；如果同一模型仍在下载，则直接在命令行接管其进度显示。自动化或无人值守启动可传入 `--skip-model-prompt`，它只跳过命令行询问，不会隐藏网页模型管理功能。
+启动器会在本地网页服务就绪后检查当前设备兼容、允许启动提示且尚未完整准备的模型。若至少有一个任务尚未开始，会先显示 `AI download proxy [Enter=keep, s=set/change, c=clear]`，网页和命令行共用这份设置。新下载随后显示 `Download this model now? [y/N]`；检测到失败、取消或残留的部分文件时，会改为显示 `Continue, restart from zero, or skip? [c/r/N]`。`c` 使用 HTTP Range 从断点续传，`r` 只删除所选模型的已有权重和 `.download` 文件后从零重下，`n` 或直接按 Enter 跳过。重下不会删除该模型的 runtime 或任何其他模型。某个模型准备失败不会阻止基础工具启动。已有实例运行时再次启动程序，也会检查并显示恢复提示；如果同一模型仍在下载，则直接在命令行接管其进度显示。自动化或无人值守启动可传入 `--skip-model-prompt`，它会同时跳过命令行代理与模型询问，不会隐藏网页模型管理功能。
 
 也可以在独立的“AI 模型管理”标签页按模型提前安装、继续下载或取消。安装过程会创建隔离环境，下载固定 revision 的运行器与权重，并逐文件校验 SHA-256。SeedVR2 下载约 7.3 GB 的 3B FP16 与 VAE 权重；SwiftVR 下载约 20.2 GB 的 5B BF16 权重。blocked 的 FlashVSR 不会开始下载。
 
@@ -300,8 +304,8 @@ brew install python ffmpeg-full molten-vk
 当前 GitHub Release 没有商业代码签名证书，Windows 可能在第一次运行时显示 SmartScreen 提示。请只使用本仓库 Releases 中的 ZIP，并同时下载同页对应的 `.zip.sha256` 文件；确认来源后点击“更多信息”再选择“仍要运行”。SHA-256 可以在 PowerShell 中检查：
 
 ```powershell
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.8.1.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.8.1.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.9.0.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.9.0.zip.sha256
 ```
 
 第一条命令输出中的 `Hash` 必须与 `.zip.sha256` 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行该文件，应重新下载并再次核对。

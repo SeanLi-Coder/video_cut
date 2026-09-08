@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, urlopen
 
 import pytest
 
@@ -20,6 +20,12 @@ import launcher
 import stop
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_posix_local_control_requests_disable_system_proxies() -> None:
+    for module in (launcher, stop):
+        assert isinstance(module._LOCAL_PROXY_HANDLER, ProxyHandler)
+        assert module._LOCAL_PROXY_HANDLER.proxies == {}
 
 
 def _health(port: int) -> dict[str, Any] | None:

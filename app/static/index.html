@@ -173,7 +173,7 @@
             <div class="time-field">
               <label for="start-time">起始时间</label>
               <div class="time-input-wrap">
-                <input id="start-time" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="00:00:00.000" disabled aria-describedby="time-format-hint start-time-error">
+                <input id="start-time" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="00:00:00.000" disabled aria-describedby="time-format-hint start-time-error" data-video-parameter="time">
                 <span class="time-input-icon" aria-hidden="true">
                   <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>
                 </span>
@@ -190,7 +190,7 @@
             <div class="time-field">
               <label for="end-time">结束时间</label>
               <div class="time-input-wrap">
-                <input id="end-time" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="00:00:00.000" disabled aria-describedby="time-format-hint end-time-error">
+                <input id="end-time" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="00:00:00.000" disabled aria-describedby="time-format-hint end-time-error" data-video-parameter="time">
                 <span class="time-input-icon" aria-hidden="true">
                   <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>
                 </span>
@@ -416,6 +416,64 @@
             <small>保留完整质量路径，等待 RTX 50 兼容验证</small>
           </button>
         </div>
+
+        <article class="workflow-card proxy-settings-card" aria-labelledby="ai-proxy-heading">
+          <div class="proxy-settings-heading">
+            <div>
+              <span class="model-kicker">DOWNLOAD NETWORK</span>
+              <h2 id="ai-proxy-heading">AI 模型下载代理</h2>
+              <p>网络受限或下载较慢时使用；支持 HTTP、HTTPS 和 SOCKS5。账号与密码请分别填写。</p>
+            </div>
+            <span class="model-status-badge proxy-status-badge" id="ai-proxy-status-badge" data-status="idle">正在读取</span>
+          </div>
+
+          <form class="proxy-settings-form" id="ai-proxy-form" autocomplete="off" novalidate>
+            <div class="proxy-fields">
+              <label class="proxy-field" for="ai-proxy-url">
+                <span>代理地址</span>
+                <input id="ai-proxy-url" type="text" inputmode="url" autocomplete="off" spellcheck="false" maxlength="2048" placeholder="例如 socks5://127.0.0.1:7897" aria-describedby="ai-proxy-url-hint ai-proxy-error" disabled>
+                <small id="ai-proxy-url-hint">请包含协议；不要把账号或密码写进地址。</small>
+              </label>
+              <label class="proxy-field" for="ai-proxy-username">
+                <span>用户名（可选）</span>
+                <input id="ai-proxy-username" type="text" autocomplete="off" spellcheck="false" maxlength="256" placeholder="代理不需要登录时留空" aria-describedby="ai-proxy-error" disabled>
+              </label>
+              <label class="proxy-field" for="ai-proxy-password">
+                <span>密码（可选）</span>
+                <input id="ai-proxy-password" type="password" autocomplete="new-password" maxlength="512" placeholder="已保存的密码不会显示" aria-describedby="ai-proxy-password-hint ai-proxy-error" disabled>
+                <small id="ai-proxy-password-hint">留空会沿用同一代理已保存的密码；输入新值会替换。</small>
+              </label>
+            </div>
+
+            <label class="proxy-clear-password" for="ai-proxy-clear-password">
+              <input id="ai-proxy-clear-password" type="checkbox" disabled>
+              <span>清除已保存的密码</span>
+            </label>
+
+            <p class="proxy-error" id="ai-proxy-error" role="alert" hidden></p>
+            <div class="proxy-settings-footer">
+              <div class="proxy-status-copy">
+                <p class="proxy-current" id="ai-proxy-current" role="status" aria-live="polite">正在读取当前设置…</p>
+                <p class="proxy-test-result" id="ai-proxy-test-result" role="status" aria-live="polite" hidden></p>
+                <p class="proxy-next-task-note" id="ai-proxy-next-task-note">保存或清除后只影响下一次新开始或重试的模型下载。</p>
+              </div>
+              <div class="proxy-actions">
+                <button class="button button-secondary button-compact" id="ai-proxy-test-button" type="button" disabled>
+                  <span class="button-spinner" aria-hidden="true"></span>
+                  <span class="button-label">测试连接</span>
+                </button>
+                <button class="button button-secondary button-compact" id="ai-proxy-clear-button" type="button" disabled>
+                  <span class="button-spinner" aria-hidden="true"></span>
+                  <span class="button-label">清除代理</span>
+                </button>
+                <button class="button button-primary button-compact" id="ai-proxy-save-button" type="submit" disabled>
+                  <span class="button-spinner" aria-hidden="true"></span>
+                  <span class="button-label">保存代理</span>
+                </button>
+              </div>
+            </div>
+          </form>
+        </article>
 
         <article class="workflow-card model-manager-card" aria-labelledby="model-manager-heading">
           <div class="model-card-heading">

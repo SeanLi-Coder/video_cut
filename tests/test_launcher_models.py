@@ -7,7 +7,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request
+from urllib.request import ProxyHandler, Request
 
 import launcher_models
 
@@ -37,10 +37,28 @@ class FakeAPI:
     def __call__(self, request: Request, *, timeout: float) -> FakeResponse:
         assert timeout == launcher_models.HTTP_TIMEOUT_SECONDS
         self.requests.append(request)
+        actual_method = request.get_method()
+        actual_path = urlsplit(request.full_url).path
+        if (
+            actual_method == "GET"
+            and actual_path == launcher_models.DOWNLOAD_PROXY_PATH
+            and (
+                not self.responses
+                or self.responses[0][0:2] != ("GET", launcher_models.DOWNLOAD_PROXY_PATH)
+            )
+        ):
+            return FakeResponse(
+                json.dumps(
+                    {
+                        "configured": False,
+                        "display_url": "direct connection (no proxy)",
+                    }
+                ).encode("utf-8")
+            )
         assert self.responses, f"unexpected request: {request.get_method()} {request.full_url}"
         expected_method, expected_path, result = self.responses.pop(0)
-        assert request.get_method() == expected_method
-        assert urlsplit(request.full_url).path == expected_path
+        assert actual_method == expected_method
+        assert actual_path == expected_path
         if isinstance(result, BaseException):
             raise result
         if callable(result):
@@ -102,6 +120,10 @@ def _headers(request: Request) -> dict[str, str]:
     return {key.lower(): value for key, value in request.header_items()}
 
 
+def _prompt_input(model_answers: str) -> io.StringIO:
+    return io.StringIO(f"\n{model_answers}")
+
+
 def test_skip_avoids_all_api_and_terminal_access(monkeypatch) -> None:
     def unexpected_request(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("the API must not be contacted")
@@ -113,7 +135,7 @@ def test_skip_avoids_all_api_and_terminal_access(monkeypatch) -> None:
         8777,
         threading.Event(),
         skip=True,
-        input_stream=io.StringIO("y\n"),
+        input_stream=_prompt_input("y\n"),
         output_stream=output,
     )
 
@@ -134,7 +156,396 @@ def test_default_non_tty_input_never_blocks_automation(monkeypatch) -> None:
     assert output.getvalue() == ""
 
 
-def test_eof_skips_remaining_models_and_returns_normally(monkeypatch) -> None:
+def test_local_api_default_opener_explicitly_disables_environment_proxies() -> None:
+    assert launcher_models.urlopen.__self__ is launcher_models._DIRECT_LOCAL_OPENER
+    assert isinstance(launcher_models._DIRECT_PROXY_HANDLER, ProxyHandler)
+    assert launcher_models._DIRECT_PROXY_HANDLER.proxies == {}
+
+
+def test_proxy_prompt_displays_scrubbed_setting_and_enter_keeps_it(monkeypatch) -> None:
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+            (
+                "GET",
+                launcher_models.DOWNLOAD_PROXY_PATH,
+                {
+                    "configured": True,
+                    "display_url": "http://alice:should-not-leak@proxy.example:7890",
+                },
+            ),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=_prompt_input("n\n"),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    text = output.getvalue()
+    assert "Current AI download proxy: http://***@proxy.example:7890" in text
+    assert "alice" not in text
+    assert "should-not-leak" not in text
+    assert "Skipped SeedVR2 3B FP16." in text
+    assert [request.get_method() for request in api.requests].count("GET") == 3
+
+
+def test_proxy_prompt_sets_credentials_tests_connection_then_prompts_model(monkeypatch) -> None:
+    def save_proxy(request: Request) -> dict[str, Any]:
+        assert _headers(request)["content-type"] == "application/json"
+        assert json.loads((request.data or b"").decode("utf-8")) == {
+            "url": "http://proxy.example:7890",
+            "username": "alice",
+            "password": "very-secret",
+            "password_action": "replace",
+        }
+        return {
+            "configured": True,
+            "display_url": "http://al***:••••@proxy.example:7890",
+        }
+
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+            (
+                "GET",
+                launcher_models.DOWNLOAD_PROXY_PATH,
+                {"configured": False},
+            ),
+            ("PUT", launcher_models.DOWNLOAD_PROXY_PATH, save_proxy),
+            (
+                "POST",
+                f"{launcher_models.DOWNLOAD_PROXY_PATH}/test",
+                {"test_success": True, "latency_ms": 12.6},
+            ),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    output = io.StringIO()
+
+    def read_password(prompt: str, *, stream: io.StringIO) -> str:
+        assert prompt == "Proxy password (hidden; Enter clears it): "
+        assert stream is output
+        return "very-secret"
+
+    monkeypatch.setattr(launcher_models.getpass, "getpass", read_password)
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=io.StringIO("s\nhttp://proxy.example:7890\nalice\nn\n"),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    text = output.getvalue()
+    assert "AI download proxy saved: http://***@proxy.example:7890" in text
+    assert "Proxy connection test succeeded (13 ms)." in text
+    assert "Download this model now?" in text
+    assert "very-secret" not in text
+    assert "alice" not in text
+    assert "x-app-token" not in _headers(api.requests[0])
+    for request in api.requests[1:]:
+        assert _headers(request)["x-app-token"] == "test-token"
+
+
+def test_blank_proxy_password_sends_clear_action(monkeypatch) -> None:
+    def save_proxy(request: Request) -> dict[str, Any]:
+        assert json.loads((request.data or b"").decode("utf-8")) == {
+            "url": "socks5h://proxy.example:1080",
+            "username": "alice",
+            "password": "",
+            "password_action": "clear",
+        }
+        return {
+            "configured": True,
+            "display_url": "socks5h://al***@proxy.example:1080",
+        }
+
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+            ("GET", launcher_models.DOWNLOAD_PROXY_PATH, {"configured": False}),
+            ("PUT", launcher_models.DOWNLOAD_PROXY_PATH, save_proxy),
+            (
+                "POST",
+                f"{launcher_models.DOWNLOAD_PROXY_PATH}/test",
+                {"test_success": True, "latency_ms": 0},
+            ),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    monkeypatch.setattr(launcher_models.getpass, "getpass", lambda *_args, **_kwargs: "")
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=io.StringIO("s\nsocks5h://proxy.example:1080\nalice\nn\n"),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    assert "Proxy connection test succeeded (0 ms)." in output.getvalue()
+    assert "Skipped SeedVR2 3B FP16." in output.getvalue()
+
+
+def test_stop_event_interrupts_blocked_proxy_password_input(monkeypatch) -> None:
+    password_started = threading.Event()
+    release_password = threading.Event()
+
+    def blocked_password(*_args: object, **_kwargs: object) -> str:
+        password_started.set()
+        release_password.wait()
+        return "must-not-be-saved"
+
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+            ("GET", launcher_models.DOWNLOAD_PROXY_PATH, {"configured": False}),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    monkeypatch.setattr(launcher_models.getpass, "getpass", blocked_password)
+    stop_requested = threading.Event()
+    output = io.StringIO()
+    worker = threading.Thread(
+        target=launcher_models.prompt_for_missing_models,
+        args=(8777, stop_requested),
+        kwargs={
+            "input_stream": io.StringIO("s\nhttp://proxy.example:7890\nalice\n"),
+            "output_stream": output,
+        },
+    )
+    worker.start()
+    assert password_started.wait(timeout=2)
+
+    stop_requested.set()
+    worker.join(timeout=2)
+    release_password.set()
+
+    api.assert_finished()
+    assert not worker.is_alive()
+    assert "must-not-be-saved" not in output.getvalue()
+    assert not any(request.get_method() == "PUT" for request in api.requests)
+
+
+def test_posix_password_prompt_restores_terminal_echo_when_stopped(monkeypatch) -> None:
+    if launcher_models.sys.platform == "win32":
+        return
+
+    import os
+    import select
+    import termios
+
+    descriptor = 42
+    original = [0, 0, 0, termios.ECHO | termios.ICANON, 0, 0, []]
+    applied: list[list[Any]] = []
+    closed: list[int] = []
+    stop_requested = threading.Event()
+
+    monkeypatch.setattr(os, "open", lambda *_args, **_kwargs: descriptor)
+    monkeypatch.setattr(os, "close", closed.append)
+    monkeypatch.setattr(termios, "tcgetattr", lambda _descriptor: list(original))
+    monkeypatch.setattr(
+        termios,
+        "tcsetattr",
+        lambda _descriptor, _when, attributes: applied.append(list(attributes)),
+    )
+
+    def stop_while_waiting(*_args, **_kwargs):
+        stop_requested.set()
+        return [], [], []
+
+    monkeypatch.setattr(select, "select", stop_while_waiting)
+    output = io.StringIO()
+
+    result = launcher_models._getpass_from_posix_tty(
+        output,
+        stop_requested,
+        enabled=True,
+    )
+
+    assert result is None
+    assert applied[0][3] & termios.ECHO == 0
+    assert applied[-1] == original
+    assert closed == [descriptor]
+    assert "Proxy password (hidden" in output.getvalue()
+
+
+def test_proxy_password_error_is_sanitized_and_returns_normally(monkeypatch) -> None:
+    def broken_password(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("password-value-from-terminal")
+
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+            ("GET", launcher_models.DOWNLOAD_PROXY_PATH, {"configured": False}),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    monkeypatch.setattr(launcher_models.getpass, "getpass", broken_password)
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=io.StringIO("s\nhttp://proxy.example:7890\nalice\n"),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    text = output.getvalue()
+    assert "secure proxy password input failed" in text
+    assert "password-value-from-terminal" not in text
+    assert not any(request.get_method() == "PUT" for request in api.requests)
+
+
+def test_keyboard_interrupt_during_proxy_password_input_is_handled(monkeypatch) -> None:
+    def interrupt_password(*_args: object, **_kwargs: object) -> str:
+        raise KeyboardInterrupt
+
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+            ("GET", launcher_models.DOWNLOAD_PROXY_PATH, {"configured": False}),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    monkeypatch.setattr(launcher_models.getpass, "getpass", interrupt_password)
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=io.StringIO("s\nhttp://proxy.example:7890\nalice\n"),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    assert "setup was interrupted; startup will continue" in output.getvalue()
+    assert not any(request.get_method() == "PUT" for request in api.requests)
+
+
+def test_proxy_prompt_can_clear_without_running_proxy_test(monkeypatch) -> None:
+    def clear_proxy(request: Request) -> dict[str, Any]:
+        assert request.data is None
+        return {"configured": False}
+
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+            (
+                "GET",
+                launcher_models.DOWNLOAD_PROXY_PATH,
+                {
+                    "configured": True,
+                    "display_url": "http://proxy.example:7890",
+                },
+            ),
+            ("DELETE", launcher_models.DOWNLOAD_PROXY_PATH, clear_proxy),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=io.StringIO("c\nn\n"),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    assert "AI download proxy was cleared." in output.getvalue()
+    assert "Skipped SeedVR2 3B FP16." in output.getvalue()
+    assert not any(
+        urlsplit(request.full_url).path.endswith("/ai-download-proxy/test")
+        for request in api.requests
+    )
+
+
+def test_failed_proxy_test_does_not_block_model_choice(monkeypatch) -> None:
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+            ("GET", launcher_models.DOWNLOAD_PROXY_PATH, {"configured": False}),
+            (
+                "PUT",
+                launcher_models.DOWNLOAD_PROXY_PATH,
+                {
+                    "configured": True,
+                    "display_url": "http://proxy.example:7890",
+                },
+            ),
+            (
+                "POST",
+                f"{launcher_models.DOWNLOAD_PROXY_PATH}/test",
+                URLError("proxy unavailable"),
+            ),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    monkeypatch.setattr(launcher_models.getpass, "getpass", lambda *_args, **_kwargs: "")
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=io.StringIO("s\nhttp://proxy.example:7890\n\nn\n"),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    text = output.getvalue()
+    assert "connection test failed" in text
+    assert "model selection will continue" in text
+    assert "Download this model now?" in text
+    assert "Skipped SeedVR2 3B FP16." in text
+
+
+def test_proxy_setting_failure_does_not_block_model_choice(monkeypatch) -> None:
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+            (
+                "GET",
+                launcher_models.DOWNLOAD_PROXY_PATH,
+                URLError("settings unavailable"),
+            ),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=io.StringIO("n\n"),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    text = output.getvalue()
+    assert "proxy settings are unavailable" in text
+    assert "Skipped SeedVR2 3B FP16." in text
+
+
+def test_eof_at_proxy_prompt_skips_model_prompts(monkeypatch) -> None:
     api = FakeAPI(
         [
             ("GET", "/api/bootstrap", _bootstrap()),
@@ -148,6 +559,54 @@ def test_eof_skips_remaining_models_and_returns_normally(monkeypatch) -> None:
         8777,
         threading.Event(),
         input_stream=io.StringIO(""),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    assert "Input closed" in output.getvalue()
+    assert "Download this model now?" not in output.getvalue()
+
+
+def test_keyboard_interrupt_at_proxy_prompt_returns_normally(monkeypatch) -> None:
+    class InterruptingInput:
+        def readline(self) -> str:
+            raise KeyboardInterrupt
+
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=InterruptingInput(),  # type: ignore[arg-type]
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    assert "setup was interrupted; startup will continue" in output.getvalue()
+    assert "Download this model now?" not in output.getvalue()
+
+
+def test_eof_skips_remaining_models_and_returns_normally(monkeypatch) -> None:
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            ("GET", "/api/ai-models", {"models": [_model()]}),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=_prompt_input(""),
         output_stream=output,
     )
 
@@ -183,7 +642,7 @@ def test_only_compatible_missing_startup_models_are_prompted(monkeypatch) -> Non
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("n\n\n"),
+        input_stream=_prompt_input("n\n\n"),
         output_stream=output,
     )
 
@@ -226,7 +685,7 @@ def test_downloaded_model_with_stale_runtime_is_still_prompted(monkeypatch) -> N
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("n\n"),
+        input_stream=_prompt_input("n\n"),
         output_stream=output,
     )
 
@@ -267,7 +726,7 @@ def test_partial_download_can_continue_from_saved_data(monkeypatch) -> None:
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("c\n"),
+        input_stream=_prompt_input("c\n"),
         output_stream=output,
     )
 
@@ -309,7 +768,7 @@ def test_partial_download_can_be_removed_and_restarted(monkeypatch) -> None:
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("invalid\nrestart\n"),
+        input_stream=_prompt_input("invalid\nrestart\n"),
         output_stream=output,
     )
 
@@ -345,7 +804,7 @@ def test_recovery_only_ignores_models_that_were_never_started(monkeypatch) -> No
         8777,
         threading.Event(),
         recovery_only=True,
-        input_stream=io.StringIO("n\n"),
+        input_stream=_prompt_input("n\n"),
         output_stream=output,
     )
 
@@ -387,7 +846,7 @@ def test_running_web_download_is_attached_without_prompting(monkeypatch) -> None
         8777,
         threading.Event(),
         recovery_only=True,
-        input_stream=io.StringIO(""),
+        input_stream=_prompt_input(""),
         output_stream=output,
     )
 
@@ -397,6 +856,62 @@ def test_running_web_download_is_attached_without_prompting(monkeypatch) -> None
     assert "Download this model now?" not in text
     assert "Continue, restart from zero, or skip?" not in text
     assert "Running Model is ready." in text
+    assert not any(
+        urlsplit(request.full_url).path == launcher_models.DOWNLOAD_PROXY_PATH
+        for request in api.requests
+    )
+
+
+def test_mixed_active_and_pending_models_prompt_for_proxy_only_once(monkeypatch) -> None:
+    api = FakeAPI(
+        [
+            ("GET", "/api/bootstrap", _bootstrap()),
+            (
+                "GET",
+                "/api/ai-models",
+                {
+                    "models": [
+                        _model(
+                            "running",
+                            name="Running Model",
+                            download_status="running",
+                        ),
+                        _model("pending", name="Pending Model"),
+                    ]
+                },
+            ),
+            (
+                "GET",
+                launcher_models.DOWNLOAD_PROXY_PATH,
+                {"configured": False},
+            ),
+            (
+                "GET",
+                "/api/ai-models/running/download",
+                {"status": "completed", "stage": "completed", "progress": 100},
+            ),
+        ]
+    )
+    monkeypatch.setattr(launcher_models, "urlopen", api)
+    output = io.StringIO()
+
+    launcher_models.prompt_for_missing_models(
+        8777,
+        threading.Event(),
+        input_stream=_prompt_input("n\n"),
+        output_stream=output,
+    )
+
+    api.assert_finished()
+    proxy_requests = [
+        request
+        for request in api.requests
+        if urlsplit(request.full_url).path == launcher_models.DOWNLOAD_PROXY_PATH
+    ]
+    assert len(proxy_requests) == 1
+    assert output.getvalue().count("AI download proxy [Enter=keep") == 1
+    assert "Running Model is ready." in output.getvalue()
+    assert "Skipped Pending Model." in output.getvalue()
 
 
 def test_attached_web_download_is_not_cancelled_when_status_checks_fail(monkeypatch) -> None:
@@ -435,7 +950,7 @@ def test_attached_web_download_is_not_cancelled_when_status_checks_fail(monkeypa
         8777,
         threading.Event(),
         recovery_only=True,
-        input_stream=io.StringIO(""),
+        input_stream=_prompt_input(""),
         output_stream=output,
     )
 
@@ -477,7 +992,7 @@ def test_attached_web_download_is_not_cancelled_on_keyboard_interrupt(monkeypatc
         8777,
         threading.Event(),
         recovery_only=True,
-        input_stream=io.StringIO(""),
+        input_stream=_prompt_input(""),
         output_stream=output,
     )
 
@@ -519,7 +1034,7 @@ def test_attached_web_download_is_not_cancelled_on_stop(monkeypatch) -> None:
         8777,
         stop_requested,
         recovery_only=True,
-        input_stream=io.StringIO(""),
+        input_stream=_prompt_input(""),
         output_stream=output,
     )
 
@@ -542,7 +1057,7 @@ def test_failed_start_request_does_not_issue_an_unscoped_cancel(monkeypatch) -> 
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("y\n"),
+        input_stream=_prompt_input("y\n"),
         output_stream=output,
     )
 
@@ -589,7 +1104,7 @@ def test_restart_http_error_surfaces_safe_api_detail_without_cancelling(monkeypa
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("r\n"),
+        input_stream=_prompt_input("r\n"),
         output_stream=output,
     )
 
@@ -624,7 +1139,7 @@ def test_already_running_start_response_is_not_owned_or_cancelled(monkeypatch) -
     launcher_models.prompt_for_missing_models(
         8777,
         stop_requested,
-        input_stream=io.StringIO("y\n"),
+        input_stream=_prompt_input("y\n"),
         output_stream=output,
     )
 
@@ -658,7 +1173,7 @@ def test_invalid_start_job_id_is_not_used_for_cancellation(monkeypatch) -> None:
     launcher_models.prompt_for_missing_models(
         8777,
         stop_requested,
-        input_stream=io.StringIO("y\n"),
+        input_stream=_prompt_input("y\n"),
         output_stream=output,
     )
 
@@ -750,7 +1265,7 @@ def test_yes_downloads_and_renders_percentage_amount_speed_and_eta(monkeypatch) 
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("y\n"),
+        input_stream=_prompt_input("y\n"),
         output_stream=output,
     )
 
@@ -765,7 +1280,13 @@ def test_yes_downloads_and_renders_percentage_amount_speed_and_eta(monkeypatch) 
     assert "SeedVR2 3B FP16 is ready." in text
     for request in api.requests[1:]:
         assert _headers(request)["x-app-token"] == "test-token"
-    assert api.requests[2].data == b"{}"
+    start_request = next(
+        request
+        for request in api.requests
+        if urlsplit(request.full_url).path == "/api/ai-models/seedvr2-3b/download"
+        and request.get_method() == "POST"
+    )
+    assert start_request.data == b"{}"
 
 
 def test_invalid_answer_reprompts_and_model_id_is_url_encoded(monkeypatch) -> None:
@@ -786,7 +1307,7 @@ def test_invalid_answer_reprompts_and_model_id_is_url_encoded(monkeypatch) -> No
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("maybe\nyes\n"),
+        input_stream=_prompt_input("maybe\nyes\n"),
         output_stream=output,
     )
 
@@ -827,7 +1348,7 @@ def test_failed_download_does_not_prevent_later_prompts(monkeypatch) -> None:
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("y\nn\n"),
+        input_stream=_prompt_input("y\nn\n"),
         output_stream=output,
     )
 
@@ -846,7 +1367,7 @@ def test_api_failure_is_reported_but_never_raised(monkeypatch) -> None:
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("y\n"),
+        input_stream=_prompt_input("y\n"),
         output_stream=output,
     )
 
@@ -897,7 +1418,7 @@ def test_repeated_poll_failure_requests_cancel_and_stops_prompting(monkeypatch) 
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("y\nn\n"),
+        input_stream=_prompt_input("y\nn\n"),
         output_stream=output,
     )
 
@@ -945,7 +1466,7 @@ def test_keyboard_interrupt_during_poll_attempts_cancel(monkeypatch) -> None:
     launcher_models.prompt_for_missing_models(
         8777,
         threading.Event(),
-        input_stream=io.StringIO("y\n"),
+        input_stream=_prompt_input("y\n"),
         output_stream=output,
     )
 
@@ -987,7 +1508,7 @@ def test_stop_event_during_download_attempts_cancel(monkeypatch) -> None:
     launcher_models.prompt_for_missing_models(
         8777,
         stop_requested,
-        input_stream=io.StringIO("y\n"),
+        input_stream=_prompt_input("y\n"),
         output_stream=output,
     )
 

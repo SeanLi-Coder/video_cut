@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 from app.paths import APPLICATION_ROOT, is_frozen
 from launcher_models import prompt_for_missing_models
@@ -51,6 +51,8 @@ FFMPEG_FULL_SMOKE_FILTER = (
     "zscale=matrix=bt709:range=limited:primaries=bt709:transfer=bt709:"
     "chromal=left:dither=error_diffusion,format=yuv420p10le"
 )
+_LOCAL_PROXY_HANDLER = ProxyHandler({})
+_LOCAL_HTTP_OPENER = build_opener(_LOCAL_PROXY_HANDLER)
 
 
 class LauncherError(RuntimeError):
@@ -59,6 +61,10 @@ class LauncherError(RuntimeError):
 
 class LauncherCancelled(LauncherError):
     pass
+
+
+def _open_local_http(request: Request, timeout: float):
+    return _LOCAL_HTTP_OPENER.open(request, timeout=timeout)
 
 
 def _venv_python() -> Path:
@@ -298,7 +304,11 @@ def _prepare_environment(
     with contextlib.suppress(OSError):
         marker = MARKER_PATH.read_text(encoding="utf-8").strip()
     dependency_check = subprocess.run(
-        [str(python), "-c", "import fastapi, pydantic, uvicorn"],
+        [
+            str(python),
+            "-c",
+            "import fastapi, pydantic, socks, sockshandler, urllib3, uvicorn",
+        ],
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -532,7 +542,7 @@ def _health(port: int, timeout: float = 0.5) -> dict[str, Any] | None:
         headers={"Accept": "application/json", "Cache-Control": "no-cache"},
     )
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with _open_local_http(request, timeout) as response:
             payload = json.loads(response.read(32_768).decode("utf-8"))
     except (
         HTTPError,
@@ -718,7 +728,7 @@ def _request_stop(port: int, token: str) -> None:
         headers={"Content-Type": "application/json", "X-Stop-Token": token},
     )
     with contextlib.suppress(HTTPError, URLError, OSError, TimeoutError):
-        urlopen(request, timeout=1).close()
+        _open_local_http(request, 1).close()
 
 
 def _port_argument(value: str) -> int:

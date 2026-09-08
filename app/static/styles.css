@@ -637,6 +637,180 @@ video {
   color: #697184;
 }
 
+.proxy-settings-card {
+  padding: 25px 28px;
+}
+
+.proxy-settings-heading,
+.proxy-settings-footer {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.proxy-settings-heading h2 {
+  margin: 0;
+  font-size: 19px;
+  letter-spacing: -0.02em;
+}
+
+.proxy-settings-heading p {
+  max-width: 690px;
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.proxy-status-badge[data-status="dirty"] {
+  border-color: #f2d7a3;
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.proxy-settings-form {
+  margin-top: 21px;
+}
+
+.proxy-fields {
+  display: grid;
+  grid-template-columns: minmax(250px, 1.4fr) minmax(160px, 0.8fr) minmax(180px, 0.9fr);
+  gap: 12px;
+}
+
+.proxy-field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.proxy-field > span {
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 720;
+}
+
+.proxy-field input {
+  width: 100%;
+  min-width: 0;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 11px;
+  outline: none;
+  background: var(--surface-solid);
+  color: var(--ink);
+  font-size: 12px;
+  transition: border-color 150ms ease, box-shadow 150ms ease, background 150ms ease;
+}
+
+.proxy-field input::placeholder {
+  color: #a0a6b4;
+}
+
+.proxy-field input:hover:not(:disabled) {
+  border-color: #aeb5c5;
+}
+
+.proxy-field input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(90, 84, 232, 0.11);
+}
+
+.proxy-field input[aria-invalid="true"] {
+  border-color: var(--danger);
+  background: #fffafa;
+  box-shadow: 0 0 0 3px rgba(198, 68, 68, 0.08);
+}
+
+.proxy-field input:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.proxy-field small {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.proxy-clear-password {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.proxy-clear-password input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.proxy-clear-password:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.proxy-error {
+  margin: 10px 0 0;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.proxy-settings-footer {
+  align-items: center;
+  margin-top: 17px;
+  padding-top: 17px;
+  border-top: 1px solid var(--line);
+}
+
+.proxy-status-copy {
+  min-width: 0;
+}
+
+.proxy-status-copy p {
+  margin: 0;
+}
+
+.proxy-current {
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proxy-test-result {
+  margin-top: 5px !important;
+  color: var(--success);
+  font-size: 11px;
+  font-weight: 680;
+}
+
+.proxy-next-task-note {
+  margin-top: 5px !important;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.proxy-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
 .model-manager-card {
   padding: 32px;
 }
@@ -2318,6 +2492,14 @@ video:focus-visible {
     grid-template-columns: 1fr;
   }
 
+  .proxy-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .proxy-field:first-child {
+    grid-column: 1 / -1;
+  }
+
   .selected-file {
     grid-template-columns: 1fr auto;
   }
@@ -2509,6 +2691,35 @@ video:focus-visible {
   .model-selector-option small,
   .ai-model-option small {
     white-space: normal;
+  }
+
+  .proxy-settings-card {
+    padding: 21px;
+  }
+
+  .proxy-settings-heading,
+  .proxy-settings-footer {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 13px;
+  }
+
+  .proxy-status-badge {
+    align-self: flex-start;
+  }
+
+  .proxy-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .proxy-current {
+    white-space: normal;
+  }
+
+  .proxy-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 
   .model-manager-card {

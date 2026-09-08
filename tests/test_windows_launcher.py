@@ -8,12 +8,18 @@ import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.request import ProxyHandler
 
 import launcher_windows
 import stop
 import windows_exe
 from app import dialogs
 from app import paths as app_paths
+
+
+def test_windows_local_control_requests_disable_system_proxies() -> None:
+    assert isinstance(launcher_windows._LOCAL_PROXY_HANDLER, ProxyHandler)
+    assert launcher_windows._LOCAL_PROXY_HANDLER.proxies == {}
 
 
 def test_existing_windows_instance_checks_recovery_before_opening(monkeypatch) -> None:
