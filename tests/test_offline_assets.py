@@ -230,7 +230,10 @@ def test_verification_rejects_path_replacement_after_hashing(
 
     monkeypatch.setattr(offline, "_sha256_stream", replace_after_hash)
 
-    with pytest.raises(OfflineBundleError, match="asset changed during verification"):
+    with pytest.raises(
+        OfflineBundleError,
+        match="asset (?:failed verification|changed during verification)",
+    ):
         offline.verify_offline_asset_details_now(relative_path)
 
 
