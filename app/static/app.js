@@ -70,6 +70,8 @@ const state = {
   modelDownloadModelId: DEFAULT_AI_MODEL_ID,
   modelDownloadStarting: false,
   modelDownloadCancelling: false,
+  modelDeleteModelId: "",
+  modelDeleteError: "",
   modelDownloadPollTimer: null,
   modelDownloadPollSerial: 0,
   modelDownloadPollFailures: 0,
@@ -212,6 +214,9 @@ const elements = {
   modelActionNote: byId("model-action-note"),
   modelDownloadButton: byId("model-download-button"),
   cancelModelDownloadButton: byId("cancel-model-download-button"),
+  modelDeleteButton: byId("model-delete-button"),
+  modelDeleteHint: byId("model-delete-hint"),
+  modelDeleteError: byId("model-delete-error"),
   frameLimitHint: byId("frame-limit-hint"),
   startTime: byId("start-time"),
   endTime: byId("end-time"),
@@ -1665,7 +1670,12 @@ function createAiModelChoice(model, className, { manager = false } = {}) {
   button.setAttribute("aria-pressed", model.id === state.selectedAiModelId ? "true" : "false");
   const reason = aiModelCompatibilityReason(model);
   button.title = reason || `切换到 ${model.name}`;
-  button.disabled = Boolean(state.exporting || modelDownloadIsActive() || state.modelCatalogLoading);
+  button.disabled = Boolean(
+    state.exporting
+    || state.modelDeleteModelId
+    || modelDownloadIsActive()
+    || state.modelCatalogLoading,
+  );
 
   const title = document.createElement("span");
   const name = document.createElement("strong");
@@ -2139,6 +2149,24 @@ function modelDownloadIsActive(snapshot = state.modelDownload) {
   return ["queued", "pending", "waiting", "running", "processing"].includes(status);
 }
 
+function modelHasInstalledFiles(model = selectedAiModel(), snapshot = state.modelDownload) {
+  if (!model) return false;
+  const snapshotMatchesModel = String(snapshot?.model_id || state.modelDownloadModelId || "").toLowerCase()
+    === model.id;
+  return model.downloaded === true
+    || model.prepared === true
+    || Number(model.partial_bytes) > 0
+    || (snapshotMatchesModel && (
+      snapshot?.models_downloaded === true
+      || snapshot?.prepared === true
+      || Number(snapshot?.downloaded_bytes) > 0
+    ));
+}
+
+function aiEnhancementIsActive() {
+  return state.exporting && isEnhanceMode();
+}
+
 function formatBytes(value) {
   const bytes = Number(value);
   if (!Number.isFinite(bytes) || bytes < 0) return "";
@@ -2219,6 +2247,9 @@ function renderModelManager() {
   const cancelled = status === "cancelled" || status === "canceled";
   const needsSetup = status === "needs_setup" || Boolean(snapshot.requires_runtime_update);
   const checking = !state.appReady || state.modelCatalogLoading;
+  const deleting = state.modelDeleteModelId === model?.id;
+  const anyModelDeleting = Boolean(state.modelDeleteModelId);
+  const installedFiles = modelHasInstalledFiles(model, snapshot);
   const progress = prepared ? 100 : normalizeProgress(snapshot.progress);
   const configuredTotal = Number(model?.download_size_bytes);
   const sizeGb = Number(runtime.first_download_gb);
@@ -2371,6 +2402,7 @@ function renderModelManager() {
   elements.modelDownloadButton.setAttribute("aria-busy", busy ? "true" : "false");
   elements.modelDownloadButton.disabled = checking
     || busy
+    || anyModelDeleting
     || state.modelDownloadCancelling
     || prepared
     || !platformReady
@@ -2395,6 +2427,32 @@ function renderModelManager() {
   elements.cancelModelDownloadButton.hidden = !active;
   elements.cancelModelDownloadButton.disabled = state.modelDownloadCancelling;
   elements.cancelModelDownloadButton.textContent = state.modelDownloadCancelling ? "正在取消…" : "取消下载";
+
+  const deleteBlockedByTask = active
+    || state.modelDownloadStarting
+    || state.modelDownloadCancelling
+    || aiEnhancementIsActive();
+  elements.modelDeleteButton.disabled = checking
+    || anyModelDeleting
+    || deleteBlockedByTask
+    || !state.multiModelApiAvailable
+    || !installedFiles;
+  elements.modelDeleteButton.setAttribute(
+    "aria-label",
+    deleting ? `正在删除 ${model?.name || "所选模型"}` : `删除 ${model?.name || "所选模型"} 的本地文件`,
+  );
+  setButtonBusy(elements.modelDeleteButton, deleting, "正在删除…");
+  elements.modelDeleteHint.textContent = deleting
+    ? `正在删除 ${model?.name || "所选模型"} 的本地文件，请不要关闭页面。`
+    : deleteBlockedByTask
+      ? "模型下载或 AI 超清任务进行期间不能删除模型。"
+      : !state.multiModelApiAvailable
+        ? "当前本地服务版本不支持在网页中删除模型。"
+        : !installedFiles
+          ? "所选模型尚未安装，无需删除。"
+          : "只删除所选模型的权重和未完成下载；已安装的 AI 运行环境会保留。";
+  elements.modelDeleteError.textContent = state.modelDeleteError;
+  elements.modelDeleteError.hidden = !state.modelDeleteError;
 
   elements.modelActionNote.textContent = prepared
     ? "已经准备完成；以后不会重复下载。"
@@ -2604,6 +2662,7 @@ async function startModelDownload() {
     !state.appReady
     || state.modelDownloadStarting
     || state.modelDownloadCancelling
+    || state.modelDeleteModelId
     || modelDownloadIsActive()
     || modelRuntimePrepared()
     || !aiModelCanRun(model)
@@ -2612,6 +2671,7 @@ async function startModelDownload() {
   }
   state.modelDownloadStarting = true;
   state.modelDownloadRequestError = "";
+  state.modelDeleteError = "";
   renderModelManager();
   try {
     const modelId = model?.id || state.selectedAiModelId;
@@ -2635,7 +2695,7 @@ async function startModelDownload() {
 }
 
 async function cancelModelDownload() {
-  if (!modelDownloadIsActive() || state.modelDownloadCancelling) return;
+  if (!modelDownloadIsActive() || state.modelDownloadCancelling || state.modelDeleteModelId) return;
   state.modelDownloadCancelling = true;
   let requestSucceeded = false;
   renderModelManager();
@@ -2656,10 +2716,95 @@ async function cancelModelDownload() {
   }
 }
 
-async function refreshAiModels() {
+function applyModelDeletionPayload(payload, modelId) {
+  const catalog = payload?.catalog;
+  if (catalog && typeof catalog === "object" && Array.isArray(catalog.models)) {
+    if (catalog.ai_runtime && typeof catalog.ai_runtime === "object") {
+      state.aiRuntime = catalog.ai_runtime;
+    }
+    applyAiModelCatalog(catalog);
+  }
+
+  const model = state.aiModels.find((item) => item.id === modelId);
+  if (model) {
+    model.downloaded = false;
+    model.prepared = false;
+    model.partial_bytes = 0;
+  }
+  if (modelId !== state.selectedAiModelId) return;
+
+  const snapshot = payload?.download;
+  if (snapshot && typeof snapshot === "object") {
+    applyModelDownloadSnapshot(snapshot, modelId);
+    return;
+  }
+  state.modelDownloadModelId = modelId;
+  state.modelDownload = initialModelDownloadSnapshot(model || selectedAiModel());
+}
+
+async function deleteSelectedAiModel() {
+  const model = selectedAiModel();
+  const modelId = model?.id || "";
+  if (
+    !state.appReady
+    || !state.multiModelApiAvailable
+    || !modelId
+    || state.modelDeleteModelId
+    || state.modelDownloadStarting
+    || state.modelDownloadCancelling
+    || modelDownloadIsActive()
+    || aiEnhancementIsActive()
+    || !modelHasInstalledFiles(model)
+  ) {
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `确定删除 ${model.name} 吗？\n\n将删除这个模型的权重、校验缓存和未完成下载；已安装的 AI 运行环境会保留。以后使用时需要重新下载，此操作无法撤销。`,
+  );
+  if (!confirmed) return;
+
+  state.modelDeleteModelId = modelId;
+  state.modelDeleteError = "";
+  renderModelManager();
+  let payload = null;
+  let deleteError = "";
+  try {
+    payload = await apiRequest(`/api/ai-models/${encodeURIComponent(modelId)}/download`, {
+      method: "DELETE",
+    });
+  } catch (error) {
+    deleteError = error.message || `无法删除 ${model.name}`;
+  }
+
+  if (payload) {
+    applyModelDeletionPayload(payload, modelId);
+    const removedBytes = Number(payload.deleted_bytes ?? payload.removed_bytes);
+    showToast(Number.isFinite(removedBytes) && removedBytes > 0
+      ? `${model.name} 已删除，已移除约 ${formatBytes(removedBytes)} 的本地模型文件`
+      : `${model.name} 已从本机删除`);
+  } else {
+    state.modelDeleteError = deleteError;
+    showToast(deleteError, "error");
+  }
+
+  try {
+    await refreshAiModels({ preserveOnError: true });
+  } catch (_error) {
+    // The DELETE result is authoritative; a follow-up refresh is best-effort.
+  } finally {
+    state.modelDeleteModelId = "";
+    state.modelDeleteError = deleteError;
+    renderModelManager();
+    renderControls();
+  }
+}
+
+async function refreshAiModels({ preserveOnError = false } = {}) {
   if (!state.appReady) return;
   state.modelCatalogLoading = true;
   renderModelManager();
+  let catalogRefreshFailed = false;
   try {
     const payload = await apiRequest("/api/ai-models");
     state.multiModelApiAvailable = true;
@@ -2675,20 +2820,27 @@ async function refreshAiModels() {
       state.modelDownloadModelId = activeModel.id;
     }
   } catch (_error) {
-    state.multiModelApiAvailable = false;
-    applyAiModelCatalog({
-      default_model_id: DEFAULT_AI_MODEL_ID,
-      models: [{
-        ...FALLBACK_AI_MODELS[0],
-        compatible: state.aiEnhanceReady,
-        runnable: state.aiEnhanceReady,
-        runtime: state.aiRuntime,
-        prepared: modelRuntimePrepared(state.aiRuntime, null),
-        downloaded: Boolean(state.aiRuntime.models_downloaded),
-      }],
-    });
+    catalogRefreshFailed = true;
+    if (!preserveOnError) {
+      state.multiModelApiAvailable = false;
+      applyAiModelCatalog({
+        default_model_id: DEFAULT_AI_MODEL_ID,
+        models: [{
+          ...FALLBACK_AI_MODELS[0],
+          compatible: state.aiEnhanceReady,
+          runnable: state.aiEnhanceReady,
+          runtime: state.aiRuntime,
+          prepared: modelRuntimePrepared(state.aiRuntime, null),
+          downloaded: Boolean(state.aiRuntime.models_downloaded),
+        }],
+      });
+    }
   } finally {
     state.modelCatalogLoading = false;
+  }
+  if (catalogRefreshFailed && preserveOnError) {
+    renderModelManager();
+    return;
   }
   state.modelDownload = initialModelDownloadSnapshot(selectedAiModel());
   state.modelDownloadModelId = state.selectedAiModelId;
@@ -2706,6 +2858,7 @@ function selectAiModel(modelId) {
     || model.id === state.selectedAiModelId
     || state.exporting
     || state.modelDownloadStarting
+    || state.modelDeleteModelId
     || modelDownloadIsActive()
     || state.modelCatalogLoading
   ) {
@@ -2716,6 +2869,7 @@ function selectAiModel(modelId) {
   state.modelDownloadModelId = model.id;
   state.modelDownload = initialModelDownloadSnapshot(model);
   state.modelDownloadRequestError = "";
+  state.modelDeleteError = "";
   selectDefaultAiTarget();
   if (state.activeRange) state.activePreviewKey = previewKey(state.activeRange);
   renderModeCopy();
@@ -2827,6 +2981,7 @@ async function startExport() {
   const pollSerial = state.exportPollSerial;
   showExportProgress();
   renderControls();
+  if (isEnhanceMode()) renderModelManager();
 
   try {
     const body = isEnhanceMode()
@@ -3019,6 +3174,7 @@ function finishExportSuccessfully(job) {
       ? "逐帧截图完成，已保存到独立文件夹"
       : "剪辑完成，已保存为新文件");
   renderControls();
+  if (isEnhanceMode()) renderModelManager();
   if (isEnhanceMode()) void refreshModelDownloadStatus({ reconnect: false });
 }
 
@@ -3039,6 +3195,7 @@ function finishCancelledExport() {
       ? "已取消截图，未完成图片已清理"
       : "已取消导出，原视频未被修改");
   renderControls();
+  if (isEnhanceMode()) renderModelManager();
 }
 
 function finishExportWithError(message, job = null) {
@@ -3065,6 +3222,7 @@ function finishExportWithError(message, job = null) {
   }
   showToast(state.exportError, "error");
   renderControls();
+  if (isEnhanceMode()) renderModelManager();
 }
 
 async function cancelExport() {
@@ -3154,6 +3312,7 @@ function canExport(range = readRange(false)) {
       && !state.selectingVideo
       && !state.selectingDirectory
       && !state.exporting
+      && !(isEnhanceMode() && state.modelDeleteModelId)
       && !(isEnhanceMode() && modelDownloadIsActive()),
   );
 }
@@ -3176,6 +3335,8 @@ function renderReadyNote(range) {
       : isFrameMode()
         ? "请先选择视频并设置截图范围"
         : "请先选择视频并设置剪辑范围";
+  } else if (isEnhanceMode() && state.modelDeleteModelId) {
+    elements.readyNoteText.textContent = "正在删除所选 AI 模型，完成后可以重新下载。";
   } else if (isEnhanceMode() && modelDownloadIsActive()) {
     elements.readyNoteText.textContent = "AI 模型正在后台准备，完成后即可开始超清";
   } else if (isEnhanceMode() && !aiSelectionReady()) {
@@ -3353,6 +3514,7 @@ elements.openModelManagerButton.addEventListener("click", () => {
 });
 elements.modelDownloadButton.addEventListener("click", startModelDownload);
 elements.cancelModelDownloadButton.addEventListener("click", cancelModelDownload);
+elements.modelDeleteButton.addEventListener("click", deleteSelectedAiModel);
 elements.aiProxyForm.addEventListener("submit", saveAiProxySettings);
 elements.aiProxyTestButton.addEventListener("click", testAiProxyDraft);
 elements.aiProxyClearButton.addEventListener("click", clearAiProxySettings);
@@ -3487,7 +3649,7 @@ window.addEventListener("popstate", () => {
   switchWorkspace(workspaceFromLocation(), { updateHistory: false });
 });
 window.addEventListener("beforeunload", (event) => {
-  if (!state.exporting && !modelDownloadIsActive()) return;
+  if (!state.exporting && !modelDownloadIsActive() && !state.modelDeleteModelId) return;
   event.preventDefault();
   event.returnValue = "";
 });

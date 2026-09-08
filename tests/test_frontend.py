@@ -180,6 +180,45 @@ def test_frontend_supports_selectable_ai_model_catalog() -> None:
     assert "Block-Sparse-Attention 尚未验证" in html
 
 
+def test_frontend_can_delete_an_installed_ai_model_with_confirmation() -> None:
+    javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    styles = (PROJECT_ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="model-delete-button"' in html
+    assert 'id="model-delete-hint"' in html
+    assert 'id="model-delete-error" role="alert"' in html
+    assert 'aria-describedby="model-delete-hint"' in html
+    assert "function modelHasInstalledFiles" in javascript
+    assert "function aiEnhancementIsActive" in javascript
+    assert "Number(model.partial_bytes) > 0" in javascript
+    assert "Number(snapshot?.downloaded_bytes) > 0" in javascript
+    assert "function applyModelDeletionPayload" in javascript
+    assert "async function deleteSelectedAiModel" in javascript
+    delete_function = javascript.split("async function deleteSelectedAiModel()", 1)[1].split(
+        "\nasync function refreshAiModels", 1
+    )[0]
+    assert "window.confirm(" in delete_function
+    assert "此操作无法撤销" in delete_function
+    assert "已安装的 AI 运行环境会保留" in delete_function
+    assert 'method: "DELETE"' in delete_function
+    assert "/api/ai-models/${encodeURIComponent(modelId)}/download" in delete_function
+    assert "applyModelDeletionPayload(payload, modelId)" in delete_function
+    assert "payload.deleted_bytes ?? payload.removed_bytes" in delete_function
+    assert "已移除约" in delete_function
+    assert "释放" not in delete_function
+    assert "await refreshAiModels({ preserveOnError: true })" in delete_function
+    assert "state.modelDeleteError = deleteError" in delete_function
+    assert "catalogRefreshFailed && preserveOnError" in javascript
+    assert "state.modelDeleteModelId" in javascript
+    assert "modelDownloadIsActive()" in javascript
+    assert "aiEnhancementIsActive()" in javascript
+    assert "!modelHasInstalledFiles(model)" in javascript
+    assert 'showToast(deleteError, "error")' in delete_function
+    assert ".button-danger" in styles
+    assert ".model-delete-error" in styles
+
+
 def test_frontend_ai_proxy_editor_keeps_password_out_of_state_and_tests_draft() -> None:
     javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")

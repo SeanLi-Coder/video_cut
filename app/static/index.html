@@ -536,6 +536,10 @@
             </div>
             <div class="model-actions">
               <button class="text-button danger-text" id="cancel-model-download-button" type="button" hidden>取消下载</button>
+              <button class="button button-danger button-compact" id="model-delete-button" type="button" aria-describedby="model-delete-hint" disabled>
+                <span class="button-spinner" aria-hidden="true"></span>
+                <span class="button-label">删除模型</span>
+              </button>
               <button class="button button-primary" id="model-download-button" type="button" disabled>
                 <span class="button-spinner" aria-hidden="true"></span>
                 <span class="button-label">提前下载并安装</span>
@@ -543,6 +547,8 @@
               </button>
             </div>
           </div>
+          <p class="model-delete-hint" id="model-delete-hint">只删除所选模型的权重和未完成下载；已安装的 AI 运行环境会保留。</p>
+          <p class="model-delete-error" id="model-delete-error" role="alert" hidden></p>
         </article>
 
         <div class="model-info-grid">

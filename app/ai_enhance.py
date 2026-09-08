@@ -1660,12 +1660,18 @@ class AIEnhancementManager:
             )
         return tuple(paths)
 
-    def _reclaimable_model_download_bytes_locked(self, model_id: str) -> int:
+    def _model_cleanup_summary_locked(
+        self,
+        model_id: str,
+    ) -> tuple[tuple[Path, ...], bool, int]:
+        paths = self._model_cleanup_paths_locked(model_id)
+        found = False
         reclaimable = 0
         seen: set[tuple[int, int]] = set()
-        for path in self._model_cleanup_paths_locked(model_id):
+        for path in paths:
             self._validate_model_cleanup_parent(model_id, path)
             if self._is_unsafe_model_link(path):
+                found = True
                 continue
             try:
                 stat = path.stat()
@@ -1675,11 +1681,16 @@ class AIEnhancementManager:
                 raise MediaError("The existing AI model download could not be cleared") from exc
             if not path.is_file():
                 raise MediaError("The AI model download contains an unexpected directory")
+            found = True
             identity = (stat.st_dev, stat.st_ino)
             if identity in seen or stat.st_nlink != 1:
                 continue
             seen.add(identity)
             reclaimable += max(0, stat.st_size)
+        return paths, found, reclaimable
+
+    def _reclaimable_model_download_bytes_locked(self, model_id: str) -> int:
+        _paths, _found, reclaimable = self._model_cleanup_summary_locked(model_id)
         return reclaimable
 
     def _model_cleanup_disk_free_bytes(self) -> int:
@@ -1710,8 +1721,12 @@ class AIEnhancementManager:
                 )
             raise MediaError("There is not enough free space for the AI runtime and models")
 
-    def _clear_model_download_locked(self, model_id: str) -> None:
-        for path in self._model_cleanup_paths_locked(model_id):
+    def _clear_model_download_locked(
+        self,
+        model_id: str,
+        paths: tuple[Path, ...] | None = None,
+    ) -> None:
+        for path in paths if paths is not None else self._model_cleanup_paths_locked(model_id):
             self._unlink_model_download_artifact(model_id, path)
 
     def _ensure_model_cleanup_is_idle_locked(self) -> None:
@@ -1722,6 +1737,31 @@ class AIEnhancementManager:
                 process is not None and process.poll() is None
             ):
                 raise MediaError("An AI task is still stopping")
+
+    def delete_model(self, model_id: str = DEFAULT_AI_MODEL_ID) -> dict[str, Any]:
+        spec = get_ai_model(model_id)
+        model_id = spec.id
+        with self._lock:
+            if self._active_job_locked() is not None:
+                raise MediaError("The selected AI model is currently in use")
+            self._ensure_model_cleanup_is_idle_locked()
+            paths, deleted, removed_bytes = self._model_cleanup_summary_locked(model_id)
+            self._clear_model_download_locked(model_id, paths)
+            self._latest_model_download_job_ids.pop(model_id, None)
+            if model_id == DEFAULT_AI_MODEL_ID:
+                self._latest_model_download_job_id = None
+            download = self._model_download_snapshot(None, model_id)
+            catalog = self.model_catalog_status()
+        return {
+            **download,
+            "deleted": deleted,
+            "deleted_bytes": removed_bytes,
+            "removed_bytes": removed_bytes,
+            "runtime_preserved": True,
+            "model_id": model_id,
+            "download": download,
+            "catalog": catalog,
+        }
 
     def start_model_download(
         self,
@@ -1921,6 +1961,10 @@ class AIEnhancementManager:
         with self._lock:
             if self._active_job_locked() is not None:
                 raise MediaError("Another AI enhancement job is already running")
+            if model_id != DEFAULT_AI_MODEL_ID and not (
+                self._runtime_installed(model_id) and self._models_downloaded(model_id)
+            ):
+                raise MediaError(f"请先在模型管理中下载并准备 {spec.name}。")
             self._jobs[job.id] = job
             self._active_job_id = job.id
         worker = threading.Thread(target=self._run, args=(job,), daemon=True)

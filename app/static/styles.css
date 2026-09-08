@@ -1100,6 +1100,23 @@ video {
   gap: 14px;
 }
 
+.model-delete-hint,
+.model-delete-error {
+  margin: 8px 0 0;
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: right;
+}
+
+.model-delete-hint {
+  color: var(--muted);
+}
+
+.model-delete-error {
+  color: var(--danger);
+  font-weight: 650;
+}
+
 .model-info-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1303,6 +1320,18 @@ video {
 
 .danger-text {
   color: var(--danger);
+}
+
+.button-danger {
+  border-color: rgba(190, 52, 58, 0.28);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.button-danger:hover:not(:disabled) {
+  border-color: rgba(190, 52, 58, 0.48);
+  background: #fdebec;
+  box-shadow: 0 8px 22px rgba(190, 52, 58, 0.1);
 }
 
 button:focus-visible,
@@ -2761,7 +2790,14 @@ video:focus-visible {
   }
 
   .model-actions {
+    width: 100%;
+    flex-wrap: wrap;
     justify-content: flex-end;
+  }
+
+  .model-delete-hint,
+  .model-delete-error {
+    text-align: left;
   }
 
   .section-heading {

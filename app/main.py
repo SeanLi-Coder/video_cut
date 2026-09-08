@@ -278,6 +278,9 @@ def _user_media_error(exc: MediaError) -> str:
             "AI 模型目录结构异常，已停止操作以避免误删数据。"
         ),
         "An AI task is still stopping": "AI 任务仍在停止和清理中，请稍后再试。",
+        "The selected AI model is currently in use": (
+            "该 AI 模型正在下载或用于 AI 超清，请等待任务结束后再删除。"
+        ),
         "AI model download job was not found": ("找不到这次 AI 模型下载任务，请刷新页面后重试。"),
         "The bundled AI quality patch failed integrity verification": (
             "内置 AI 质量补丁校验失败，请重新下载本项目。"
@@ -1131,6 +1134,21 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             if state.ai_enhancements is None:
                 raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
             return state.ai_enhancements.start_model_download(model_id, restart=True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="没有找到这个 AI 模型。") from exc
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
+
+    @app.delete(
+        "/api/ai-models/{model_id}/download",
+        dependencies=[Depends(require_app_token)],
+    )
+    def delete_ai_model_for_model(model_id: str, response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        try:
+            if state.ai_enhancements is None:
+                raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
+            return state.ai_enhancements.delete_model(model_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="没有找到这个 AI 模型。") from exc
         except MediaError as exc:
