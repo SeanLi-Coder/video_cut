@@ -108,6 +108,18 @@ def test_fixed_model_assets_match_application_catalog() -> None:
     assert actual == expected
 
 
+def test_ai_profiles_include_windows_conditional_runtime_packages() -> None:
+    assert frozenset({"colorama"}) == finalizer.WINDOWS_AI_RUNTIME_PACKAGES
+    for profile_name in ("seedvr2", "swiftvr"):
+        assert (
+            finalizer.PROFILE_SPECS[profile_name].expected_packages
+            >= finalizer.WINDOWS_AI_RUNTIME_PACKAGES
+        )
+    assert finalizer.WINDOWS_AI_RUNTIME_PACKAGES.isdisjoint(
+        finalizer.PROFILE_SPECS["app"].expected_packages
+    )
+
+
 def test_finalize_writes_deterministic_hashed_locks_manifest_and_ready_last(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -1,6 +1,7 @@
 safetensors>=0.5.3,<1
 numpy>=1.26,<3
 tqdm>=4.67,<5
+colorama==0.4.6; platform_system == "Windows"
 psutil>=6,<8
 einops>=0.8,<1
 omegaconf==2.3.0

@@ -32,6 +32,14 @@ def test_windows_portable_includes_multi_model_launcher_files() -> None:
     assert '@("app", "vendor")' in build_script
 
 
+def test_windows_ai_requirements_pin_conditional_colorama() -> None:
+    colorama_pin = 'colorama==0.4.6; platform_system == "Windows"'
+
+    assert colorama_pin in _read("requirements-ai-common.txt").splitlines()
+    assert colorama_pin in _read("requirements-ai-swiftvr-cuda.txt").splitlines()
+    assert colorama_pin not in _read("requirements.txt").splitlines()
+
+
 def test_windows_start_batch_prefers_packaged_executable() -> None:
     start_batch = _read("start.bat")
 

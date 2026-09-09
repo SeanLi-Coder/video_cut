@@ -321,8 +321,8 @@ brew install python ffmpeg
 当前 GitHub Release 没有商业代码签名证书，Windows 可能在第一次运行时显示 SmartScreen 提示。请只使用本仓库 Releases 中的 ZIP，并同时下载同页对应的 `.zip.sha256` 文件；确认来源后点击“更多信息”再选择“仍要运行”。SHA-256 可以在 PowerShell 中检查：
 
 ```powershell
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.4.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.4.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.5.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.5.zip.sha256
 ```
 
 第一条命令输出中的 `Hash` 必须与 `.zip.sha256` 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行该文件，应重新下载并再次核对。

@@ -80,6 +80,8 @@ APP_PACKAGES = frozenset(
     }
 )
 
+WINDOWS_AI_RUNTIME_PACKAGES = frozenset({"colorama"})
+
 SEEDVR2_PACKAGES = frozenset(
     {
         "accelerate",
@@ -142,7 +144,7 @@ SEEDVR2_PACKAGES = frozenset(
         "urllib3",
         "zipp",
     }
-)
+) | WINDOWS_AI_RUNTIME_PACKAGES
 
 SWIFTVR_PACKAGES = frozenset(
     {
@@ -197,7 +199,7 @@ SWIFTVR_PACKAGES = frozenset(
         "urllib3",
         "zipp",
     }
-)
+) | WINDOWS_AI_RUNTIME_PACKAGES
 
 PROFILE_SPECS: Mapping[str, ProfileSpec] = {
     "app": ProfileSpec(
