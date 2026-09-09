@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import contextlib
 import hashlib
 import json
@@ -117,6 +118,17 @@ AI_OUTPUT_COLOR_FILTER_GRAPH = (
     "zscale=matrix=bt709:range=limited:primaries=bt709:transfer=bt709:"
     "chromal=left:dither=error_diffusion,format=yuv420p10le"
 )
+
+_UTF8_PYTHON_ENVIRONMENT = {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8",
+}
+
+
+def _utf8_process_environment(base: dict[str, str] | None = None) -> dict[str, str]:
+    environment = dict(os.environ if base is None else base)
+    environment.update(_UTF8_PYTHON_ENVIRONMENT)
+    return environment
 
 
 def _estimated_ai_remaining_seconds(
@@ -756,7 +768,7 @@ class AIEnhancementJob:
     reported_eta_seconds: float | None = None
     finished_at: float | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
-    process: subprocess.Popen[str] | None = field(default=None, repr=False)
+    process: subprocess.Popen[Any] | None = field(default=None, repr=False)
     worker: threading.Thread | None = field(default=None, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
@@ -823,7 +835,7 @@ class AIModelDownloadJob:
     network_started_at: float | None = field(default=None, repr=False)
     network_start_bytes: int = field(default=0, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
-    process: subprocess.Popen[str] | None = field(default=None, repr=False)
+    process: subprocess.Popen[Any] | None = field(default=None, repr=False)
     worker: threading.Thread | None = field(default=None, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
@@ -2223,7 +2235,7 @@ class AIEnhancementManager:
                 worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
     @staticmethod
-    def _request_process_stop(process: subprocess.Popen[str]) -> None:
+    def _request_process_stop(process: subprocess.Popen[Any]) -> None:
         if process.poll() is not None:
             return
         try:
@@ -2240,7 +2252,7 @@ class AIEnhancementManager:
             return
 
     @classmethod
-    def _escalate_process_stop(cls, process: subprocess.Popen[str]) -> None:
+    def _escalate_process_stop(cls, process: subprocess.Popen[Any]) -> None:
         cls._request_process_stop(process)
         try:
             process.wait(timeout=4)
@@ -2925,14 +2937,12 @@ class AIEnhancementManager:
         on_line: Callable[[str], None] | None = None,
     ) -> deque[str]:
         recent: deque[str] = deque(maxlen=80)
-        process: subprocess.Popen[str] | None = None
+        process: subprocess.Popen[bytes] | None = None
         options: dict[str, Any] = {
             "cwd": cwd,
-            "env": env,
+            "env": _utf8_process_environment(env),
             "stdout": subprocess.PIPE,
             "stderr": subprocess.STDOUT,
-            "text": True,
-            "bufsize": 1,
         }
         if sys.platform == "win32":
             options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -2946,11 +2956,10 @@ class AIEnhancementManager:
                 job.process = process
             assert process.stdout is not None
             pending = ""
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
             while True:
                 raw_chunk = os.read(process.stdout.fileno(), 4096)
-                if not raw_chunk:
-                    break
-                chunk = raw_chunk.decode("utf-8", errors="replace")
+                chunk = decoder.decode(raw_chunk, final=not raw_chunk)
                 pending += chunk.replace("\r", "\n")
                 pieces = pending.split("\n")
                 pending = pieces.pop()
@@ -2960,6 +2969,8 @@ class AIEnhancementManager:
                         recent.append(line)
                         if on_line is not None:
                             on_line(line)
+                if not raw_chunk:
+                    break
                 if job.cancel_event.is_set() and process.poll() is None:
                     self._request_process_stop(process)
             if pending.strip():
@@ -3094,9 +3105,11 @@ class AIEnhancementManager:
         socks_directory = None
         if job.download_proxy is not None and job.download_proxy.scheme in {"socks5", "socks5h"}:
             socks_directory = stage_pysocks_module(staging / "proxy-bootstrap")
-        return proxy_process_environment(
-            job.download_proxy,
-            socks_module_directory=socks_directory,
+        return _utf8_process_environment(
+            proxy_process_environment(
+                job.download_proxy,
+                socks_module_directory=socks_directory,
+            )
         )
 
     @staticmethod
@@ -3608,7 +3621,7 @@ class AIEnhancementManager:
         return command
 
     def _inference_environment(self, python_directory: Path | None = None) -> dict[str, str]:
-        env = os.environ.copy()
+        env = _utf8_process_environment()
         env.update(
             {
                 "PYTHONUNBUFFERED": "1",

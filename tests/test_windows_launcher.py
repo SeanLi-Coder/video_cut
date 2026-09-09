@@ -25,6 +25,24 @@ def test_windows_local_control_requests_disable_system_proxies() -> None:
     assert launcher_windows._LOCAL_PROXY_HANDLER.proxies == {}
 
 
+def test_windows_child_environment_overrides_legacy_encoding() -> None:
+    inherited = {
+        "PATH": "bin",
+        "PYTHONUTF8": "0",
+        "PYTHONIOENCODING": "gbk",
+    }
+
+    environment = launcher_windows._utf8_process_environment(inherited)
+
+    assert inherited["PYTHONUTF8"] == "0"
+    assert inherited["PYTHONIOENCODING"] == "gbk"
+    assert environment == {
+        "PATH": "bin",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
+
+
 def test_existing_windows_instance_checks_recovery_before_opening(monkeypatch) -> None:
     record = {
         "instance_id": "existing-instance",
@@ -740,6 +758,8 @@ def test_windows_launch_uses_port_and_parent_pid_mode(monkeypatch, tmp_path: Pat
     assert records[-1]["server_pid"] == 52_525
     assert records[-1]["control_port"] == 42_425
     assert captured_environment["VIDEO_CUT_AI_BASE_PYTHON"] == str(python)
+    assert captured_environment["PYTHONUTF8"] == "1"
+    assert captured_environment["PYTHONIOENCODING"] == "utf-8"
     assert startup_steps == ["resolve-python", "probe-vc-runtime", "prepare-environment"]
 
 

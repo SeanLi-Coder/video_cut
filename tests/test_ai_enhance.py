@@ -5,6 +5,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -869,6 +870,8 @@ def test_ai_command_is_full_precision_mps_quality_path(
     assert "--input_frame_count" in command
     assert not any(token in joined.lower() for token in ("cuda", "fp8", "gguf", "real-esrgan"))
     environment = manager._inference_environment()
+    assert environment["PYTHONUTF8"] == "1"
+    assert environment["PYTHONIOENCODING"] == "utf-8"
     assert environment["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
     assert environment["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.95"
     assert environment["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] != "0.0"
@@ -922,6 +925,8 @@ def test_ai_command_is_full_precision_rtx_5090_cuda_path(
     assert not any(token in joined.lower() for token in ("fp8", "gguf", "sageattn"))
 
     environment = manager._inference_environment()
+    assert environment["PYTHONUTF8"] == "1"
+    assert environment["PYTHONIOENCODING"] == "utf-8"
     assert environment["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
     assert environment["CUDA_VISIBLE_DEVICES"] == "GPU-5090-test"
     assert environment["PYTORCH_CUDA_ALLOC_CONF"] == "backend:cudaMallocAsync"
@@ -1003,6 +1008,52 @@ def test_offline_pip_failure_does_not_treat_networkx_as_a_network_error(
         "[WinError 5] Access is denied"
     )
     assert "检查网络" not in message
+
+
+def test_ai_process_overrides_legacy_encoding_and_preserves_split_utf8(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        compute_backend="cuda",
+        inference_runner=lambda _job, _output: None,
+    )
+    hostile_environment = {
+        **os.environ,
+        "PYTHONUTF8": "0",
+        "PYTHONIOENCODING": "gbk",
+    }
+    expected = "A" * 4095 + "📊"
+
+    prepared_environment = ai_module._utf8_process_environment(hostile_environment)
+    assert hostile_environment["PYTHONUTF8"] == "0"
+    assert hostile_environment["PYTHONIOENCODING"] == "gbk"
+    assert prepared_environment["PYTHONUTF8"] == "1"
+    assert prepared_environment["PYTHONIOENCODING"] == "utf-8"
+
+    download_environment = manager._download_process_environment(
+        AIModelDownloadJob(id="unicode-download"),
+        tmp_path / "staging",
+    )
+    assert download_environment["PYTHONUTF8"] == "1"
+    assert download_environment["PYTHONIOENCODING"] == "utf-8"
+
+    output = manager._run_process(
+        AIModelDownloadJob(id="unicode-output"),
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('A' * 4095 + chr(0x1f4ca) + '\\n'); "
+            "sys.stdout.flush()",
+        ],
+        env=hostile_environment,
+    )
+
+    assert list(output) == [expected]
 
 
 def test_process_network_error_requires_a_real_network_failure_signature(

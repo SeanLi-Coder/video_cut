@@ -62,6 +62,10 @@ FFMPEG_FULL_SMOKE_FILTER = (
 )
 _LOCAL_PROXY_HANDLER = ProxyHandler({})
 _LOCAL_HTTP_OPENER = build_opener(_LOCAL_PROXY_HANDLER)
+_UTF8_PYTHON_ENVIRONMENT = {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8",
+}
 
 
 class LauncherError(RuntimeError):
@@ -74,6 +78,12 @@ class LauncherCancelled(LauncherError):
 
 def _open_local_http(request: Request, timeout: float):
     return _LOCAL_HTTP_OPENER.open(request, timeout=timeout)
+
+
+def _utf8_process_environment(base: dict[str, str] | None = None) -> dict[str, str]:
+    environment = dict(os.environ if base is None else base)
+    environment.update(_UTF8_PYTHON_ENVIRONMENT)
+    return environment
 
 
 def _venv_python() -> Path:
@@ -217,6 +227,7 @@ def _run_owned(command: list[str], *, stop_requested: threading.Event) -> int:
         command,
         cwd=PROJECT_ROOT,
         creationflags=_creation_flags(),
+        env=_utf8_process_environment(),
     )
     try:
         while process.poll() is None:
@@ -923,7 +934,7 @@ def launch(
                 raise LauncherCancelled("Startup was cancelled")
 
             port = _available_port(preferred_port)
-            environment = dict(os.environ)
+            environment = _utf8_process_environment()
             environment.update(
                 {
                     "PYTHONUNBUFFERED": "1",

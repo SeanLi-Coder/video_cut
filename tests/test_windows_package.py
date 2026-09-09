@@ -43,6 +43,8 @@ def test_windows_ai_requirements_pin_conditional_colorama() -> None:
 def test_windows_start_batch_prefers_packaged_executable() -> None:
     start_batch = _read("start.bat")
 
+    assert 'set "PYTHONUTF8=1"' in start_batch
+    assert 'set "PYTHONIOENCODING=utf-8"' in start_batch
     executable_index = start_batch.index('if exist "LocalVideoCutter.exe"')
     python_index = start_batch.index('if exist ".venv\\Scripts\\python.exe"')
     assert executable_index < python_index
