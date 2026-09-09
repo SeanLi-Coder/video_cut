@@ -100,7 +100,8 @@ def test_frontend_ai_output_is_fixed_to_source_directory() -> None:
     assert "function usesSourceDirectory()" in javascript
     assert "return isRotateMode() || isEnhanceMode();" in javascript
     assert "elements.selectDirectoryButton.hidden = sourceDirectory;" in javascript
-    assert 'sourceDirectory ? "固定保存到原视频同级目录" : "保存到"' in javascript
+    assert 'batch ? "分别保存到每个原视频的同级目录"' in javascript
+    assert '"固定保存到原视频同级目录"' in javascript
     assert "选择视频后自动使用原视频同级目录" in javascript
     assert "const destinationReady = isEnhanceMode()" in javascript
     assert "? Boolean(state.video)" in javascript
@@ -118,6 +119,50 @@ def test_frontend_ai_output_is_fixed_to_source_directory() -> None:
         "\nfunction scheduleExportPoll", 1
     )[0]
     assert "output_directory" not in start_export
+
+
+def test_frontend_ai_batch_queue_selects_and_processes_multiple_videos() -> None:
+    javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    styles = (PROJECT_ROOT / "app" / "static" / "styles.css").read_text(encoding="utf-8")
+
+    for element_id in (
+        "ai-batch-selection",
+        "ai-batch-file-list",
+        "ai-batch-selection-errors",
+        "ai-batch-progress-summary",
+        "ai-batch-result-list",
+    ):
+        assert f'id="{element_id}"' in html
+
+    assert 'selectingBatch ? "/api/videos/select-many" : "/api/videos/select"' in javascript
+    assert 'return "/api/ai-enhancement-batches"' in javascript
+    assert "video_ids: batchVideos.map((video) => video.id)" in javascript
+    assert "function updateAiBatchSnapshot(snapshot)" in javascript
+    assert "function finishAiBatch(snapshot, { cancelled = false } = {})" in javascript
+    assert "snapshot?.current_index == null ? -1" in javascript
+    assert "declaredItemIsRunning" in javascript
+    assert "!snapshot?.eta_includes_queued_items" in javascript
+    assert "counts.cancelled > 0 || Boolean(topLevelError)" in javascript
+    assert "finishAiBatch(job, { cancelled: true })" in javascript
+    assert "renderAiBatchResultList(snapshot)" in javascript
+    assert "function restoreCancelExportButton()" in javascript
+    assert "pollSerial === state.exportPollSerial" in javascript
+    assert "批量超清意外停止" in javascript
+    assert "newFailures.length === 1" in javascript
+    assert '"completed_with_errors"' in javascript
+    assert "处理失败，已记录原因并自动继续下一个" in javascript
+    assert 'state.aiBatchActive ? "停止批量超清"' in javascript
+    assert "data-reveal-ai-job-id" in javascript
+    start_export = javascript.split("async function startExport()", 1)[1].split(
+        "\nfunction scheduleExportPoll", 1
+    )[0]
+    assert start_export.index('state.exportJobId = "";') < start_export.index(
+        "await post(exportApiBase(), body)"
+    )
+    assert ".ai-batch-file-list" in styles
+    assert '.ai-batch-file-item[data-status="failed"]' in styles
+    assert ".ai-batch-result-list" in styles
 
 
 def test_frontend_hides_and_disables_ai_when_bootstrap_capability_is_off() -> None:
@@ -223,8 +268,9 @@ def test_frontend_ai_eta_uses_ranges_and_recalibration_copy() -> None:
     assert "estimated_remaining_lower_seconds" in javascript
     assert "estimated_remaining_upper_seconds" in javascript
     assert 'etaState === "recalibrating"' in javascript
-    assert "AI 生成预计：速度有变化，正在重新校准…" in javascript
-    assert "AI 生成预计还需：约 ${range}" in javascript
+    assert '整批 AI 生成预计" : "AI 生成预计' in javascript
+    assert "${estimatePrefix}：速度有变化，正在重新校准…" in javascript
+    assert "${label}：约 ${range}" in javascript
     assert "（速度有波动）" in javascript
     assert "（初步估算）" in javascript
     assert "取得足够的实际处理样本后显示…" in javascript

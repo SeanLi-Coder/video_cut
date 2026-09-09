@@ -18,7 +18,7 @@ import time
 import uuid
 import zipfile
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
@@ -947,6 +947,256 @@ class AIEnhancementJob:
 
 
 @dataclass
+class AIEnhancementBatchItem:
+    id: str
+    source: VideoSource
+    status: str = "queued"
+    stage: str = "queued"
+    progress: float = 0.0
+    message: str = "等待批量 AI 超清"
+    error: str | None = None
+    job: AIEnhancementJob | None = field(default=None, repr=False)
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            job = self.job
+            item_status = self.status
+            item_stage = self.stage
+            item_progress = self.progress
+            item_message = self.message
+            item_error = self.error
+            item_started_at = self.started_at
+            item_finished_at = self.finished_at
+        job_snapshot = job.snapshot() if job is not None else None
+        if job_snapshot is not None:
+            status = str(job_snapshot["status"])
+            stage = str(job_snapshot["stage"])
+            progress = float(job_snapshot["progress"])
+            message = str(job_snapshot["message"])
+            error = job_snapshot.get("error")
+            output_name = job_snapshot.get("output_name")
+            output_path = job_snapshot.get("output_path")
+            elapsed_seconds = job_snapshot.get("elapsed_seconds", 0.0)
+            estimated_remaining_seconds = job_snapshot.get("estimated_remaining_seconds")
+            estimated_remaining_lower_seconds = job_snapshot.get(
+                "estimated_remaining_lower_seconds"
+            )
+            estimated_remaining_upper_seconds = job_snapshot.get(
+                "estimated_remaining_upper_seconds"
+            )
+            eta_state = job_snapshot.get("eta_state", "unavailable")
+            eta_confidence = job_snapshot.get("eta_confidence")
+        else:
+            end_time = item_finished_at or time.time()
+            start_time = item_started_at or self.created_at
+            status = item_status
+            stage = item_stage
+            progress = item_progress
+            message = item_message
+            error = item_error
+            output_name = None
+            output_path = None
+            elapsed_seconds = max(0.0, end_time - start_time) if item_started_at else 0.0
+            estimated_remaining_seconds = None
+            estimated_remaining_lower_seconds = None
+            estimated_remaining_upper_seconds = None
+            eta_state = "unavailable"
+            eta_confidence = None
+        return {
+            "item_id": self.id,
+            "video_id": self.source.id,
+            "source_name": self.source.path.name,
+            "source_path": str(self.source.path),
+            "source_path_display": str(self.source.path),
+            "job_id": job.id if job is not None else None,
+            "status": status,
+            "stage": stage,
+            "progress": round(progress, 1),
+            "message": message,
+            "error": error,
+            "output_name": output_name,
+            "output_path": output_path,
+            "elapsed_seconds": round(float(elapsed_seconds or 0.0), 1),
+            "estimated_remaining_seconds": estimated_remaining_seconds,
+            "estimated_remaining_lower_seconds": estimated_remaining_lower_seconds,
+            "estimated_remaining_upper_seconds": estimated_remaining_upper_seconds,
+            "eta_state": eta_state,
+            "eta_confidence": eta_confidence,
+        }
+
+
+@dataclass
+class AIEnhancementBatchJob:
+    id: str
+    target: str
+    model_id: str
+    items: list[AIEnhancementBatchItem]
+    status: str = "queued"
+    stage: str = "queued"
+    message: str = "等待开始批量 AI 超清"
+    error: str | None = None
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    current_index: int | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    worker: threading.Thread | None = field(default=None, repr=False)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            status = self.status
+            stage = self.stage
+            message = self.message
+            error = self.error
+            started_at = self.started_at
+            finished_at = self.finished_at
+            current_index = self.current_index
+            items = list(self.items)
+        item_snapshots = [item.snapshot() for item in items]
+        completed_count = sum(item["status"] == "completed" for item in item_snapshots)
+        failed_count = sum(item["status"] == "failed" for item in item_snapshots)
+        cancelled_count = sum(item["status"] == "cancelled" for item in item_snapshots)
+        running_count = sum(item["status"] == "running" for item in item_snapshots)
+        queued_count = sum(item["status"] == "queued" for item in item_snapshots)
+        weights = [
+            max(
+                1.0,
+                float(item.source.metadata.get("duration") or 0.0)
+                * float(item.source.metadata.get("fps") or 0.0),
+            )
+            for item in items
+        ]
+        weighted_progress = sum(
+            weight
+            * (
+                100.0
+                if snapshot["status"] in {"completed", "failed", "cancelled"}
+                else max(0.0, min(100.0, float(snapshot["progress"])))
+            )
+            for weight, snapshot in zip(weights, item_snapshots, strict=True)
+        ) / max(1.0, sum(weights))
+        if status in {"completed", "completed_with_errors"}:
+            weighted_progress = 100.0
+        end_time = finished_at or time.time()
+        start_time = started_at or self.created_at
+        elapsed_seconds = max(0.0, end_time - start_time)
+        current_item = (
+            item_snapshots[current_index]
+            if current_index is not None and 0 <= current_index < len(item_snapshots)
+            else None
+        )
+        if (
+            status == "running"
+            and current_item is not None
+            and current_item["status"] in {"completed", "failed", "cancelled"}
+        ):
+            # The child may have reached a terminal state while its cleanup is
+            # still returning. Do not expose it as the active item or reuse its
+            # zero ETA for the videos that are still queued.
+            current_index = None
+            current_item = None
+        current_stage = None
+        if current_item is not None and status == "running":
+            current_stage = str(current_item["stage"])
+            stage = current_stage
+        if status in {"completed", "completed_with_errors"}:
+            estimated_remaining_seconds = 0.0
+            estimated_remaining_lower_seconds = 0.0
+            estimated_remaining_upper_seconds = 0.0
+            eta_state = "completed"
+            eta_confidence = "high"
+        elif current_item is not None and status == "running":
+            current_progress = max(0.0, min(100.0, float(current_item["progress"])))
+            current_weight = weights[current_index] if current_index is not None else 0.0
+            current_remaining_work = current_weight * (1.0 - current_progress / 100.0)
+            total_remaining_work = sum(
+                weight
+                * (
+                    0.0
+                    if snapshot["status"] in {"completed", "failed", "cancelled"}
+                    else 1.0 - max(0.0, min(100.0, float(snapshot["progress"]))) / 100.0
+                )
+                for weight, snapshot in zip(weights, item_snapshots, strict=True)
+            )
+            eta_scale = (
+                max(1.0, total_remaining_work / current_remaining_work)
+                if current_remaining_work > 0
+                else 1.0
+            )
+
+            def scaled_current_eta(key: str) -> float | None:
+                value = current_item.get(key)
+                if value is None:
+                    return None
+                numeric = float(value)
+                return round(max(0.0, numeric * eta_scale), 1)
+
+            estimated_remaining_seconds = scaled_current_eta(
+                "estimated_remaining_seconds"
+            )
+            estimated_remaining_lower_seconds = scaled_current_eta(
+                "estimated_remaining_lower_seconds"
+            )
+            estimated_remaining_upper_seconds = scaled_current_eta(
+                "estimated_remaining_upper_seconds"
+            )
+            eta_state = current_item["eta_state"]
+            eta_confidence = current_item["eta_confidence"]
+            if eta_scale > 1.0 and estimated_remaining_seconds is not None:
+                eta_confidence = "low"
+            if queued_count and current_stage in {
+                "verify",
+                "verifying",
+                "remux",
+                "finalize",
+                "finalizing",
+            }:
+                stage = "batch"
+                eta_state = "calibrating"
+        else:
+            estimated_remaining_seconds = None
+            estimated_remaining_lower_seconds = None
+            estimated_remaining_upper_seconds = None
+            eta_state = "unavailable"
+            eta_confidence = None
+        return {
+            "batch_id": self.id,
+            "operation": "enhance_batch",
+            "status": status,
+            "stage": stage,
+            "progress": round(weighted_progress, 1),
+            "message": message,
+            "error": error,
+            "elapsed_seconds": round(elapsed_seconds, 1),
+            "estimated_remaining_seconds": estimated_remaining_seconds,
+            "estimated_remaining_lower_seconds": estimated_remaining_lower_seconds,
+            "estimated_remaining_upper_seconds": estimated_remaining_upper_seconds,
+            "eta_state": eta_state,
+            "eta_confidence": eta_confidence,
+            "eta_scope": "ai_generation",
+            "eta_includes_queued_items": True,
+            "current_stage": current_stage,
+            "target": self.target,
+            "model_id": self.model_id,
+            "model": get_ai_model(self.model_id).name,
+            "total_count": len(item_snapshots),
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "cancelled_count": cancelled_count,
+            "running_count": running_count,
+            "queued_count": queued_count,
+            "current_index": current_index,
+            "current_item_id": current_item["item_id"] if current_item is not None else None,
+            "items": item_snapshots,
+        }
+
+
+@dataclass
 class AIModelDownloadJob:
     id: str
     model_id: str = DEFAULT_AI_MODEL_ID
@@ -999,6 +1249,7 @@ class AIModelDownloadJob:
 
 
 AIWorkerJob = AIEnhancementJob | AIModelDownloadJob
+AIActiveJob = AIWorkerJob | AIEnhancementBatchJob
 
 
 class AIEnhancementManager:
@@ -1065,6 +1316,7 @@ class AIEnhancementManager:
         self.color_pipeline_error: str | None = None
         self.color_pipeline_available = inference_runner is not None or self._has_color_pipeline()
         self._jobs: dict[str, AIEnhancementJob] = {}
+        self._batches: dict[str, AIEnhancementBatchJob] = {}
         self._model_download_jobs: dict[str, AIModelDownloadJob] = {}
         self._lock = threading.RLock()
         self._model_validation_lock = threading.RLock()
@@ -1716,12 +1968,14 @@ class AIEnhancementManager:
             and compatible
         )
 
-    def _active_job_locked(self) -> AIWorkerJob | None:
+    def _active_job_locked(self) -> AIActiveJob | None:
         if self._active_job_id is None:
             return None
-        active: AIWorkerJob | None = self._jobs.get(self._active_job_id)
+        active: AIActiveJob | None = self._jobs.get(self._active_job_id)
         if active is None:
             active = self._model_download_jobs.get(self._active_job_id)
+        if active is None:
+            active = self._batches.get(self._active_job_id)
         if active is None or active.snapshot()["status"] not in {"queued", "running"}:
             self._active_job_id = None
             return None
@@ -2072,6 +2326,10 @@ class AIEnhancementManager:
                 process is not None and process.poll() is None
             ):
                 raise MediaError("An AI task is still stopping")
+        for batch in self._batches.values():
+            worker = batch.worker
+            if worker is not None and worker.is_alive():
+                raise MediaError("An AI task is still stopping")
 
     def delete_model(self, model_id: str = DEFAULT_AI_MODEL_ID) -> dict[str, Any]:
         spec = get_ai_model(model_id)
@@ -2227,7 +2485,7 @@ class AIEnhancementManager:
             ).start()
         return self._model_download_snapshot(job, model_id)
 
-    def create(
+    def _build_enhancement_job(
         self,
         source: VideoSource,
         *,
@@ -2311,11 +2569,22 @@ class AIEnhancementManager:
             model_id=model_id,
             download_proxy=self._download_proxy_snapshot(),
         )
+        return job
+
+    def create(
+        self,
+        source: VideoSource,
+        *,
+        target: str,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> AIEnhancementJob:
+        job = self._build_enhancement_job(source, target=target, model_id=model_id)
+        spec = get_ai_model(job.model_id)
         with self._lock:
             if self._active_job_locked() is not None:
                 raise MediaError("Another AI enhancement job is already running")
-            if model_id != DEFAULT_AI_MODEL_ID and not (
-                self._runtime_installed(model_id) and self._models_downloaded(model_id)
+            if job.model_id != DEFAULT_AI_MODEL_ID and not (
+                self._runtime_installed(job.model_id) and self._models_downloaded(job.model_id)
             ):
                 raise MediaError(f"请先在模型管理中下载并准备 {spec.name}。")
             self._jobs[job.id] = job
@@ -2324,6 +2593,207 @@ class AIEnhancementManager:
         job.worker = worker
         worker.start()
         return job
+
+    def create_batch(
+        self,
+        sources: Sequence[VideoSource],
+        *,
+        target: str,
+        model_id: str = DEFAULT_AI_MODEL_ID,
+    ) -> AIEnhancementBatchJob:
+        selected_sources = list(sources)
+        if not selected_sources:
+            raise MediaError("At least one video is required for AI enhancement batch")
+        try:
+            spec = get_ai_model(model_id)
+        except KeyError as exc:
+            raise MediaError("Unknown AI enhancement model") from exc
+        model_id = spec.id
+        compatible, reason = model_compatibility(spec, self.compute_backend)
+        if not self.platform_supported:
+            raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
+        if not self.driver_supported:
+            raise MediaError("NVIDIA driver R580 or newer is required for RTX 5090")
+        if not self.encoder_available:
+            raise MediaError("Required FFmpeg encoder is not available: libx265")
+        if not self.color_pipeline_available:
+            raise MediaError("Required FFmpeg color filters are not available")
+        if not compatible:
+            raise MediaError(reason or "The selected AI model is not compatible")
+        normalized_target = str(target).strip().lower()
+        if normalized_target not in spec.supported_targets:
+            supported = "、".join(spec.supported_targets)
+            raise MediaError(f"{spec.name} 当前仅支持 {supported} 输出。")
+
+        batch = AIEnhancementBatchJob(
+            id=uuid.uuid4().hex,
+            target=normalized_target,
+            model_id=model_id,
+            items=[
+                AIEnhancementBatchItem(id=uuid.uuid4().hex, source=source)
+                for source in selected_sources
+            ],
+        )
+        with self._lock:
+            if self._active_job_locked() is not None:
+                raise MediaError("Another AI enhancement job is already running")
+            if model_id != DEFAULT_AI_MODEL_ID and not (
+                self._runtime_installed(model_id) and self._models_downloaded(model_id)
+            ):
+                raise MediaError(f"请先在模型管理中下载并准备 {spec.name}。")
+            self._batches[batch.id] = batch
+            self._active_job_id = batch.id
+        try:
+            worker = threading.Thread(target=self._run_batch, args=(batch,), daemon=True)
+            batch.worker = worker
+            worker.start()
+        except BaseException as exc:
+            batch.worker = None
+            with self._lock:
+                self._batches.pop(batch.id, None)
+                if self._active_job_id == batch.id:
+                    self._active_job_id = None
+            raise MediaError("Could not start AI process: batch worker") from exc
+        return batch
+
+    def get_batch(self, batch_id: str) -> AIEnhancementBatchJob | None:
+        with self._lock:
+            return self._batches.get(batch_id)
+
+    def cancel_batch(self, batch_id: str) -> AIEnhancementBatchJob:
+        batch = self.get_batch(batch_id)
+        if batch is None:
+            raise MediaError("AI enhancement batch was not found")
+        with batch.lock:
+            if batch.status not in {"queued", "running"}:
+                return batch
+            batch.cancel_event.set()
+            current_index = batch.current_index
+            batch.message = "正在停止当前 AI 超清并取消后续视频"
+        current_item = (
+            batch.items[current_index]
+            if current_index is not None and 0 <= current_index < len(batch.items)
+            else None
+        )
+        if current_item is not None:
+            with current_item.lock:
+                current_job = current_item.job
+            if current_job is not None:
+                self.cancel(current_job.id)
+        return batch
+
+    @staticmethod
+    def _cancel_queued_batch_items(batch: AIEnhancementBatchJob) -> None:
+        now = time.time()
+        for item in batch.items:
+            with item.lock:
+                if item.job is None and item.status == "queued":
+                    item.status = "cancelled"
+                    item.stage = "cancelled"
+                    item.message = "批量任务已取消，此视频未开始处理"
+                    item.finished_at = now
+
+    def _run_batch(self, batch: AIEnhancementBatchJob) -> None:
+        current_thread = threading.current_thread()
+        with batch.lock:
+            batch.status = "running"
+            batch.stage = "running"
+            batch.started_at = time.time()
+            batch.message = f"正在批量处理 {len(batch.items)} 个视频"
+        try:
+            for index, item in enumerate(batch.items):
+                if batch.cancel_event.is_set():
+                    break
+                with batch.lock:
+                    batch.current_index = index
+                    batch.stage = "preparing"
+                    batch.message = (
+                        f"正在处理第 {index + 1}/{len(batch.items)} 个视频："
+                        f"{item.source.path.name}"
+                    )
+                with item.lock:
+                    item.status = "running"
+                    item.stage = "preparing"
+                    item.message = "正在检查视频并准备 AI 超清"
+                    item.started_at = time.time()
+                job: AIEnhancementJob | None = None
+                try:
+                    job = self._build_enhancement_job(
+                        item.source,
+                        target=batch.target,
+                        model_id=batch.model_id,
+                    )
+                    job.worker = current_thread
+                    with self._lock:
+                        self._jobs[job.id] = job
+                    with item.lock:
+                        item.job = job
+                        item.stage = "queued"
+                        item.message = "正在开始 AI 超清"
+                    if batch.cancel_event.is_set():
+                        job.cancel_event.set()
+                    self._run(job)
+                except BaseException as exc:
+                    error = str(exc) or exc.__class__.__name__
+                    if job is not None:
+                        with job.lock:
+                            if job.status in {"queued", "running"}:
+                                job.status = "failed"
+                                job.stage = "failed"
+                                job.error = redact_proxy_credentials(error, job.download_proxy)
+                                job.message = "AI 超清失败，原视频未被修改"
+                                job.finished_at = time.time()
+                    if job is None:
+                        with item.lock:
+                            item.status = "failed"
+                            item.stage = "failed"
+                            item.progress = 100.0
+                            item.error = error
+                            item.message = "此视频 AI 超清失败，已自动继续下一个"
+                            item.finished_at = time.time()
+                if batch.cancel_event.is_set():
+                    break
+
+            snapshots = [item.snapshot() for item in batch.items]
+            cancellation_changed_outcome = batch.cancel_event.is_set() and any(
+                item["status"] in {"queued", "running", "cancelled"} for item in snapshots
+            )
+            if cancellation_changed_outcome:
+                self._cancel_queued_batch_items(batch)
+                with batch.lock:
+                    batch.status = "cancelled"
+                    batch.stage = "cancelled"
+                    batch.message = "批量 AI 超清已取消，未开始的视频未被处理"
+                    batch.finished_at = time.time()
+                    batch.current_index = None
+            else:
+                completed = sum(item["status"] == "completed" for item in snapshots)
+                failed = sum(
+                    item["status"] in {"failed", "cancelled"} for item in snapshots
+                )
+                with batch.lock:
+                    batch.status = "completed_with_errors" if failed else "completed"
+                    batch.stage = batch.status
+                    batch.message = (
+                        f"批量 AI 超清结束：成功 {completed} 个，失败 {failed} 个"
+                        if failed
+                        else f"批量 AI 超清完成，共处理 {completed} 个视频"
+                    )
+                    batch.finished_at = time.time()
+                    batch.current_index = None
+        except BaseException as exc:
+            self._cancel_queued_batch_items(batch)
+            with batch.lock:
+                batch.status = "completed_with_errors"
+                batch.stage = "completed_with_errors"
+                batch.error = str(exc) or exc.__class__.__name__
+                batch.message = "批量 AI 超清意外停止；已完成的视频会保留"
+                batch.finished_at = time.time()
+                batch.current_index = None
+        finally:
+            with self._lock:
+                if self._active_job_id == batch.id:
+                    self._active_job_id = None
 
     def get(self, job_id: str) -> AIEnhancementJob | None:
         with self._lock:
@@ -2351,7 +2821,11 @@ class AIEnhancementManager:
     def cancel_all(self) -> None:
         with self._lock:
             jobs = list(self._jobs.values())
+            batches = list(self._batches.values())
             model_download_jobs = list(self._model_download_jobs.values())
+        for batch in batches:
+            if batch.snapshot()["status"] in {"queued", "running"}:
+                self.cancel_batch(batch.id)
         for job in jobs:
             if job.snapshot()["status"] in {"queued", "running"}:
                 self.cancel(job.id)
@@ -2359,9 +2833,17 @@ class AIEnhancementManager:
             if job.snapshot()["status"] in {"queued", "running"}:
                 self.cancel_model_download(job.id, model_id=job.model_id)
         deadline = time.monotonic() + 10
-        for job in [*jobs, *model_download_jobs]:
-            worker = job.worker
-            if worker is not None and worker.is_alive():
+        workers = {
+            id(worker): worker
+            for worker in [
+                *(job.worker for job in jobs),
+                *(batch.worker for batch in batches),
+                *(job.worker for job in model_download_jobs),
+            ]
+            if worker is not None
+        }
+        for worker in workers.values():
+            if worker.is_alive():
                 worker.join(timeout=max(0.0, deadline - time.monotonic()))
 
     @staticmethod

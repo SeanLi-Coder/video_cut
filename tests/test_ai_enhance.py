@@ -1544,6 +1544,345 @@ def test_ai_create_uses_source_directory_and_allocates_unique_name(
         job.worker.join(timeout=5)
 
 
+def test_ai_batch_continues_after_one_item_fails(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        compute_backend="mps",
+        inference_runner=lambda _job, _output: None,
+    )
+    sources = [
+        VideoSource(
+            id=f"source-{index}",
+            path=tmp_path / name,
+            metadata={"duration": 10.0, "fps": 30.0},
+        )
+        for index, name in enumerate(("first.mp4", "broken.mp4", "last.mp4"))
+    ]
+    execution_order: list[str] = []
+
+    def build_job(
+        source: VideoSource,
+        *,
+        target: str,
+        model_id: str,
+    ) -> AIEnhancementJob:
+        assert target == "1080p"
+        return AIEnhancementJob(
+            id=f"job-{source.id}",
+            source=source,
+            target=ai_module.AI_TARGETS[target],
+            output_path=source.path.with_name(f"{source.path.stem}-output.mp4"),
+            expected_width=1920,
+            expected_height=1080,
+            model_id=model_id,
+        )
+
+    def run_job(job: AIEnhancementJob) -> None:
+        execution_order.append(job.source.path.name)
+        with job.lock:
+            job.status = "running"
+            job.stage = "inference"
+            job.progress = 50.0
+            job.started_at = time.time()
+        if job.source.path.name == "broken.mp4":
+            raise RuntimeError("simulated inference failure")
+        with job.lock:
+            job.status = "completed"
+            job.stage = "completed"
+            job.progress = 100.0
+            job.finished_at = time.time()
+
+    monkeypatch.setattr(manager, "_build_enhancement_job", build_job)
+    monkeypatch.setattr(manager, "_run", run_job)
+
+    batch = manager.create_batch(sources, target="1080p")
+    assert batch.worker is not None
+    batch.worker.join(timeout=5)
+
+    snapshot = batch.snapshot()
+    assert execution_order == ["first.mp4", "broken.mp4", "last.mp4"]
+    assert snapshot["status"] == "completed_with_errors"
+    assert snapshot["progress"] == 100.0
+    assert snapshot["completed_count"] == 2
+    assert snapshot["failed_count"] == 1
+    assert [item["status"] for item in snapshot["items"]] == [
+        "completed",
+        "failed",
+        "completed",
+    ]
+    assert snapshot["items"][1]["error"] == "simulated inference failure"
+    assert all(item["job_id"] for item in snapshot["items"])
+
+
+def test_ai_batch_cancel_stops_current_item_and_cancels_the_queue(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        compute_backend="mps",
+        inference_runner=lambda _job, _output: None,
+    )
+    sources = [
+        VideoSource(
+            id=f"source-{index}",
+            path=tmp_path / name,
+            metadata={"duration": 10.0, "fps": 30.0},
+        )
+        for index, name in enumerate(("first.mp4", "second.mp4"))
+    ]
+    current_started = threading.Event()
+    execution_order: list[str] = []
+
+    def build_job(
+        source: VideoSource,
+        *,
+        target: str,
+        model_id: str,
+    ) -> AIEnhancementJob:
+        return AIEnhancementJob(
+            id=f"job-{source.id}",
+            source=source,
+            target=ai_module.AI_TARGETS[target],
+            output_path=source.path.with_name(f"{source.path.stem}-output.mp4"),
+            expected_width=1920,
+            expected_height=1080,
+            model_id=model_id,
+        )
+
+    def run_job(job: AIEnhancementJob) -> None:
+        execution_order.append(job.source.path.name)
+        with job.lock:
+            job.status = "running"
+            job.stage = "inference"
+            job.started_at = time.time()
+        current_started.set()
+        assert job.cancel_event.wait(5)
+        with job.lock:
+            job.status = "cancelled"
+            job.stage = "cancelled"
+            job.finished_at = time.time()
+
+    monkeypatch.setattr(manager, "_build_enhancement_job", build_job)
+    monkeypatch.setattr(manager, "_run", run_job)
+
+    batch = manager.create_batch(sources, target="1080p")
+    assert current_started.wait(5)
+    with pytest.raises(MediaError, match="Another AI enhancement job is already running"):
+        manager.create_batch(sources, target="1080p")
+    manager.cancel_batch(batch.id)
+    assert batch.worker is not None
+    batch.worker.join(timeout=5)
+
+    snapshot = batch.snapshot()
+    assert snapshot["status"] == "cancelled"
+    assert snapshot["cancelled_count"] == 2
+    assert execution_order == ["first.mp4"]
+    assert [item["status"] for item in snapshot["items"]] == [
+        "cancelled",
+        "cancelled",
+    ]
+
+
+def test_ai_batch_cancel_after_last_item_completes_keeps_completed_status(
+    monkeypatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+        compute_backend="mps",
+        inference_runner=lambda _job, _output: None,
+    )
+    source = VideoSource(
+        id="source",
+        path=tmp_path / "source.mp4",
+        metadata={"duration": 10.0, "fps": 30.0},
+    )
+    child_completed = threading.Event()
+    release_child = threading.Event()
+
+    def build_job(
+        selected_source: VideoSource,
+        *,
+        target: str,
+        model_id: str,
+    ) -> AIEnhancementJob:
+        return AIEnhancementJob(
+            id="job-source",
+            source=selected_source,
+            target=ai_module.AI_TARGETS[target],
+            output_path=selected_source.path.with_name("source-output.mp4"),
+            expected_width=1920,
+            expected_height=1080,
+            model_id=model_id,
+        )
+
+    def run_job(job: AIEnhancementJob) -> None:
+        with job.lock:
+            job.status = "completed"
+            job.stage = "completed"
+            job.progress = 100.0
+            job.started_at = time.time()
+            job.finished_at = time.time()
+        child_completed.set()
+        assert release_child.wait(5)
+
+    monkeypatch.setattr(manager, "_build_enhancement_job", build_job)
+    monkeypatch.setattr(manager, "_run", run_job)
+
+    batch = manager.create_batch([source], target="1080p")
+    assert child_completed.wait(5)
+    manager.cancel_batch(batch.id)
+    release_child.set()
+    assert batch.worker is not None
+    batch.worker.join(timeout=5)
+
+    snapshot = batch.snapshot()
+    assert snapshot["status"] == "completed"
+    assert snapshot["completed_count"] == 1
+    assert snapshot["cancelled_count"] == 0
+    assert [item["status"] for item in snapshot["items"]] == ["completed"]
+
+
+def test_ai_batch_snapshot_does_not_expose_completed_child_as_current(
+    tmp_path: Path,
+) -> None:
+    sources = [
+        VideoSource(
+            id=f"source-{index}",
+            path=tmp_path / f"source-{index}.mp4",
+            metadata={"duration": 10.0, "fps": 30.0},
+        )
+        for index in range(2)
+    ]
+    completed_job = AIEnhancementJob(
+        id="job-completed",
+        source=sources[0],
+        target=ai_module.AI_TARGETS["1080p"],
+        output_path=tmp_path / "completed.mp4",
+        expected_width=1920,
+        expected_height=1080,
+        status="completed",
+        stage="completed",
+        progress=100.0,
+        finished_at=time.time(),
+    )
+    items = [
+        ai_module.AIEnhancementBatchItem(
+            id="item-completed",
+            source=sources[0],
+            job=completed_job,
+        ),
+        ai_module.AIEnhancementBatchItem(
+            id="item-queued",
+            source=sources[1],
+        ),
+    ]
+    batch = ai_module.AIEnhancementBatchJob(
+        id="batch",
+        target="1080p",
+        model_id=ai_module.DEFAULT_AI_MODEL_ID,
+        items=items,
+        status="running",
+        stage="running",
+        current_index=0,
+        started_at=time.time(),
+    )
+
+    snapshot = batch.snapshot()
+
+    assert snapshot["status"] == "running"
+    assert snapshot["current_index"] is None
+    assert snapshot["current_item_id"] is None
+    assert snapshot["queued_count"] == 1
+    assert snapshot["eta_state"] == "unavailable"
+    assert snapshot["estimated_remaining_seconds"] is None
+
+
+def test_ai_batch_eta_includes_the_remaining_queue(tmp_path: Path) -> None:
+    sources = [
+        VideoSource(
+            id=f"source-{index}",
+            path=tmp_path / f"source-{index}.mp4",
+            metadata={"duration": 10.0, "fps": 30.0},
+        )
+        for index in range(2)
+    ]
+    running_job = AIEnhancementJob(
+        id="job-running",
+        source=sources[0],
+        target=ai_module.AI_TARGETS["1080p"],
+        output_path=tmp_path / "running.mp4",
+        expected_width=1920,
+        expected_height=1080,
+        status="running",
+        stage="inference",
+        progress=50.0,
+        started_at=time.time(),
+    )
+
+    class StableEta:
+        @staticmethod
+        def reading() -> ai_module._RemainingTimeReading:
+            return ai_module._RemainingTimeReading(
+                "stable",
+                5,
+                seconds=10.0,
+                lower_seconds=8.0,
+                upper_seconds=12.0,
+                confidence="high",
+            )
+
+    running_job.eta_estimator = StableEta()  # type: ignore[assignment]
+    batch = ai_module.AIEnhancementBatchJob(
+        id="batch",
+        target="1080p",
+        model_id=ai_module.DEFAULT_AI_MODEL_ID,
+        items=[
+            ai_module.AIEnhancementBatchItem(
+                id="item-running",
+                source=sources[0],
+                job=running_job,
+            ),
+            ai_module.AIEnhancementBatchItem(
+                id="item-queued",
+                source=sources[1],
+            ),
+        ],
+        status="running",
+        stage="inference",
+        current_index=0,
+        started_at=time.time(),
+    )
+
+    snapshot = batch.snapshot()
+
+    assert snapshot["progress"] == 25.0
+    assert snapshot["eta_includes_queued_items"] is True
+    assert snapshot["estimated_remaining_seconds"] == 30.0
+    assert snapshot["estimated_remaining_lower_seconds"] == 24.0
+    assert snapshot["estimated_remaining_upper_seconds"] == 36.0
+    assert snapshot["eta_confidence"] == "low"
+
+
 def test_ai_create_rejects_missing_source_directory(
     monkeypatch,
     tmp_path: Path,

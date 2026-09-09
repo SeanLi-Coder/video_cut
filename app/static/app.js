@@ -85,6 +85,11 @@ const state = {
   maxFrameSeconds: DEFAULT_MAX_FRAME_SECONDS,
   outputDirectory: "",
   video: null,
+  aiBatchVideos: [],
+  aiBatchSelectionErrors: [],
+  aiBatchActive: false,
+  aiBatchSnapshot: null,
+  aiBatchNotifiedFailures: new Set(),
   selectingVideo: false,
   selectingDirectory: false,
   previewTimer: null,
@@ -141,6 +146,10 @@ const elements = {
   exportCard: byId("export-card"),
   sourceEmpty: byId("source-empty"),
   selectedFile: byId("selected-file"),
+  sourceHeading: byId("source-heading"),
+  sourceDescription: byId("source-description"),
+  sourceEmptyTitle: byId("source-empty-title"),
+  sourceEmptyHint: byId("source-empty-hint"),
   selectVideoButton: byId("select-video-button"),
   replaceVideoButton: byId("replace-video-button"),
   videoName: byId("video-name"),
@@ -149,6 +158,11 @@ const elements = {
   videoResolution: byId("video-resolution"),
   videoFps: byId("video-fps"),
   videoCodecs: byId("video-codecs"),
+  aiBatchSelection: byId("ai-batch-selection"),
+  aiBatchSelectionTitle: byId("ai-batch-selection-title"),
+  aiBatchSelectionSummary: byId("ai-batch-selection-summary"),
+  aiBatchFileList: byId("ai-batch-file-list"),
+  aiBatchSelectionErrors: byId("ai-batch-selection-errors"),
   trimHeading: byId("trim-heading"),
   trimDescription: byId("trim-description"),
   durationLabel: byId("duration-label"),
@@ -247,6 +261,7 @@ const elements = {
   exportProgressTrack: byId("export-progress-track"),
   exportProgressBar: byId("export-progress-bar"),
   exportProgressMessage: byId("export-progress-message"),
+  aiBatchProgressSummary: byId("ai-batch-progress-summary"),
   exportElapsed: byId("export-elapsed"),
   exportRemaining: byId("export-remaining"),
   cancelExportButton: byId("cancel-export-button"),
@@ -254,6 +269,7 @@ const elements = {
   completedOutputName: byId("completed-output-name"),
   completedOutputPath: byId("completed-output-path"),
   completionSummary: byId("completion-summary"),
+  aiBatchResultList: byId("ai-batch-result-list"),
   revealOutputButton: byId("reveal-output-button"),
   continueButton: byId("continue-button"),
   toast: byId("toast"),
@@ -831,7 +847,7 @@ function formatEtaDuration(value) {
 function formatAiRemainingRange(
   lowerValue,
   upperValue,
-  { volatile = false, confidence = "" } = {},
+  { volatile = false, confidence = "", label = "AI 生成预计还需" } = {},
 ) {
   const lower = Math.max(0, Number(lowerValue) || 0);
   const upper = Math.max(lower, Number(upperValue) || 0);
@@ -842,7 +858,7 @@ function formatAiRemainingRange(
     ? formatEtaDuration(roundedUpper)
     : `${formatEtaDuration(roundedLower)}–${formatEtaDuration(roundedUpper)}`;
   const note = volatile ? "（速度有波动）" : confidence === "low" ? "（初步估算）" : "";
-  return `AI 生成预计还需：约 ${range}${note}`;
+  return `${label}：约 ${range}${note}`;
 }
 
 function remainingTimeText(snapshot, { cancelling = false } = {}) {
@@ -853,8 +869,9 @@ function remainingTimeText(snapshot, { cancelling = false } = {}) {
   if (!active) return "";
   const aiEstimate = snapshot?.eta_scope === "ai_generation" || snapshot?.operation === "enhance";
   if (aiEstimate) {
+    const estimatePrefix = snapshot?.eta_includes_queued_items ? "整批 AI 生成预计" : "AI 生成预计";
     if (["verify", "verifying", "remux", "finalize", "finalizing"].includes(stage)
-      || normalizeProgress(snapshot?.progress) >= 90) {
+      || (!snapshot?.eta_includes_queued_items && normalizeProgress(snapshot?.progress) >= 90)) {
       return "AI 画面已生成：正在校验并封装…";
     }
     const etaState = String(snapshot?.eta_state || "").toLowerCase();
@@ -862,12 +879,12 @@ function remainingTimeText(snapshot, { cancelling = false } = {}) {
       return "AI 画面已生成：正在校验并封装…";
     }
     if (etaState === "recalibrating") {
-      return "AI 生成预计：速度有变化，正在重新校准…";
+      return `${estimatePrefix}：速度有变化，正在重新校准…`;
     }
     if (etaState === "calibrating" || stage !== "inference") {
       return stage === "inference"
-        ? "AI 生成预计：正在校准，取得足够的实际处理样本后显示…"
-        : "AI 生成预计：等待实际处理开始…";
+        ? `${estimatePrefix}：正在校准，取得足够的实际处理样本后显示…`
+        : `${estimatePrefix}：等待实际处理开始…`;
     }
     const lower = Number(snapshot?.estimated_remaining_lower_seconds);
     const upper = Number(snapshot?.estimated_remaining_upper_seconds);
@@ -875,9 +892,10 @@ function remainingTimeText(snapshot, { cancelling = false } = {}) {
       return formatAiRemainingRange(lower, upper, {
         volatile: etaState === "volatile",
         confidence: String(snapshot?.eta_confidence || "").toLowerCase(),
+        label: `${estimatePrefix}还需`,
       });
     }
-    return "AI 生成预计：正在校准处理速度…";
+    return `${estimatePrefix}：正在校准处理速度…`;
   }
   if (["verify", "verifying", "remux", "finalize", "finalizing"].includes(stage)
     || normalizeProgress(snapshot?.progress) >= 99) {
@@ -910,6 +928,36 @@ function aiFeaturesAvailable() {
 
 function isEnhanceMode() {
   return aiFeaturesAvailable() && state.operation === "enhance";
+}
+
+function enhancementVideos() {
+  if (!isEnhanceMode()) return state.video ? [state.video] : [];
+  if (state.aiBatchVideos.length) return state.aiBatchVideos;
+  return state.video ? [state.video] : [];
+}
+
+function isAiBatchSelection() {
+  return isEnhanceMode() && enhancementVideos().length > 1;
+}
+
+function aiBatchItemStatusLabel(status) {
+  const normalized = String(status || "queued").toLowerCase();
+  if (["running", "processing", "inference", "setup", "inspect", "remux", "verify"].includes(normalized)) return "处理中";
+  if (["completed", "complete", "done", "success", "succeeded"].includes(normalized)) return "已完成";
+  if (["failed", "error", "failure"].includes(normalized)) return "失败";
+  if (["cancelled", "canceled", "skipped"].includes(normalized)) return "已取消";
+  return "等待中";
+}
+
+function aiBatchItems() {
+  return Array.isArray(state.aiBatchSnapshot?.items) ? state.aiBatchSnapshot.items : [];
+}
+
+function aiBatchItemForVideo(video, index) {
+  const items = aiBatchItems();
+  return items.find((item) => String(item.video_id || item.source_id || "") === String(video?.id || ""))
+    || items[index]
+    || null;
 }
 
 function usesSourceDirectory() {
@@ -1057,9 +1105,9 @@ function normalizeAiTarget(value) {
   };
 }
 
-function videoAiTargets() {
-  if (!state.video) return [];
-  const configured = state.video.ai_targets;
+function configuredAiTargets(video) {
+  if (!video) return [];
+  const configured = video.ai_targets;
   const values = Array.isArray(configured)
     ? configured
     : configured && typeof configured === "object"
@@ -1074,6 +1122,33 @@ function videoAiTargets() {
     if (!item || seen.has(item.target)) return false;
     seen.add(item.target);
     return true;
+  });
+}
+
+function videoAiTargets() {
+  const videos = enhancementVideos();
+  if (!videos.length) return [];
+  const targetsByVideo = videos.map((video) => new Map(
+    configuredAiTargets(video).map((item) => [item.target, item]),
+  ));
+  return Object.keys(AI_TARGETS).map((target) => {
+    const entries = targetsByVideo.map((targets) => targets.get(target) || null);
+    const unavailableIndexes = entries
+      .map((item, index) => (!item?.available ? index : -1))
+      .filter((index) => index >= 0);
+    const first = entries.find(Boolean) || { target, available: false };
+    const warning = Array.from(new Set(entries.map((item) => item?.warning).filter(Boolean))).join("；");
+    if (!unavailableIndexes.length) return { ...first, target, available: true, warning };
+    const examples = unavailableIndexes.slice(0, 2).map((index) => videos[index]?.name || `第 ${index + 1} 个视频`);
+    const remaining = unavailableIndexes.length - examples.length;
+    const sourceReason = entries[unavailableIndexes[0]]?.reason || "该目标会降低原片分辨率或素材不兼容";
+    return {
+      ...first,
+      target,
+      available: false,
+      warning,
+      reason: `${examples.join("、")}${remaining > 0 ? `等 ${unavailableIndexes.length} 个文件` : ""}：${sourceReason}`,
+    };
   });
 }
 
@@ -1211,14 +1286,20 @@ function renderFieldErrors(range) {
 }
 
 function renderRangeSummary(range) {
-  const duration = state.video ? Number(state.video.duration) : 0;
+  const duration = isEnhanceMode()
+    ? enhancementVideos().reduce((total, video) => total + (Number(video.duration) || 0), 0)
+    : state.video ? Number(state.video.duration) : 0;
   if (isEnhanceMode()) {
     elements.clipDuration.textContent = range.valid && state.enhanceTarget ? aiTargetLabel() : "—";
     elements.rangeReadout.style.setProperty("--range-start", "0%");
     elements.rangeReadout.style.setProperty("--range-width", range.valid ? "100%" : "0%");
     elements.rangeReadout.setAttribute(
       "aria-label",
-      range.valid ? `整段视频将使用 AI 增强到 ${aiTargetLabel()}` : "尚未选择可增强的视频",
+      range.valid
+        ? enhancementVideos().length > 1
+          ? `${enhancementVideos().length} 个视频将依次使用 AI 增强到 ${aiTargetLabel()}`
+          : `整段视频将使用 AI 增强到 ${aiTargetLabel()}`
+        : "尚未选择可增强的视频",
     );
     elements.rangeTotal.textContent = duration > 0 ? formatShortTime(duration) : "—";
     elements.suggestedOutputName.textContent = range.valid && state.enhanceTarget
@@ -1276,6 +1357,9 @@ function makeSuggestedOutputName(range) {
     return `${stem}_rotated_${state.rotationDegrees}${extension}`;
   }
   if (isEnhanceMode()) {
+    if (isAiBatchSelection()) {
+      return `${enhancementVideos().length} 个文件将分别生成 _ai_${state.enhanceTarget || "enhanced"} 新视频`;
+    }
     const suggested = selectedAiTarget()?.suggestedOutputName
       || `${stem}_ai_${state.enhanceTarget || "enhanced"}.mp4`;
     const model = selectedAiModel();
@@ -1840,6 +1924,8 @@ function renderModeCopy() {
   const rotate = isRotateMode();
   const enhance = isEnhanceMode();
   const sourceDirectory = rotate || enhance;
+  const batchCount = enhancementVideos().length;
+  const batch = enhance && batchCount > 1;
   const aiModel = selectedAiModel();
   const aiModelName = aiModel?.name || "AI 模型";
   const aiRuntime = selectedAiRuntime();
@@ -1850,6 +1936,16 @@ function renderModeCopy() {
   elements.timePanel.hidden = rotate || enhance;
   elements.rotationPanel.hidden = !rotate;
   elements.aiPanel.hidden = !enhance;
+  elements.sourceHeading.textContent = enhance ? "选择一个或多个本地视频" : "选择本地视频";
+  elements.sourceDescription.textContent = enhance
+    ? "支持一次多选；所有视频只在本机按顺序处理，不会上传到网络。"
+    : "支持常见视频格式，文件不会上传到网络。";
+  elements.sourceEmptyTitle.textContent = enhance ? "从这台电脑中选择一个或多个视频" : "先从这台电脑中选一个视频";
+  elements.sourceEmptyHint.textContent = enhance ? "可在系统窗口中按 Ctrl 或 Shift 多选" : "将打开系统文件选择窗口";
+  const selectVideoLabel = elements.selectVideoButton.querySelector(".button-label");
+  const replaceVideoLabel = elements.replaceVideoButton.querySelector(".button-label");
+  if (selectVideoLabel) selectVideoLabel.textContent = enhance ? "批量选择视频" : "选择视频";
+  if (replaceVideoLabel) replaceVideoLabel.textContent = enhance ? "重新批量选择" : "更换视频";
   elements.pageTitle.textContent = enhance
     ? "让整段视频真正清晰起来"
     : rotate
@@ -1868,7 +1964,9 @@ function renderModeCopy() {
   elements.journeyExportLabel.textContent = enhance ? "确认增强" : rotate ? "确认旋转" : frames ? "确认截图" : "确认导出";
   elements.trimHeading.textContent = enhance ? "选择 AI 超清目标" : rotate ? "选择永久旋转角度" : frames ? "设置截图范围" : "设置剪辑范围";
   elements.trimDescription.textContent = enhance
-    ? "不需要填写时间；整段视频都会处理。下方播放的是原片内容预览，不是 AI 效果预览。"
+    ? batch
+      ? `不需要填写时间；${batchCount} 个视频将依次整段处理。下方先预览队列中的第一个原片。`
+      : "不需要填写时间；整段视频都会处理。下方播放的是原片内容预览，不是 AI 效果预览。"
     : rotate
       ? "不需要填写时间；整段视频都会处理，点击角度后预览立即更新。"
       : frames
@@ -1879,7 +1977,9 @@ function renderModeCopy() {
   elements.frameLimitHint.hidden = !frames;
   elements.exportHeading.textContent = enhance ? "确认并开始 AI 超清" : rotate ? "确认并永久旋转" : frames ? "确认并逐帧截图" : "确认并导出";
   elements.exportDescription.textContent = enhance
-    ? "整段视频会在本机完成 AI 计算，并在原视频同级目录保存为新文件；原视频不会被修改。"
+    ? batch
+      ? `${batchCount} 个视频会在本机逐个完成 AI 计算；单个失败会提示并自动继续，成片分别保存到各自同级目录。`
+      : "整段视频会在本机完成 AI 计算，并在原视频同级目录保存为新文件；原视频不会被修改。"
     : rotate
       ? "生成在原视频同级目录；方向会真正写入画面，原视频不变。"
       : frames
@@ -1894,13 +1994,17 @@ function renderModeCopy() {
         : "保持原分辨率与高品质音频";
   elements.outputNameLabel.textContent = frames ? "文件夹名" : "文件名";
   elements.outputNameNote.textContent = enhance
-    ? "10-bit HEVC · BT.709 SDR；原音频直接复制；同名自动编号"
+    ? batch
+      ? "每个文件单独命名 · 10-bit HEVC · 原音频直接复制"
+      : "10-bit HEVC · BT.709 SDR；原音频直接复制；同名自动编号"
     : rotate
       ? "如遇同名文件会自动添加编号"
       : frames
         ? "图片按 frame_000001 开始顺序编号"
         : "如遇同名文件会自动添加编号";
-  elements.destinationLabel.textContent = sourceDirectory ? "固定保存到原视频同级目录" : "保存到";
+  elements.destinationLabel.textContent = sourceDirectory
+    ? batch ? "分别保存到每个原视频的同级目录" : "固定保存到原视频同级目录"
+    : "保存到";
   elements.rotationNote.textContent = state.rotationDegrees === 360
     ? "360° 看起来方向不变，但仍会重新生成一份已固化、已清除旋转标记的新视频。"
     : state.rotationDegrees === 90 || state.rotationDegrees === 270
@@ -1921,6 +2025,7 @@ function renderModeCopy() {
         : "剪辑完成，原视频未被修改";
   }
   elements.continueButton.textContent = enhance ? "继续增强" : rotate ? "继续旋转" : frames ? "继续截图" : "继续剪辑";
+  renderVideoDetails();
   renderOutputDirectory();
 }
 
@@ -1940,7 +2045,10 @@ function changeOperation(operation) {
   releaseGeneratedPreview();
   clearRotationPreview();
   state.operation = operation;
-  if (isEnhanceMode()) selectDefaultAiTarget();
+  if (isEnhanceMode()) {
+    if (state.video && !state.aiBatchVideos.length) state.aiBatchVideos = [state.video];
+    selectDefaultAiTarget();
+  }
   if (isFrameMode()) setDefaultFrameEnd();
   state.previewReady = false;
   state.activePreviewKey = "";
@@ -1977,11 +2085,21 @@ function resetExportResult() {
   state.exportError = "";
   state.exportJobId = "";
   state.exportOutputName = "";
+  state.aiBatchActive = false;
+  state.aiBatchSnapshot = null;
+  state.aiBatchNotifiedFailures = new Set();
   elements.exportSetup.hidden = false;
   elements.exportProgressPanel.hidden = true;
   elements.exportProgressPanel.classList.remove("is-error");
   elements.exportCompletePanel.hidden = true;
+  elements.exportCompletePanel.classList.remove("has-errors");
+  elements.aiBatchProgressSummary.hidden = true;
+  elements.aiBatchProgressSummary.textContent = "";
+  elements.aiBatchResultList.hidden = true;
+  elements.aiBatchResultList.replaceChildren();
+  elements.revealOutputButton.hidden = false;
   setExportProgress(0);
+  renderAiBatchSelection();
 }
 
 function handleTimeInput(event) {
@@ -2021,11 +2139,152 @@ function handleTimeKeydown(event) {
   if (range.valid) requestPreview(range, { autoplay: true });
 }
 
+function normalizedAiBatchStatus(value) {
+  const status = String(value || "queued").toLowerCase();
+  if (["completed", "complete", "done", "success", "succeeded"].includes(status)) return "completed";
+  if (["failed", "error", "failure"].includes(status)) return "failed";
+  if (["cancelled", "canceled", "skipped"].includes(status)) return "cancelled";
+  if (["running", "processing", "inference", "setup", "inspect", "remux", "verify"].includes(status)) return "running";
+  return "queued";
+}
+
+function aiBatchStatusCounts(snapshot = state.aiBatchSnapshot) {
+  const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
+  const counts = { total: items.length || enhancementVideos().length, completed: 0, failed: 0, cancelled: 0 };
+  for (const item of items) {
+    const status = normalizedAiBatchStatus(item.status);
+    if (status === "completed") counts.completed += 1;
+    else if (status === "failed") counts.failed += 1;
+    else if (status === "cancelled") counts.cancelled += 1;
+  }
+  return counts;
+}
+
+function renderAiBatchSelection() {
+  const videos = enhancementVideos();
+  const visible = isEnhanceMode() && (videos.length > 1 || state.aiBatchSelectionErrors.length > 0);
+  elements.aiBatchSelection.hidden = !visible;
+  if (!visible) {
+    elements.aiBatchFileList.replaceChildren();
+    elements.aiBatchSelectionErrors.hidden = true;
+    return;
+  }
+
+  const counts = aiBatchStatusCounts();
+  elements.aiBatchSelectionTitle.textContent = `批量队列 · ${videos.length} 个视频`;
+  elements.aiBatchSelectionSummary.textContent = state.aiBatchSnapshot
+    ? `已完成 ${counts.completed} · 失败 ${counts.failed}${counts.cancelled ? ` · 已取消 ${counts.cancelled}` : ""}`
+    : "将严格按选择顺序逐个处理；单个失败自动继续";
+
+  const rows = videos.map((video, index) => {
+    const item = aiBatchItemForVideo(video, index);
+    const status = normalizedAiBatchStatus(item?.status);
+    const row = document.createElement("li");
+    row.className = "ai-batch-file-item";
+    row.dataset.status = status;
+
+    const number = document.createElement("span");
+    number.className = "ai-batch-file-index";
+    number.textContent = String(index + 1);
+
+    const copy = document.createElement("span");
+    copy.className = "ai-batch-file-copy";
+    const name = document.createElement("strong");
+    name.textContent = video.name || item?.source_name || `视频 ${index + 1}`;
+    const detail = document.createElement("span");
+    const dimensions = video.width && video.height ? `${video.width} × ${video.height}` : "未知尺寸";
+    const duration = Number(video.duration) > 0 ? formatShortTime(video.duration) : "未知时长";
+    const progress = status === "running" && Number.isFinite(Number(item?.progress))
+      ? ` · ${Math.round(normalizeProgress(item.progress))}%`
+      : "";
+    detail.textContent = item?.error || item?.message || `${dimensions} · ${duration}${progress}`;
+    copy.append(name, detail);
+
+    const badge = document.createElement("span");
+    badge.className = "ai-batch-status";
+    badge.textContent = aiBatchItemStatusLabel(status);
+    row.append(number, copy, badge);
+    return row;
+  });
+  elements.aiBatchFileList.replaceChildren(...rows);
+
+  const selectionErrors = state.aiBatchSelectionErrors;
+  elements.aiBatchSelectionErrors.textContent = selectionErrors.length
+    ? `${selectionErrors.length} 个文件无法加入：${selectionErrors.slice(0, 3).map((item) => `${item.name || item.path_display || "文件"}（${item.error || "无法读取"}）`).join("；")}${selectionErrors.length > 3 ? "……" : ""}`
+    : "";
+  elements.aiBatchSelectionErrors.hidden = !selectionErrors.length;
+}
+
+function renderAiBatchResultList(snapshot = state.aiBatchSnapshot) {
+  const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
+  if (!items.length) {
+    elements.aiBatchResultList.hidden = true;
+    elements.aiBatchResultList.replaceChildren();
+    return;
+  }
+  const rows = items.map((item, index) => {
+    const status = normalizedAiBatchStatus(item.status);
+    const row = document.createElement("li");
+    row.className = "ai-batch-result-item";
+    row.dataset.status = status;
+
+    const badge = document.createElement("span");
+    badge.className = "ai-batch-status";
+    badge.textContent = aiBatchItemStatusLabel(status);
+
+    const copy = document.createElement("span");
+    copy.className = "ai-batch-result-copy";
+    const name = document.createElement("strong");
+    name.textContent = item.source_name || item.name || `视频 ${index + 1}`;
+    const detail = document.createElement("span");
+    detail.textContent = item.error || item.output_path || item.output_name || item.message || "处理结束";
+    copy.append(name, detail);
+    row.append(badge, copy);
+
+    if (status === "completed" && item.job_id) {
+      const reveal = document.createElement("button");
+      reveal.type = "button";
+      reveal.className = "button button-secondary button-compact";
+      reveal.dataset.revealAiJobId = String(item.job_id);
+      reveal.textContent = "显示文件";
+      row.append(reveal);
+    } else {
+      const spacer = document.createElement("span");
+      spacer.setAttribute("aria-hidden", "true");
+      row.append(spacer);
+    }
+    return row;
+  });
+  elements.aiBatchResultList.replaceChildren(...rows);
+  elements.aiBatchResultList.hidden = false;
+}
+
 function renderVideoDetails() {
   const video = state.video;
   elements.sourceEmpty.hidden = Boolean(video);
   elements.selectedFile.hidden = !video;
-  if (!video) return;
+  if (!video) {
+    renderAiBatchSelection();
+    return;
+  }
+
+  const videos = enhancementVideos();
+  if (isEnhanceMode() && videos.length > 1) {
+    const durations = videos.map((item) => Number(item.duration) || 0);
+    const dimensions = new Set(videos.map((item) => `${item.width || "?"} × ${item.height || "?"}`));
+    const frameRates = new Set(videos.map((item) => Number(item.fps) > 0 ? Number(item.fps).toFixed(3) : "?"));
+    const codecs = new Set(videos.map((item) => `${normalizeCodec(item.video_codec)} · ${normalizeCodec(item.audio_codec)}`));
+    elements.videoName.textContent = `已选择 ${videos.length} 个视频`;
+    elements.videoPath.textContent = "将按队列顺序逐个超分；失败项不会阻断后续文件";
+    elements.videoPath.title = videos.map((item) => item.path_display || item.name || "").filter(Boolean).join("\n");
+    elements.videoDuration.textContent = formatTime(durations.reduce((total, duration) => total + duration, 0));
+    elements.videoResolution.textContent = dimensions.size === 1 ? [...dimensions][0] : `${dimensions.size} 种尺寸`;
+    elements.videoFps.textContent = frameRates.size === 1 ? `${Number([...frameRates][0]).toFixed(2).replace(/\.00$/, "")} fps` : "多种帧率";
+    elements.videoCodecs.textContent = codecs.size === 1 ? [...codecs][0] : "多种编码";
+    renderAiBatchSelection();
+    renderOutputDirectory();
+    return;
+  }
 
   elements.videoName.textContent = video.name || "未命名视频";
   elements.videoPath.textContent = video.path_display || "本地文件";
@@ -2035,6 +2294,7 @@ function renderVideoDetails() {
   const fps = Number(video.fps);
   elements.videoFps.textContent = Number.isFinite(fps) && fps > 0 ? `${fps.toFixed(fps % 1 ? 2 : 0)} fps` : "—";
   elements.videoCodecs.textContent = `${normalizeCodec(video.video_codec)} · ${normalizeCodec(video.audio_codec)}`;
+  renderAiBatchSelection();
   renderOutputDirectory();
 }
 
@@ -2046,23 +2306,33 @@ async function selectVideo() {
   renderControls();
 
   try {
-    const result = await post("/api/videos/select");
+    const selectingBatch = isEnhanceMode();
+    const result = await post(selectingBatch ? "/api/videos/select-many" : "/api/videos/select");
     if (result.cancelled) return;
-    if (!result.video || !result.video.id) throw new Error("没有读取到有效的视频信息");
+    const selectedVideos = selectingBatch
+      ? (Array.isArray(result.videos) ? result.videos : result.video ? [result.video] : [])
+      : result.video ? [result.video] : [];
+    if (!selectedVideos.length || !selectedVideos[0]?.id) {
+      const errors = Array.isArray(result.errors) ? result.errors : [];
+      throw new Error(errors[0]?.error || "没有读取到有效的视频信息");
+    }
+    const selectedVideo = selectedVideos[0];
 
     cancelPendingPreview();
     stopExportPolling();
     resetExportResult();
-    state.video = result.video;
+    state.video = selectedVideo;
+    state.aiBatchVideos = selectingBatch ? selectedVideos : [];
+    state.aiBatchSelectionErrors = selectingBatch && Array.isArray(result.errors) ? result.errors : [];
     state.mediaFallbackAttempted = false;
     state.previewReady = false;
-    state.previewMode = result.video.preview_mode || "direct";
+    state.previewMode = selectedVideo.preview_mode || "direct";
     state.previewUrl = "";
     state.activePreviewKey = "";
     state.enhanceTarget = "";
     selectDefaultAiTarget();
 
-    const duration = Number(result.video.duration);
+    const duration = Number(selectedVideo.duration);
     const suggestedStart = parseTime(result.suggested_start);
     const suggestedEnd = parseTime(result.suggested_end);
     const start = suggestedStart === null ? 0 : suggestedStart;
@@ -2084,8 +2354,8 @@ async function selectVideo() {
       renderControls();
 
       try {
-        if (!result.video.preview_url) throw new Error("没有可直接播放的预览");
-        await loadMedia(result.video.preview_url, result.video.preview_mode || "direct", range, { autoplay: false });
+        if (!selectedVideo.preview_url) throw new Error("没有可直接播放的预览");
+        await loadMedia(selectedVideo.preview_url, selectedVideo.preview_mode || "direct", range, { autoplay: false });
         state.previewReady = true;
         setPreviewLoading(false);
         setPreviewStatus(
@@ -2100,7 +2370,12 @@ async function selectVideo() {
       }
     }
 
-    showToast(`已选择“${result.video.name || "视频"}”`);
+    if (selectingBatch && selectedVideos.length > 1) {
+      const skipped = state.aiBatchSelectionErrors.length;
+      showToast(`已加入 ${selectedVideos.length} 个视频${skipped ? `；另有 ${skipped} 个无法读取` : ""}`);
+    } else {
+      showToast(`已选择“${selectedVideo.name || "视频"}”`);
+    }
   } catch (error) {
     if (!error || error.name !== "AbortError") {
       showToast(error.message || "选择视频失败", "error");
@@ -2140,6 +2415,14 @@ function renderOutputDirectory() {
   const sourceDirectory = usesSourceDirectory();
   elements.selectDirectoryButton.hidden = sourceDirectory;
   if (sourceDirectory) {
+    if (isAiBatchSelection()) {
+      elements.outputDirectory.textContent = `${enhancementVideos().length} 个原视频各自的同级目录`;
+      elements.outputDirectory.title = enhancementVideos()
+        .map((video) => video.directory_display || video.path_display || "")
+        .filter(Boolean)
+        .join("\n");
+      return;
+    }
     const directory = state.video && state.video.directory_display;
     elements.outputDirectory.textContent = directory || "选择视频后自动使用原视频同级目录";
     elements.outputDirectory.title = directory || "";
@@ -3020,6 +3303,7 @@ function handleWorkspaceTabKeydown(event) {
 function exportApiBase() {
   if (isFrameMode()) return "/api/frame-exports";
   if (isRotateMode()) return "/api/rotations";
+  if (isEnhanceMode() && state.aiBatchActive) return "/api/ai-enhancement-batches";
   if (isEnhanceMode()) return "/api/ai-enhancements";
   return "/api/exports";
 }
@@ -3036,23 +3320,27 @@ function setExportProgress(value, remainingText = "") {
 function showExportProgress() {
   const model = selectedAiModel();
   const modelSize = Math.max(0, Number(model?.download_size_bytes) || 0);
+  const batchCount = enhancementVideos().length;
+  const batch = isEnhanceMode() && state.aiBatchActive && batchCount > 1;
   elements.exportSetup.hidden = true;
   elements.exportCompletePanel.hidden = true;
   elements.exportProgressPanel.hidden = false;
   elements.exportProgressPanel.classList.remove("is-error");
   elements.cancelExportButton.hidden = false;
   elements.cancelExportButton.disabled = false;
-  elements.cancelExportButton.textContent = `取消${operationVerb()}`;
+  elements.cancelExportButton.textContent = batch ? "停止批量超清" : `取消${operationVerb()}`;
   elements.exportProgressKicker.textContent = "正在准备";
   elements.exportProgressTitle.textContent = isEnhanceMode()
-    ? "正在准备 AI 超清…"
+    ? batch ? `正在准备 ${batchCount} 个视频的批量超清…` : "正在准备 AI 超清…"
     : isRotateMode()
     ? "正在永久旋转视频…"
     : isFrameMode()
       ? "正在逐帧截图…"
       : "正在导出视频…";
   elements.exportProgressMessage.textContent = isEnhanceMode()
-    ? modelRuntimePrepared()
+    ? batch
+      ? `${model?.name || "AI 模型"} 将严格串行处理队列；任何一个视频失败都会记录原因并自动继续。`
+      : modelRuntimePrepared()
       ? `${model?.name || "AI 模型"} 已经提前准备完成，正在加载并开始整段 AI 计算。`
       : model?.id === DEFAULT_AI_MODEL_ID
         ? `首次使用会准备环境并下载${modelSize > 0 ? `约 ${formatBytes(modelSize)} 的` : "所选"}模型，之后开始整段 AI 计算。`
@@ -3064,6 +3352,8 @@ function showExportProgress() {
       : "正在安全地创建新文件，请不要关闭此页面。";
   elements.exportElapsed.textContent = "";
   elements.exportRemaining.textContent = "预计还需：正在估算…";
+  elements.aiBatchProgressSummary.hidden = !batch;
+  elements.aiBatchProgressSummary.textContent = batch ? `队列共 ${batchCount} 个 · 等待第 1 个任务开始` : "";
   setExportProgress(0, elements.exportRemaining.textContent);
 }
 
@@ -3072,10 +3362,15 @@ async function startExport() {
   if (!canExport(range)) return;
 
   cancelPendingPreview();
+  const batchVideos = enhancementVideos();
+  state.aiBatchActive = isEnhanceMode() && batchVideos.length > 1;
+  state.aiBatchSnapshot = null;
+  state.aiBatchNotifiedFailures = new Set();
   state.exporting = true;
   state.cancellingExport = false;
   state.exportCompleted = false;
   state.exportError = "";
+  state.exportJobId = "";
   state.exportPollFailures = 0;
   state.exportPollSerial += 1;
   const pollSerial = state.exportPollSerial;
@@ -3085,7 +3380,13 @@ async function startExport() {
 
   try {
     const body = isEnhanceMode()
-      ? {
+      ? state.aiBatchActive
+        ? {
+          video_ids: batchVideos.map((video) => video.id),
+          target: state.enhanceTarget,
+          model_id: state.selectedAiModelId,
+        }
+        : {
           video_id: state.video.id,
           target: state.enhanceTarget,
           model_id: state.selectedAiModelId,
@@ -3094,9 +3395,20 @@ async function startExport() {
       ? { video_id: state.video.id, degrees: state.rotationDegrees }
       : { video_id: state.video.id, start: range.start, end: range.end };
     const result = await post(exportApiBase(), body);
-    if (!result.job_id) throw new Error("本地服务没有创建导出任务");
-    state.exportJobId = result.job_id;
-    state.exportOutputName = result.output_name || makeSuggestedOutputName(range);
+    const createdId = state.aiBatchActive ? result.batch_id || result.job_id : result.job_id;
+    if (!createdId) throw new Error("本地服务没有创建导出任务");
+    state.exportJobId = createdId;
+    state.exportOutputName = state.aiBatchActive
+      ? `${batchVideos.length} 个视频的批量超清`
+      : result.output_name || makeSuggestedOutputName(range);
+    if (state.cancellingExport) {
+      try {
+        await post(`${exportApiBase()}/${encodeURIComponent(state.exportJobId)}/cancel`);
+      } catch (cancelError) {
+        restoreCancelExportButton();
+        showToast(cancelError.message || "取消失败，任务将继续运行", "error");
+      }
+    }
     await pollExport(pollSerial);
   } catch (error) {
     if (pollSerial !== state.exportPollSerial) return;
@@ -3109,6 +3421,94 @@ function scheduleExportPoll(pollSerial, delay = EXPORT_POLL_MS) {
   state.exportPollTimer = window.setTimeout(() => pollExport(pollSerial), delay);
 }
 
+function updateAiBatchSnapshot(snapshot) {
+  state.aiBatchSnapshot = snapshot && typeof snapshot === "object" ? snapshot : null;
+  renderAiBatchSelection();
+  const items = aiBatchItems();
+  const counts = aiBatchStatusCounts();
+  const runningIndex = items.findIndex((item) => normalizedAiBatchStatus(item.status) === "running");
+  const declaredIndex = snapshot?.current_index == null ? -1 : Number(snapshot.current_index);
+  const declaredItemIsRunning = Number.isInteger(declaredIndex)
+    && declaredIndex >= 0
+    && declaredIndex < items.length
+    && normalizedAiBatchStatus(items[declaredIndex]?.status) === "running";
+  const currentIndex = runningIndex >= 0
+    ? runningIndex
+    : declaredItemIsRunning
+      ? declaredIndex
+      : -1;
+  const current = currentIndex >= 0 ? items[currentIndex] : null;
+  elements.aiBatchProgressSummary.hidden = false;
+  elements.aiBatchProgressSummary.textContent = current
+    ? `当前第 ${currentIndex + 1}/${counts.total} 个 · 已完成 ${counts.completed} · 失败 ${counts.failed}`
+    : `队列共 ${counts.total} 个 · 已完成 ${counts.completed} · 失败 ${counts.failed}${counts.cancelled ? ` · 已取消 ${counts.cancelled}` : ""}`;
+
+  const newFailures = [];
+  for (const [index, item] of items.entries()) {
+    if (normalizedAiBatchStatus(item.status) !== "failed") continue;
+    const key = String(item.job_id || item.video_id || item.source_id || index);
+    if (state.aiBatchNotifiedFailures.has(key)) continue;
+    state.aiBatchNotifiedFailures.add(key);
+    const name = item.source_name || item.name || `第 ${index + 1} 个视频`;
+    newFailures.push(name);
+  }
+  const terminal = ["completed", "completed_with_errors", "cancelled", "canceled", "failed"].includes(
+    String(snapshot?.status || "").toLowerCase(),
+  );
+  if (newFailures.length && !terminal) {
+    showToast(
+      newFailures.length === 1
+        ? `“${newFailures[0]}”处理失败，已记录原因并自动继续下一个`
+        : `${newFailures.length} 个视频处理失败，已记录各自原因并自动继续队列`,
+      "error",
+    );
+  }
+  return { items, counts, current, currentIndex };
+}
+
+function finishAiBatch(snapshot, { cancelled = false } = {}) {
+  stopExportPolling();
+  const { counts } = updateAiBatchSnapshot(snapshot);
+  const topLevelError = String(snapshot?.error || "").trim();
+  const hasIssues = counts.failed > 0 || counts.cancelled > 0 || Boolean(topLevelError);
+  state.exporting = false;
+  state.cancellingExport = false;
+  state.exportCompleted = true;
+  state.exportError = "";
+  state.exportOutputName = `成功 ${counts.completed} 个 · 失败 ${counts.failed} 个${counts.cancelled ? ` · 取消 ${counts.cancelled} 个` : ""}`;
+
+  if (!cancelled) setExportProgress(100);
+  elements.exportProgressPanel.hidden = true;
+  elements.exportSetup.hidden = true;
+  elements.exportCompletePanel.hidden = false;
+  elements.exportCompletePanel.classList.toggle("has-errors", hasIssues || cancelled);
+  elements.completionSummary.textContent = cancelled
+    ? `已停止批量超清：${counts.completed} 个成功，${counts.failed} 个失败，${counts.cancelled} 个已取消`
+    : topLevelError
+      ? `批量超清意外停止：${counts.completed} 个成功，${counts.failed} 个失败，${counts.cancelled} 个未处理。${topLevelError}`
+      : hasIssues
+      ? `批量超清已结束：${counts.completed} 个成功，${counts.failed} 个失败${counts.cancelled ? `，${counts.cancelled} 个已取消` : ""}；单项问题没有阻断后续文件`
+      : `批量超清完成，共 ${counts.completed} 个视频，原视频均未修改`;
+  elements.completedOutputName.textContent = state.exportOutputName;
+  elements.completedOutputPath.textContent = "成功成片分别保存在各自原视频的同级目录";
+  elements.completedOutputPath.title = elements.completedOutputPath.textContent;
+  elements.revealOutputButton.hidden = true;
+  renderAiBatchResultList(snapshot);
+  showToast(
+    cancelled
+      ? `已停止批量 AI 超清；已保留 ${counts.completed} 个成片`
+      : topLevelError
+        ? `批量任务意外停止：成功 ${counts.completed} 个，失败 ${counts.failed} 个，未处理 ${counts.cancelled} 个`
+        : hasIssues
+        ? `批量任务已结束：成功 ${counts.completed} 个，失败 ${counts.failed} 个${counts.cancelled ? `，取消 ${counts.cancelled} 个` : ""}`
+        : `批量 AI 超清完成，共生成 ${counts.completed} 个视频`,
+    hasIssues || cancelled ? "error" : "success",
+  );
+  renderControls();
+  renderModelManager();
+  void refreshModelDownloadStatus({ reconnect: false });
+}
+
 async function pollExport(pollSerial) {
   if (!state.exportJobId || pollSerial !== state.exportPollSerial) return;
 
@@ -3116,6 +3516,7 @@ async function pollExport(pollSerial) {
     const job = await apiRequest(`${exportApiBase()}/${encodeURIComponent(state.exportJobId)}`);
     if (pollSerial !== state.exportPollSerial) return;
     state.exportPollFailures = 0;
+    const batchState = state.aiBatchActive ? updateAiBatchSnapshot(job) : null;
 
     const status = String(job.status || "running").toLowerCase();
     const stage = String(job.stage || job.phase || status).toLowerCase();
@@ -3132,7 +3533,7 @@ async function pollExport(pollSerial) {
     if (["queued", "pending", "waiting"].includes(status)) {
       elements.exportProgressKicker.textContent = "等待处理";
       elements.exportProgressTitle.textContent = isEnhanceMode()
-        ? "正在排队准备 AI 超清…"
+        ? state.aiBatchActive ? "正在排队准备批量 AI 超清…" : "正在排队准备 AI 超清…"
         : isRotateMode()
         ? "正在准备旋转…"
         : isFrameMode()
@@ -3164,13 +3565,15 @@ async function pollExport(pollSerial) {
       const aiCopy = aiStageCopy[stage] || ["本机处理中", "正在进行 AI 超清…", `${aiModelName} 正在本机处理整段视频。`];
       elements.exportProgressKicker.textContent = isEnhanceMode() ? aiCopy[0] : "本机处理中";
       elements.exportProgressTitle.textContent = isEnhanceMode()
-        ? aiCopy[1]
+        ? state.aiBatchActive && batchState?.current
+          ? `第 ${batchState.currentIndex + 1}/${batchState.counts.total} 个：${batchState.current.source_name || batchState.current.name || "视频"}`
+          : aiCopy[1]
         : isRotateMode()
         ? "正在永久旋转视频…"
         : isFrameMode()
           ? "正在逐帧截图…"
           : "正在导出视频…";
-      elements.exportProgressMessage.textContent = job.message || (isEnhanceMode()
+      elements.exportProgressMessage.textContent = (state.aiBatchActive && batchState?.current?.message) || job.message || (isEnhanceMode()
         ? aiCopy[2]
         : isRotateMode()
         ? "正在将方向写入画面并原样复制音频。"
@@ -3181,13 +3584,22 @@ async function pollExport(pollSerial) {
       return;
     }
 
+    if (state.aiBatchActive && ["completed", "completed_with_errors", "complete", "done", "success", "succeeded"].includes(status)) {
+      finishAiBatch(job);
+      return;
+    }
+
     if (["completed", "complete", "done", "success", "succeeded"].includes(status)) {
       finishExportSuccessfully(job);
       return;
     }
 
     if (["cancelled", "canceled"].includes(status)) {
-      finishCancelledExport();
+      if (state.aiBatchActive) {
+        finishAiBatch(job, { cancelled: true });
+      } else {
+        finishCancelledExport();
+      }
       return;
     }
 
@@ -3279,15 +3691,20 @@ function finishExportSuccessfully(job) {
 }
 
 function finishCancelledExport() {
+  const cancelledBatch = state.aiBatchActive;
   stopExportPolling();
   state.exporting = false;
   state.cancellingExport = false;
   state.exportCompleted = false;
   state.exportError = "";
   state.exportJobId = "";
+  state.aiBatchActive = false;
   elements.exportProgressPanel.hidden = true;
+  elements.aiBatchProgressSummary.hidden = true;
   elements.exportSetup.hidden = false;
-  showToast(isEnhanceMode()
+  showToast(cancelledBatch
+    ? "已停止批量 AI 超清；当前未完成文件已清理，后续项目已取消"
+    : isEnhanceMode()
     ? "已取消 AI 超清，未完成文件已清理"
     : isRotateMode()
     ? "已取消旋转，未完成视频已清理"
@@ -3295,22 +3712,26 @@ function finishCancelledExport() {
       ? "已取消截图，未完成图片已清理"
       : "已取消导出，原视频未被修改");
   renderControls();
+  renderAiBatchSelection();
   if (isEnhanceMode()) renderModelManager();
 }
 
 function finishExportWithError(message, job = null) {
+  const failedBatch = state.aiBatchActive;
   stopExportPolling();
   state.exporting = false;
   state.cancellingExport = false;
   state.exportCompleted = false;
   state.exportError = typeof message === "string" ? message : extractErrorMessage(message) || "导出失败，请重试。";
+  state.exportJobId = "";
+  state.aiBatchActive = false;
 
   elements.exportSetup.hidden = false;
   elements.exportProgressPanel.hidden = false;
   elements.exportProgressPanel.classList.add("is-error");
   elements.cancelExportButton.hidden = true;
   elements.exportProgressKicker.textContent = `${operationLabel()}未完成`;
-  elements.exportProgressTitle.textContent = `${operationLabel()}失败`;
+  elements.exportProgressTitle.textContent = failedBatch ? "批量 AI 超清未能启动" : `${operationLabel()}失败`;
   elements.exportProgressMessage.textContent = `${state.exportError} 原视频未被修改。`;
   elements.exportRemaining.textContent = "";
   setProgressAriaValue(
@@ -3321,12 +3742,20 @@ function finishExportWithError(message, job = null) {
     elements.exportElapsed.textContent = formatElapsed(job.elapsed_seconds);
   }
   showToast(state.exportError, "error");
+  renderAiBatchSelection();
   renderControls();
   if (isEnhanceMode()) renderModelManager();
 }
 
+function restoreCancelExportButton() {
+  state.cancellingExport = false;
+  elements.cancelExportButton.disabled = false;
+  elements.cancelExportButton.textContent = state.aiBatchActive ? "停止批量超清" : `取消${operationVerb()}`;
+  renderControls();
+}
+
 async function cancelExport() {
-  if (!state.exporting || !state.exportJobId || state.cancellingExport) return;
+  if (!state.exporting || state.cancellingExport) return;
   state.cancellingExport = true;
   elements.cancelExportButton.disabled = true;
   elements.cancelExportButton.textContent = "正在取消…";
@@ -3336,7 +3765,9 @@ async function cancelExport() {
     elements.exportProgressTrack.getAttribute("aria-valuenow"),
     elements.exportRemaining.textContent,
   );
-  elements.exportProgressMessage.textContent = isEnhanceMode()
+  elements.exportProgressMessage.textContent = state.aiBatchActive
+    ? "正在停止当前 AI 计算、清理未完成文件并取消尚未开始的队列项目…"
+    : isEnhanceMode()
     ? "正在停止 AI 计算并清理未完成文件；已下载的模型会保留供下次使用…"
     : isRotateMode()
     ? "正在安全停止旋转并清理未完成视频…"
@@ -3344,13 +3775,22 @@ async function cancelExport() {
       ? "正在安全停止截图并清理未完成图片…"
       : "正在安全停止导出并清理未完成文件…";
 
+  if (!state.exportJobId) return;
+  const jobId = state.exportJobId;
+  const pollSerial = state.exportPollSerial;
+
   try {
-    await post(`${exportApiBase()}/${encodeURIComponent(state.exportJobId)}/cancel`);
-    scheduleExportPoll(state.exportPollSerial, 150);
+    await post(`${exportApiBase()}/${encodeURIComponent(jobId)}/cancel`);
+    if (
+      state.exporting
+      && state.cancellingExport
+      && pollSerial === state.exportPollSerial
+      && jobId === state.exportJobId
+    ) {
+      scheduleExportPoll(pollSerial, 150);
+    }
   } catch (error) {
-    state.cancellingExport = false;
-    elements.cancelExportButton.disabled = false;
-    elements.cancelExportButton.textContent = `取消${operationVerb()}`;
+    restoreCancelExportButton();
     showToast(error.message || "取消失败，请稍后重试", "error");
   }
 }
@@ -3376,14 +3816,39 @@ async function revealOutput() {
   }
 }
 
+async function revealAiBatchResult(event) {
+  const button = event.target.closest("[data-reveal-ai-job-id]");
+  if (!button || !elements.aiBatchResultList.contains(button) || button.disabled) return;
+  const jobId = String(button.dataset.revealAiJobId || "");
+  if (!jobId) return;
+  button.disabled = true;
+  try {
+    await post(`/api/ai-enhancements/${encodeURIComponent(jobId)}/reveal`);
+    showToast("已在文件夹中显示这个 AI 超清视频");
+  } catch (error) {
+    showToast(error.message || "无法在文件夹中显示这个视频", "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function continueEditing() {
   state.exportCompleted = false;
   state.exportError = "";
   state.exportJobId = "";
   state.exportOutputName = "";
+  state.aiBatchActive = false;
+  state.aiBatchSnapshot = null;
+  state.aiBatchNotifiedFailures = new Set();
   elements.exportCompletePanel.hidden = true;
+  elements.exportCompletePanel.classList.remove("has-errors");
   elements.exportProgressPanel.hidden = true;
+  elements.aiBatchProgressSummary.hidden = true;
+  elements.aiBatchResultList.hidden = true;
+  elements.aiBatchResultList.replaceChildren();
+  elements.revealOutputButton.hidden = false;
   elements.exportSetup.hidden = false;
+  renderAiBatchSelection();
   renderControls();
   if (isRotateMode()) elements.rotationOptions.find((option) => option.getAttribute("aria-pressed") === "true")?.focus();
   else if (isEnhanceMode()) elements.aiTargetOptions.find((option) => option.getAttribute("aria-pressed") === "true")?.focus();
@@ -3433,7 +3898,7 @@ function renderReadyNote(range) {
     elements.readyNoteText.textContent = "正在连接本地服务…";
   } else if (!state.video) {
     elements.readyNoteText.textContent = isEnhanceMode()
-      ? "请先选择视频和目标清晰度"
+      ? "请先选择一个或多个视频和目标清晰度"
       : isRotateMode()
       ? "请先选择视频和旋转角度"
       : isFrameMode()
@@ -3469,7 +3934,9 @@ function renderReadyNote(range) {
   } else {
     elements.readyNote.classList.add("is-ready");
     elements.readyNoteText.textContent = isEnhanceMode()
-      ? state.video.is_hdr
+      ? isAiBatchSelection()
+        ? `已就绪，将用 ${aiModel?.name || "所选模型"} 把 ${enhancementVideos().length} 个视频依次增强到 ${aiTargetLabel()}；单个失败会自动继续`
+        : state.video.is_hdr
         ? `已就绪；将 HDR 映射为 BT.709 SDR 后，再用 ${aiModel?.name || "所选模型"} 增强到 ${aiTargetLabel()}；成片保存到原视频同级目录，原片不会修改`
         : `已就绪，将用 ${aiModel?.name || "所选模型"} 把整段视频增强到 ${aiTargetLabel()}，并保存到原视频同级目录`
       : isRotateMode()
@@ -3544,7 +4011,9 @@ function renderControls() {
           ? "重新截图"
           : "重新导出"
       : isEnhanceMode()
-        ? "确定并开始 AI 超清"
+        ? isAiBatchSelection()
+          ? `开始批量超清（${enhancementVideos().length} 个）`
+          : "确定并开始 AI 超清"
         : isRotateMode()
         ? "确定并旋转"
         : isFrameMode()
@@ -3649,6 +4118,7 @@ elements.selectDirectoryButton.addEventListener("click", selectOutputDirectory);
 elements.exportButton.addEventListener("click", startExport);
 elements.cancelExportButton.addEventListener("click", cancelExport);
 elements.revealOutputButton.addEventListener("click", revealOutput);
+elements.aiBatchResultList.addEventListener("click", revealAiBatchResult);
 elements.continueButton.addEventListener("click", continueEditing);
 elements.reloadButton.addEventListener("click", () => window.location.reload());
 elements.retryPreviewButton.addEventListener("click", () => {

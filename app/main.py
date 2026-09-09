@@ -19,13 +19,13 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .ai_enhance import AIEnhancementManager, ai_target_options
 from .ai_models import DEFAULT_AI_MODEL_ID
 from .build_info import APP_ID, APP_NAME, APP_VERSION
-from .dialogs import DialogError, select_output_directory, select_video_file
+from .dialogs import DialogError, select_output_directory, select_video_file, select_video_files
 from .download_proxy import (
     DownloadProxy,
     ProxyConfigurationError,
@@ -55,8 +55,9 @@ from .storage import SettingsStore, SettingsStoreError
 PROJECT_ROOT = APPLICATION_ROOT
 STATIC_ROOT = RESOURCE_ROOT / "app" / "static"
 SETTINGS_PATH = PROJECT_ROOT / "data" / "settings.json"
-MAX_REMEMBERED_VIDEOS = 12
+MAX_REMEMBERED_VIDEOS = 256
 MAX_PREVIEW_SPECS = 80
+MAX_AI_BATCH_VIDEOS = 100
 
 
 class TimeRangeRequest(BaseModel):
@@ -83,6 +84,14 @@ class AIEnhancementRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     video_id: str
+    target: Literal["1080p", "2k", "4k"]
+    model_id: str = DEFAULT_AI_MODEL_ID
+
+
+class AIEnhancementBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    video_ids: list[str] = Field(min_length=1, max_length=MAX_AI_BATCH_VIDEOS)
     target: Literal["1080p", "2k", "4k"]
     model_id: str = DEFAULT_AI_MODEL_ID
 
@@ -212,6 +221,10 @@ def _user_media_error(exc: MediaError) -> str:
             "另一个 AI 模型正在准备，请等待完成或先取消。"
         ),
         "AI enhancement job was not found": "找不到这次 AI 超清任务，请刷新页面后重试。",
+        "At least one video is required for AI enhancement batch": (
+            "批量 AI 超清至少需要选择一个视频。"
+        ),
+        "AI enhancement batch was not found": "找不到这次批量 AI 超清任务，请刷新页面后重试。",
         "Unknown AI enhancement model": "没有找到所选 AI 模型，请刷新页面后重试。",
         "AI enhancement requires baked-in video orientation": (
             "该视频仍带旋转标记，请先用“永久旋转”固化方向，再进行 AI 超清。"
@@ -510,12 +523,16 @@ class ApplicationState:
         return source
 
     def video(self, video_id: str) -> VideoSource:
+        source = self.registered_video(video_id)
+        if not source.path.is_file():
+            raise MediaError("The original video was moved or deleted")
+        return source
+
+    def registered_video(self, video_id: str) -> VideoSource:
         with self._lock:
             source = self._videos.get(video_id)
         if source is None:
             raise MediaError("The selected video is no longer available")
-        if not source.path.is_file():
-            raise MediaError("The original video was moved or deleted")
         return source
 
     def create_preview(
@@ -629,6 +646,25 @@ def _video_payload(
             else []
         ),
     }
+
+
+def _localized_ai_batch_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    localized = dict(snapshot)
+    if localized.get("error"):
+        localized["error"] = _user_media_error(MediaError(str(localized["error"])))
+
+    items: list[dict[str, Any]] = []
+    raw_items = snapshot.get("items")
+    if isinstance(raw_items, list):
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                continue
+            item = dict(raw_item)
+            if item.get("error"):
+                item["error"] = _user_media_error(MediaError(str(item["error"])))
+            items.append(item)
+        localized["items"] = items
+    return localized
 
 
 def _proxy_chunks(
@@ -796,6 +832,49 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             "suggested_start": format_timecode(0),
             "suggested_end": format_timecode(source.metadata["duration"]),
         }
+
+    @app.post("/api/videos/select-many", dependencies=ai_api_dependencies)
+    async def choose_videos() -> dict[str, Any]:
+        try:
+            selected_paths = await run_in_threadpool(select_video_files)
+        except DialogError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if not selected_paths:
+            return {"cancelled": True, "videos": [], "errors": []}
+
+        videos: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        color_pipeline_available = bool(
+            state.ai_enhancements and state.ai_enhancements.color_pipeline_available
+        )
+        for path in selected_paths[:MAX_AI_BATCH_VIDEOS]:
+            try:
+                source = await run_in_threadpool(state.register_video, path)
+                videos.append(
+                    _video_payload(
+                        source,
+                        color_pipeline_available=color_pipeline_available,
+                        ai_features_enabled=True,
+                    )
+                )
+            except MediaError as exc:
+                errors.append(
+                    {
+                        "name": path.name,
+                        "path_display": _display_path(path),
+                        "error": _user_media_error(exc),
+                    }
+                )
+
+        for path in selected_paths[MAX_AI_BATCH_VIDEOS:]:
+            errors.append(
+                {
+                    "name": path.name,
+                    "path_display": _display_path(path),
+                    "error": f"一次最多选择 {MAX_AI_BATCH_VIDEOS} 个视频。",
+                }
+            )
+        return {"cancelled": False, "videos": videos, "errors": errors}
 
     @app.get("/api/videos/{video_id}/content")
     def video_content(video_id: str) -> FileResponse:
@@ -1031,6 +1110,26 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
         return {"job_id": job.id, "output_name": job.output_path.name}
 
+    @app.post("/api/ai-enhancement-batches", dependencies=ai_api_dependencies)
+    def create_ai_enhancement_batch(
+        request: AIEnhancementBatchRequest,
+    ) -> dict[str, Any]:
+        try:
+            if state.ai_enhancements is None:
+                raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
+            # Resolve registered selections without re-checking every path here.
+            # Per-file checks belong to the batch worker so one moved or invalid
+            # source is recorded as a failed item and the queue can continue.
+            sources = [state.registered_video(video_id) for video_id in request.video_ids]
+            batch = state.ai_enhancements.create_batch(
+                sources,
+                target=request.target,
+                model_id=request.model_id,
+            )
+        except MediaError as exc:
+            raise HTTPException(status_code=400, detail=_user_media_error(exc)) from exc
+        return _localized_ai_batch_snapshot(batch.snapshot())
+
     @app.get("/api/ai-models", dependencies=ai_api_dependencies)
     def ai_models() -> dict[str, Any]:
         if state.ai_enhancements is None:
@@ -1254,6 +1353,34 @@ def create_app(application_state: ApplicationState | None = None) -> FastAPI:
         if job is None:
             raise HTTPException(status_code=404, detail="找不到这次 AI 超清任务。")
         return job
+
+    def ai_enhancement_batch(batch_id: str):
+        if state.ai_enhancements is None:
+            raise HTTPException(status_code=503, detail="AI 超清尚未就绪。")
+        batch = state.ai_enhancements.get_batch(batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail="找不到这次批量 AI 超清任务。")
+        return batch
+
+    @app.get(
+        "/api/ai-enhancement-batches/{batch_id}",
+        dependencies=ai_api_dependencies,
+    )
+    def ai_enhancement_batch_status(batch_id: str) -> dict[str, Any]:
+        return _localized_ai_batch_snapshot(ai_enhancement_batch(batch_id).snapshot())
+
+    @app.post(
+        "/api/ai-enhancement-batches/{batch_id}/cancel",
+        dependencies=ai_api_dependencies,
+    )
+    def cancel_ai_enhancement_batch(batch_id: str) -> dict[str, Any]:
+        try:
+            if state.ai_enhancements is None:
+                raise MediaError("AI enhancement requires Apple Silicon MPS or an RTX 5090")
+            batch = state.ai_enhancements.cancel_batch(batch_id)
+        except MediaError as exc:
+            raise HTTPException(status_code=404, detail=_user_media_error(exc)) from exc
+        return _localized_ai_batch_snapshot(batch.snapshot())
 
     @app.get("/api/exports/{job_id}", dependencies=[Depends(require_app_token)])
     def export_status(job_id: str) -> dict[str, Any]:

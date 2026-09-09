@@ -1,4 +1,4 @@
-Local Video Cutter v1.10.7 — Windows 11 / RTX 5090 完全离线 U 盘使用说明
+Local Video Cutter v1.11.0 — Windows 11 / RTX 5090 完全离线 U 盘使用说明
 
 这份说明用于没有网络的 Windows 11 + NVIDIA GeForce RTX 5090 电脑。普通 Windows 便携 ZIP 只包含程序和本说明，不包含体积很大的 Python、FFmpeg、Microsoft Visual C++ Runtime、AI runtime、wheel 或模型文件；完整离线资源由 offline 和 data\ai 两部分组成，必须另外取得，并且必须与程序版本匹配。
 
@@ -52,7 +52,7 @@ nvidia-smi
    <程序文件夹>\data\ai\
 
 3. 双击 LocalVideoCutter.exe。程序会先核对 READY、manifest.json、程序版本和目标平台，再在使用每项资源前核对其大小和 SHA-256；校验不通过时不会使用该文件。Microsoft Visual C++ Runtime、Python、FFmpeg 以及应用依赖都会优先从离线包准备。若 Windows 显示用户账户控制确认，请允许 Microsoft Visual C++ Runtime 或 Python 安装程序运行。
-4. 首次准备环境和模型会花较长时间，即使没有网络也请保持启动窗口开启。模型安装完成后，在网页中先用几秒钟短片验收，再处理重要长视频。
+4. 首次准备环境和模型会花较长时间，即使没有网络也请保持启动窗口开启。模型安装完成后，在网页中先用几秒钟短片验收，再处理重要长视频。AI 超清模式支持一次多选最多 100 个视频并按顺序串行处理；某个视频失败时会保留错误提示并自动继续下一个，成功成片分别写入各自原视频同级目录。
 
 建议不要直接从 U 盘长期运行：模型安装、缓存和输出会产生大量读写。复制到本地 SSD 后运行更稳定，也更快。
 程序启动和运行期间不要移动、覆盖或同步 offline、data\ai 以及整个程序文件夹；需要重新复制时，请先退出程序并使用另一个全新空目录。

@@ -147,6 +147,161 @@ def test_cancelled_native_dialog_is_not_an_error(
         assert response.json() == {"cancelled": True}
 
 
+def test_ai_multi_video_selection_keeps_valid_files_when_one_fails(
+    monkeypatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    missing_video = tmp_path / "无法读取.mp4"
+    monkeypatch.setattr(
+        main_module,
+        "select_video_files",
+        lambda: [sample_video, missing_video, sample_video],
+    )
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        ai_features_enabled=True,
+    )
+
+    with TestClient(create_app(state)) as client:
+        assert client.post("/api/videos/select-many").status_code == 403
+        response = client.post(
+            "/api/videos/select-many",
+            headers={"X-App-Token": state.app_token},
+        )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["cancelled"] is False
+    assert [video["name"] for video in payload["videos"]] == [
+        sample_video.name,
+        sample_video.name,
+    ]
+    assert payload["videos"][0]["id"] != payload["videos"][1]["id"]
+    assert payload["errors"] == [
+        {
+            "name": missing_video.name,
+            "path_display": str(missing_video),
+            "error": "所选视频不存在，请重新选择。",
+        }
+    ]
+
+
+def test_ai_batch_api_creates_polls_and_cancels_server_side_queue(
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    state = ApplicationState(
+        settings_path=tmp_path / "settings.json",
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        ai_features_enabled=True,
+    )
+    sources = [state.register_video(sample_video), state.register_video(sample_video)]
+
+    class FakeBatch:
+        id = "batch-1"
+
+        def __init__(self) -> None:
+            self.status = "running"
+
+        def snapshot(self) -> dict:
+            return {
+                "batch_id": self.id,
+                "operation": "enhance_batch",
+                "status": self.status,
+                "stage": "inference" if self.status == "running" else self.status,
+                "progress": 25.0,
+                "message": "processing",
+                "error": None,
+                "items": [
+                    {
+                        "video_id": sources[0].id,
+                        "source_name": sample_video.name,
+                        "job_id": "job-1",
+                        "status": "failed",
+                        "progress": 100.0,
+                        "error": "The original video was moved or deleted",
+                    },
+                    {
+                        "video_id": sources[1].id,
+                        "source_name": sample_video.name,
+                        "job_id": "job-2",
+                        "status": "running",
+                        "progress": 25.0,
+                        "error": None,
+                    },
+                ],
+            }
+
+    class FakeManager:
+        color_pipeline_available = True
+
+        def __init__(self) -> None:
+            self.batch = FakeBatch()
+            self.created_sources = []
+            self.target = ""
+            self.model_id = ""
+
+        def create_batch(self, selected_sources, *, target: str, model_id: str):
+            self.created_sources = list(selected_sources)
+            self.target = target
+            self.model_id = model_id
+            return self.batch
+
+        def get_batch(self, batch_id: str):
+            return self.batch if batch_id == self.batch.id else None
+
+        def cancel_batch(self, batch_id: str):
+            assert batch_id == self.batch.id
+            self.batch.status = "cancelled"
+            return self.batch
+
+        def cancel_all(self) -> None:
+            return None
+
+    manager = FakeManager()
+    state.ai_enhancements = manager  # type: ignore[assignment]
+    headers = {"X-App-Token": state.app_token}
+
+    with TestClient(create_app(state)) as client:
+        assert client.post(
+            "/api/ai-enhancement-batches",
+            json={"video_ids": [source.id for source in sources], "target": "1080p"},
+        ).status_code == 403
+        created = client.post(
+            "/api/ai-enhancement-batches",
+            headers=headers,
+            json={
+                "video_ids": [source.id for source in sources],
+                "target": "1080p",
+                "model_id": "seedvr2-3b-fp16",
+            },
+        )
+        polled = client.get("/api/ai-enhancement-batches/batch-1", headers=headers)
+        cancelled = client.post(
+            "/api/ai-enhancement-batches/batch-1/cancel",
+            headers=headers,
+        )
+
+    assert created.status_code == 200, created.text
+    assert created.json()["batch_id"] == "batch-1"
+    assert created.json()["items"][0]["error"] == "原视频已被移动或删除，请重新选择。"
+    assert manager.created_sources == sources
+    assert manager.target == "1080p"
+    assert manager.model_id == "seedvr2-3b-fp16"
+    assert polled.status_code == 200
+    assert polled.json()["status"] == "running"
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+
+
 def test_macos_disables_ai_runtime_payloads_and_all_ai_apis(
     monkeypatch,
     tmp_path: Path,
@@ -171,6 +326,14 @@ def test_macos_disables_ai_runtime_payloads_and_all_ai_apis(
 
     blocked_requests = [
         ("POST", "/api/ai-enhancements", {"video_id": "missing", "target": "1080p"}),
+        ("POST", "/api/videos/select-many", None),
+        (
+            "POST",
+            "/api/ai-enhancement-batches",
+            {"video_ids": ["missing"], "target": "1080p"},
+        ),
+        ("GET", "/api/ai-enhancement-batches/batch", None),
+        ("POST", "/api/ai-enhancement-batches/batch/cancel", None),
         ("GET", "/api/ai-models", None),
         ("GET", "/api/ai-download-proxy", None),
         ("PUT", "/api/ai-download-proxy", {}),
