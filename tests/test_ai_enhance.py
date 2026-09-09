@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import zipfile
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -975,6 +976,94 @@ def test_cuda_runtime_probe_uses_selected_gpu_visibility(
     assert captured["env"]["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
 
 
+def test_offline_pip_failure_does_not_treat_networkx_as_a_network_error(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        compute_backend="cuda",
+        inference_runner=lambda _job, _output: None,
+    )
+    output = deque(
+        [
+            "Processing networkx-3.6.1-py3-none-any.whl",
+            "Installing collected packages: torch, networkx, torchvision",
+            "ERROR: Could not install packages due to an OSError: [WinError 5] Access is denied",
+        ]
+    )
+
+    message = manager._friendly_process_error(output, 1, stage="setup")
+
+    assert message == (
+        "AI 运行环境准备失败：ERROR: Could not install packages due to an OSError: "
+        "[WinError 5] Access is denied"
+    )
+    assert "检查网络" not in message
+
+
+def test_process_network_error_requires_a_real_network_failure_signature(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        compute_backend="cuda",
+        inference_runner=lambda _job, _output: None,
+    )
+    output = deque(
+        [
+            "WARNING: Retrying after connection broken by ProxyError",
+            "HTTPSConnectionPool: Max retries exceeded with url: /wheel.whl",
+        ]
+    )
+
+    assert manager._friendly_process_error(output, 1, stage="setup") == (
+        "AI 模型下载失败，请检查网络后重试；已下载部分会保留以便续传。"
+    )
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (
+            "ERROR: [WinError 206] The filename or extension is too long",
+            "Windows 路径过长，AI 环境无法安装。请把程序文件夹移动到 C:\\LVC 后重试。",
+        ),
+        (
+            "HINT: This system does not have Windows Long Path support enabled.",
+            "Windows 路径过长，AI 环境无法安装。请把程序文件夹移动到 C:\\LVC 后重试。",
+        ),
+        (
+            "ERROR: [WinError 112] There is not enough space on the disk",
+            "磁盘空间不足，AI 超清未完成。",
+        ),
+    ],
+)
+def test_process_error_recognizes_windows_runtime_failures(
+    output: str,
+    expected: str,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        compute_backend="cuda",
+        inference_runner=lambda _job, _output: None,
+    )
+
+    assert manager._friendly_process_error(deque([output]), 1, stage="setup") == expected
+
+
 def test_rtx_5090_detection_requires_sm_120_and_reads_vram(monkeypatch) -> None:
     completed = subprocess.CompletedProcess(
         args=["nvidia-smi"],
@@ -1035,7 +1124,9 @@ def test_python_runtime_path_uses_windows_scripts_directory(
     )
     monkeypatch.setattr(ai_module.sys, "platform", "win32")
 
-    assert manager.venv_python == tmp_path / "runtime" / "venv" / "Scripts" / "python.exe"
+    assert manager.venv_python == (
+        tmp_path / "runtime" / ".r" / "s" / "Scripts" / "python.exe"
+    )
 
 
 @pytest.mark.parametrize(

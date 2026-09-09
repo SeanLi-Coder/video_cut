@@ -100,6 +100,80 @@ def _pip_commands(commands: list[list[str]]) -> list[list[str]]:
     return [command for command in commands if command[1:3] == ["-m", "pip"]]
 
 
+def test_runtime_setup_roots_are_short_and_model_specific(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    monkeypatch.setattr(ai_module.sys, "platform", "win32")
+    manager = _manager(tmp_path, ffmpeg, ffprobe)
+
+    seed = manager._runtime_setup_root_for(ai_module.DEFAULT_AI_MODEL_ID)
+    swift = manager._runtime_setup_root_for(SWIFTVR_5B_BF16_ID)
+
+    assert seed == manager.runtime_root / ".s" / "s"
+    assert swift == manager.runtime_root / ".s" / "w"
+    assert manager._runtime_root_for(SWIFTVR_5B_BF16_ID) not in swift.parents
+    assert manager.venv_python == (
+        manager.runtime_root / ".r" / "s" / "Scripts" / "python.exe"
+    )
+    assert manager._venv_python_for(SWIFTVR_5B_BF16_ID) == (
+        manager.runtime_root / ".r" / "w" / "Scripts" / "python.exe"
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_id", "legacy_parts", "new_name"),
+    [
+        (ai_module.DEFAULT_AI_MODEL_ID, ("venv",), "s"),
+        (SWIFTVR_5B_BF16_ID, ("engines", SWIFTVR_5B_BF16_ID, "venv"), "w"),
+    ],
+)
+def test_existing_runtime_venv_is_migrated_to_short_root(
+    model_id: str,
+    legacy_parts: tuple[str, ...],
+    new_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    monkeypatch.setattr(ai_module.sys, "platform", "win32")
+    manager = _manager(tmp_path, ffmpeg, ffprobe)
+    legacy_python = manager.runtime_root.joinpath(*legacy_parts, "Scripts", "python.exe")
+    legacy_python.parent.mkdir(parents=True)
+    legacy_python.write_bytes(b"legacy runtime")
+
+    manager._migrate_legacy_runtime_venv(model_id)
+
+    migrated_python = manager.runtime_root / ".r" / new_name / "Scripts" / "python.exe"
+    assert migrated_python.read_bytes() == b"legacy runtime"
+    assert not legacy_python.exists()
+
+
+def test_runtime_work_path_rejects_symlinked_parent_without_deleting_target(
+    tmp_path: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    manager = _manager(tmp_path, ffmpeg, ffprobe)
+    manager.runtime_root.mkdir(parents=True)
+    outside = tmp_path / "outside-runtime"
+    outside.mkdir()
+    sentinel = outside / "keep.bin"
+    sentinel.write_bytes(b"keep")
+    try:
+        (manager.runtime_root / ".s").symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Symlinks are unavailable: {exc}")
+
+    with pytest.raises(MediaError, match="不安全的符号链接"):
+        manager._validate_runtime_directory_path(manager.runtime_root / ".s" / "s")
+
+    assert sentinel.read_bytes() == b"keep"
+
+
 def test_seedvr2_windows_offline_runtime_uses_only_hashed_wheelhouse(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -149,7 +223,7 @@ def test_seedvr2_windows_offline_runtime_uses_only_hashed_wheelhouse(
     assert requested_profiles == ["seedvr2"]
     assert _pip_commands(commands) == [
         manager._offline_pip_install_command(
-            manager.runtime_root / "setup-seed-offline" / "venv" / "Scripts" / "python.exe",
+            manager.runtime_root / ".s" / "s" / "venv" / "Scripts" / "python.exe",
             profile,
         )
     ]
@@ -190,8 +264,9 @@ def test_swiftvr_windows_offline_runtime_uses_only_hashed_wheelhouse(
     assert requested_profiles == ["swiftvr"]
     assert _pip_commands(commands) == [
         manager._offline_pip_install_command(
-            manager._runtime_root_for(SWIFTVR_5B_BF16_ID)
-            / "setup-swift-offline"
+            manager.runtime_root
+            / ".s"
+            / "w"
             / "venv"
             / "Scripts"
             / "python.exe",
@@ -284,8 +359,9 @@ def test_missing_windows_offline_bundle_preserves_online_swiftvr_install(
     assert _pip_commands(commands) == [
         [
             str(
-                manager._runtime_root_for(SWIFTVR_5B_BF16_ID)
-                / "setup-swift-online"
+                manager.runtime_root
+                / ".s"
+                / "w"
                 / "venv"
                 / "Scripts"
                 / "python.exe"
@@ -296,6 +372,7 @@ def test_missing_windows_offline_bundle_preserves_online_swiftvr_install(
             "--disable-pip-version-check",
             "--no-input",
             "--no-cache-dir",
+            "--no-compile",
             "-r",
             str(ai_module.AI_SWIFTVR_REQUIREMENTS_PATH),
         ]

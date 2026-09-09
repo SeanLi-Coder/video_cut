@@ -8,7 +8,7 @@
 
 本仓库是 private 仓库。打开 Releases、下载 Release 文件或使用 **Code → Download ZIP** 前，必须先登录已获本仓库访问权限的 GitHub 账号。Windows 11 / RTX 5090 用户建议打开 [GitHub Releases](https://github.com/SeanLi-Coder/video_cut/releases/latest)，下载名称以 `LocalVideoCutter-Windows-RTX5090` 开头的 ZIP；macOS 或需要源码的用户可以在项目页面点击 **Code → Download ZIP**。如果 RTX 5090 电脑不方便登录 GitHub，请先在有权限的电脑上下载并核对文件，再把完整 ZIP 复制到 Windows 电脑。普通 Windows 便携 ZIP 不包含数十 GB 的离线依赖和模型；完全离线部署还需要取得同版本的完整 `offline` 和 `data` 文件夹，并按下文固定路径放置。
 
-不要直接在 ZIP 压缩包预览窗口里运行，也不要只复制其中的 EXE；请先把整个文件夹解压到“下载”或“桌面”等普通可写目录。
+不要直接在 ZIP 压缩包预览窗口里运行，也不要只复制其中的 EXE。Windows 版请把整个文件夹完整解压到本地 SSD 的短路径可写目录，推荐 `C:\LVC` 或 `D:\LVC`；不要保留很长的压缩包目录名。macOS 版放在普通可写目录即可。
 
 ### 2. 双击启动
 
@@ -232,7 +232,7 @@ ffprobe -version
 
 本地网页服务就绪后，启动窗口会依次询问是否准备尚未完整就绪的 SeedVR2 和实验版 SwiftVR。输入 `y` 安装环境、下载缺少文件并在窗口中查看进度，输入 `n` 或直接按 Enter 跳过；跳过后浏览器仍会正常打开。以后可随时在网页“AI 模型管理”中逐个下载、继续下载、取消并查看进度。网页下载失败、取消或留下部分文件后，再次运行 `LocalVideoCutter.exe` 会显示 `Continue, restart from zero, or skip? [c/r/N]`：`c` 断点续传，`r` 只清理该模型权重后从零重下，`n` 或直接按 Enter 跳过。清理不会动 runtime 或其他模型；即使网页服务已经在运行，再次双击启动器也会显示恢复提示。如果需要无人值守启动，可在 PowerShell 中运行 `LocalVideoCutter.exe --skip-model-prompt`，但普通用户直接双击即可。
 
-便携包应放在桌面、下载目录或其他普通用户可写目录，不要放入 `Program Files`。程序数据会写在便携包内部的 `.venv` 和 `data` 目录，因此移动到另一台 Windows 电脑时应复制整个文件夹；第一次在新电脑上仍会按该机器重新准备运行环境。
+便携包应放在本地 SSD 的短路径普通用户可写目录，推荐 `C:\LVC` 或 `D:\LVC`，不要放入 `Program Files`。程序会自动用短暂存路径安装 AI runtime；使用短程序路径还能兼容未启用 Windows Long Path policy 的电脑。程序数据会写在便携包内部的 `.venv` 和 `data` 目录，因此移动到另一台 Windows 电脑时应复制整个文件夹；第一次在新电脑上仍会按该机器重新准备运行环境。
 
 请先从 [NVIDIA 官方驱动页面](https://www.nvidia.com/Download/index.aspx)安装 R580 或更新分支驱动并重启。无需下载 CUDA Toolkit、cuDNN 或 Visual Studio CUDA workload；AI 模型页会分别在隔离环境中安装 SeedVR2 所需的 PyTorch `2.12.1` `cu130` 和 SwiftVR 所需的 PyTorch `2.10.0` `cu130`。可以在 PowerShell 先检查：
 
@@ -321,8 +321,8 @@ brew install python ffmpeg
 当前 GitHub Release 没有商业代码签名证书，Windows 可能在第一次运行时显示 SmartScreen 提示。请只使用本仓库 Releases 中的 ZIP，并同时下载同页对应的 `.zip.sha256` 文件；确认来源后点击“更多信息”再选择“仍要运行”。SHA-256 可以在 PowerShell 中检查：
 
 ```powershell
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.3.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.3.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.4.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.4.zip.sha256
 ```
 
 第一条命令输出中的 `Hash` 必须与 `.zip.sha256` 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行该文件，应重新下载并再次核对。

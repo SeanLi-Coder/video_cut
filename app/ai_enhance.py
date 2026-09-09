@@ -945,9 +945,10 @@ class AIEnhancementManager:
 
     @property
     def venv_python(self) -> Path:
+        root = self.runtime_root / ".r" / "s"
         if sys.platform == "win32":
-            return self.runtime_root / "venv" / "Scripts" / "python.exe"
-        return self.runtime_root / "venv" / "bin" / "python"
+            return root / "Scripts" / "python.exe"
+        return root / "bin" / "python"
 
     @property
     def backend_label(self) -> str:
@@ -982,7 +983,7 @@ class AIEnhancementManager:
     def _venv_python_for(self, model_id: str) -> Path:
         if model_id == DEFAULT_AI_MODEL_ID:
             return self.venv_python
-        root = self._runtime_root_for(model_id) / "venv"
+        root = self.runtime_root / ".r" / "w"
         if sys.platform == "win32":
             return root / "Scripts" / "python.exe"
         return root / "bin" / "python"
@@ -996,6 +997,47 @@ class AIEnhancementManager:
         if model_id == DEFAULT_AI_MODEL_ID:
             return self.marker_path
         return self._runtime_root_for(model_id) / "runtime.json"
+
+    def _runtime_setup_root_for(self, model_id: str) -> Path:
+        # Keep Windows wheel extraction below the traditional MAX_PATH limit.
+        # Model-specific runtime roots can already be deeply nested, and pip
+        # expands several long torch header names while installing. Only one AI
+        # worker may run at a time, so stable short staging names are sufficient
+        # and stale data can be replaced safely on the next attempt.
+        name = "s" if model_id == DEFAULT_AI_MODEL_ID else "w"
+        return self.runtime_root / ".s" / name
+
+    def _legacy_venv_root_for(self, model_id: str) -> Path:
+        return self._runtime_root_for(model_id) / "venv"
+
+    def _validate_runtime_directory_path(self, path: Path) -> None:
+        try:
+            relative = path.relative_to(self.runtime_root)
+        except ValueError as exc:
+            raise MediaError("AI 运行目录越出了程序数据文件夹，已停止安装。") from exc
+        current = self.runtime_root
+        for part in (None, *relative.parts):
+            if part is not None:
+                current = current / part
+            if self._is_unsafe_model_link(current):
+                raise MediaError("AI 运行目录包含不安全的符号链接，已停止安装。")
+            if current.exists() and not current.is_dir():
+                raise MediaError("AI 运行目录结构异常，已停止安装。")
+
+    def _migrate_legacy_runtime_venv(self, model_id: str) -> None:
+        target = self._venv_python_for(model_id).parent.parent
+        legacy = self._legacy_venv_root_for(model_id)
+        self._validate_runtime_directory_path(target)
+        self._validate_runtime_directory_path(legacy)
+        if target.exists() or not legacy.is_dir():
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.replace(legacy, target)
+        except OSError:
+            # A locked legacy environment is left untouched. The regular setup
+            # path can still create a fresh short-path environment beside it.
+            return
 
     @staticmethod
     def _model_files_for(model_id: str) -> tuple[tuple[str, int, str, str], ...]:
@@ -2940,11 +2982,49 @@ class AIEnhancementManager:
         if job.cancel_event.is_set():
             raise InterruptedError
         if return_code != 0:
-            message = self._friendly_process_error(recent, return_code)
+            with job.lock:
+                failure_stage = job.stage
+            message = self._friendly_process_error(
+                recent,
+                return_code,
+                stage=failure_stage,
+            )
             raise MediaError(redact_proxy_credentials(message, job.download_proxy))
         return recent
 
-    def _friendly_process_error(self, recent: deque[str], return_code: int) -> str:
+    @staticmethod
+    def _process_error_detail(recent: deque[str], return_code: int) -> str:
+        lines = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in recent if line.strip()]
+        diagnostic_markers = (
+            "error:",
+            "exception:",
+            "traceback",
+            "failed",
+            "winerror",
+            "modulenotfounderror",
+            "importerror",
+            "assertionerror",
+            "no matching distribution",
+            "could not find a version",
+            "requires-python",
+        )
+        detail = next(
+            (
+                line
+                for line in reversed(lines)
+                if any(marker in line.lower() for marker in diagnostic_markers)
+            ),
+            lines[-1] if lines else f"process exited with code {return_code}",
+        )
+        return re.sub(r"\s+", " ", detail).strip()[:500]
+
+    def _friendly_process_error(
+        self,
+        recent: deque[str],
+        return_code: int,
+        *,
+        stage: str | None = None,
+    ) -> str:
         text = "\n".join(recent).lower()
         if "out of memory" in text or "backend out of memory" in text:
             if self.compute_backend == "cuda":
@@ -2956,8 +3036,26 @@ class AIEnhancementManager:
                 "AI 超清所需统一内存超过了这台 Mac 当前可用容量。"
                 "请关闭大型应用或改选更低的目标分辨率后重试；模型不会自动降级。"
             )
-        if "no space left" in text:
+        if any(
+            marker in text
+            for marker in (
+                "no space left",
+                "winerror 112",
+                "not enough space on the disk",
+                "disk is full",
+            )
+        ):
             return "磁盘空间不足，AI 超清未完成。"
+        if any(
+            marker in text
+            for marker in (
+                "winerror 206",
+                "filename or extension is too long",
+                "file name too long",
+                "windows long path support",
+            )
+        ):
+            return "Windows 路径过长，AI 环境无法安装。请把程序文件夹移动到 C:\\LVC 后重试。"
         if "sm_120" in text or "compute capability" in text:
             return "PyTorch CUDA 环境不包含 RTX 5090 的 sm_120 支持，请在模型管理中重新安装。"
         if "cuda driver" in text or "driver version" in text:
@@ -2966,11 +3064,27 @@ class AIEnhancementManager:
             return "检测到 AI 生成了异常画面数值，已停止导出以避免保存损坏视频。"
         if "color-managed input failed" in text or "libplacebo" in text:
             return "AI 输入色彩转换失败，已停止以避免生成偏色或亮度错误的视频。"
-        if "download" in text or "urlopen" in text or "network" in text:
+        if any(
+            marker in text
+            for marker in (
+                "urlopen error",
+                "network is unreachable",
+                "temporary failure in name resolution",
+                "name or service not known",
+                "failed to establish a new connection",
+                "max retries exceeded with url",
+                "connection refused",
+                "connection timed out",
+                "read timed out",
+                "proxyerror",
+                "certificate_verify_failed",
+                "could not resolve host",
+            )
+        ):
             return "AI 模型下载失败，请检查网络后重试；已下载部分会保留以便续传。"
-        detail = recent[-1] if recent else f"process exited with code {return_code}"
-        detail = re.sub(r"\x1b\[[0-9;]*m", "", detail)
-        return f"AI 超清进程未完成：{detail[-500:]}"
+        detail = self._process_error_detail(recent, return_code)
+        prefix = "AI 运行环境准备失败" if stage == "setup" else "AI 超清进程未完成"
+        return f"{prefix}：{detail}"
 
     @staticmethod
     def _download_process_environment(
@@ -3049,6 +3163,7 @@ class AIEnhancementManager:
             "--disable-pip-version-check",
             "--no-input",
             "--no-cache-dir",
+            "--no-compile",
             "--no-index",
             "--find-links",
             str(profile.wheelhouse),
@@ -3079,6 +3194,7 @@ class AIEnhancementManager:
         if job.model_id != DEFAULT_AI_MODEL_ID:
             raise MediaError("The selected AI model runtime is not available")
         self.runtime_root.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_runtime_venv(DEFAULT_AI_MODEL_ID)
         runtime_installed = self._runtime_installed()
         required_free = self._required_runtime_free_bytes(runtime_installed=runtime_installed)
         if shutil.disk_usage(self.runtime_root).free < required_free:
@@ -3113,9 +3229,10 @@ class AIEnhancementManager:
             self._set_job(job, stage="setup", progress=1, message="正在下载固定版本的 AI 运行器")
             self._download_archive(job, archive)
 
-        staging = self.runtime_root / f"setup-{job.id}"
+        staging = self._runtime_setup_root_for(DEFAULT_AI_MODEL_ID)
         staging_code = staging / "code"
         staging_venv = staging / "venv"
+        self._validate_runtime_directory_path(staging)
         if staging.exists():
             shutil.rmtree(staging)
         try:
@@ -3152,6 +3269,7 @@ class AIEnhancementManager:
                 "install",
                 "--disable-pip-version-check",
                 "--no-input",
+                "--no-compile",
             ]
             download_environment = self._download_process_environment(job, staging)
             if offline_profile is not None:
@@ -3192,11 +3310,14 @@ class AIEnhancementManager:
                 cwd=extracted,
                 env=self._inference_environment(python.parent),
             )
+            self._validate_runtime_directory_path(self.code_root)
+            self._validate_runtime_directory_path(self.venv_python.parent.parent)
             if self.code_root.exists():
                 shutil.rmtree(self.code_root)
             if self.venv_python.parent.parent.exists():
                 shutil.rmtree(self.venv_python.parent.parent)
             os.replace(extracted, self.code_root)
+            self.venv_python.parent.parent.parent.mkdir(parents=True, exist_ok=True)
             os.replace(staging_venv, self.venv_python.parent.parent)
             self.marker_path.write_text(
                 json.dumps(
@@ -3228,6 +3349,7 @@ class AIEnhancementManager:
         model_id = SWIFTVR_5B_BF16_ID
         runtime_root = self._runtime_root_for(model_id)
         runtime_root.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_runtime_venv(model_id)
         runtime_installed = self._runtime_installed(model_id)
         required_free = self._required_runtime_free_bytes(
             runtime_installed=runtime_installed,
@@ -3242,8 +3364,9 @@ class AIEnhancementManager:
 
         offline_profile = self._windows_offline_install_profile("swiftvr")
 
-        staging = runtime_root / f"setup-{job.id}"
+        staging = self._runtime_setup_root_for(model_id)
         staging_venv = staging / "venv"
+        self._validate_runtime_directory_path(staging)
         if staging.exists():
             shutil.rmtree(staging)
         try:
@@ -3276,6 +3399,7 @@ class AIEnhancementManager:
                     "--disable-pip-version-check",
                     "--no-input",
                     "--no-cache-dir",
+                    "--no-compile",
                     "-r",
                     str(AI_SWIFTVR_REQUIREMENTS_PATH),
                 ]
@@ -3297,8 +3421,10 @@ class AIEnhancementManager:
                 env=self._inference_environment(python.parent),
             )
             installed_venv = self._venv_python_for(model_id).parent.parent
+            self._validate_runtime_directory_path(installed_venv)
             if installed_venv.exists():
                 shutil.rmtree(installed_venv)
+            installed_venv.parent.mkdir(parents=True, exist_ok=True)
             os.replace(staging_venv, installed_venv)
             self._marker_path_for(model_id).write_text(
                 json.dumps(

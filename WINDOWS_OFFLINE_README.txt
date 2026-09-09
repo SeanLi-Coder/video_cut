@@ -1,4 +1,4 @@
-Local Video Cutter v1.10.3 — Windows 11 / RTX 5090 完全离线 U 盘使用说明
+Local Video Cutter v1.10.4 — Windows 11 / RTX 5090 完全离线 U 盘使用说明
 
 这份说明用于没有网络的 Windows 11 + NVIDIA GeForce RTX 5090 电脑。普通 Windows 便携 ZIP 只包含程序和本说明，不包含体积很大的 Python、FFmpeg、Microsoft Visual C++ Runtime、AI runtime、wheel 或模型文件；完整离线资源由 offline 和 data\ai 两部分组成，必须另外取得，并且必须与程序版本匹配。
 
@@ -45,7 +45,7 @@ nvidia-smi
 
 四、复制并启动
 
-1. 在目标 Windows 电脑上，把 U 盘里的整个程序文件夹复制到本地 SSD 的一个全新空目录，例如桌面。不要覆盖以前运行过的旧程序文件夹，不要只复制 LocalVideoCutter.exe，也不要放进 Program Files。
+1. 在目标 Windows 电脑上，把 U 盘里的整个程序文件夹复制到本地 SSD 的短路径全新空目录，推荐直接使用 C:\LVC 或 D:\LVC。不要放在多层目录或保留很长的压缩包名称，不要覆盖以前运行过的旧程序文件夹，不要只复制 LocalVideoCutter.exe，也不要放进 Program Files。
 2. 确认固定离线路径仍是：
 
    <程序文件夹>\offline\windows-rtx5090\
@@ -71,3 +71,5 @@ nvidia-smi
 无法识别 RTX 5090：在 PowerShell 运行 nvidia-smi。离线资源只包含应用依赖，不包含 NVIDIA 显卡驱动。
 
 模型或安装很慢：这是本地解压、校验与安装过程，不代表程序正在联网。请从本地 SSD 运行，并保持足够可用空间。
+
+提示 Windows 路径过长：先退出程序，把整个程序文件夹真正移动并改名为 C:\LVC 或 D:\LVC 后重试；不要只创建快捷方式。模型文件无需重新下载或复制。
