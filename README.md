@@ -80,7 +80,7 @@ Windows 的 AI 超清不需要填写时间。选择一个目标清晰度即可�
 
 剪辑模式下点击“确定并导出”；逐帧截图模式下点击“确定并截图”；永久旋转模式下点击“确定并旋转”。Windows AI 模式下点击“确定并开始 AI 超清”。完成后可以直接点击“在文件夹中显示”。所有操作都会创建新内容，原视频始终保留不变。
 
-运行中的剪辑、逐帧截图和永久旋转会显示动态预计剩余时间；Windows 的 AI 超清也会显示。开始阶段尚无足够速度样本时会显示“正在估算”，进入校验、音频封装等短暂阶段后会显示“正在收尾”；预计时间会根据实际处理速度持续修正，并不是完成时间承诺。
+运行中的剪辑、逐帧截图和永久旋转会显示动态预计剩余时间。Windows AI 超清会排除首个热身分块，再取得至少 2 个真实处理分块的稳定样本（SwiftVR 使用实际输出进度样本），然后显示“AI 生成预计还需”的时间范围；它不再用模型内部阶段百分比直接外推。当前分块显著变慢或长时间没有完成时，旧估算会立即隐藏并显示“正在重新校准”。AI 画面完成后的逐帧校验和音频回封装会单独显示“正在校验并封装”，因此时间范围只代表 AI 画面生成阶段，不是整项任务的完成时间承诺。
 
 剪辑视频的默认文件名为：
 
@@ -321,8 +321,8 @@ brew install python ffmpeg
 当前 GitHub Release 没有商业代码签名证书，Windows 可能在第一次运行时显示 SmartScreen 提示。请只使用本仓库 Releases 中的 ZIP，并同时下载同页对应的 `.zip.sha256` 文件；确认来源后点击“更多信息”再选择“仍要运行”。SHA-256 可以在 PowerShell 中检查：
 
 ```powershell
-Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.6.zip -Algorithm SHA256
-Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.6.zip.sha256
+Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.10.7.zip -Algorithm SHA256
+Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.10.7.zip.sha256
 ```
 
 第一条命令输出中的 `Hash` 必须与 `.zip.sha256` 文件第一列的 64 位字符完全相同（忽略大小写）。只要不同，就不要解压或运行该文件，应重新下载并再次核对。

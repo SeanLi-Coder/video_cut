@@ -216,6 +216,23 @@ def test_frontend_has_independent_ai_model_download_manager() -> None:
     assert "不用选择视频" in html
 
 
+def test_frontend_ai_eta_uses_ranges_and_recalibration_copy() -> None:
+    javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "function formatAiRemainingRange" in javascript
+    assert "estimated_remaining_lower_seconds" in javascript
+    assert "estimated_remaining_upper_seconds" in javascript
+    assert 'etaState === "recalibrating"' in javascript
+    assert "AI 生成预计：速度有变化，正在重新校准…" in javascript
+    assert "AI 生成预计还需：约 ${range}" in javascript
+    assert "（速度有波动）" in javascript
+    assert "（初步估算）" in javascript
+    assert "取得足够的实际处理样本后显示…" in javascript
+    assert 'etaState === "finishing"' in javascript
+    assert "AI 画面已生成：正在校验并封装…" in javascript
+    assert "Number.isFinite(estimate) && estimate > 0" in javascript
+
+
 def test_frontend_supports_selectable_ai_model_catalog() -> None:
     javascript = (PROJECT_ROOT / "app" / "static" / "app.js").read_text(encoding="utf-8")
     html = (PROJECT_ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")

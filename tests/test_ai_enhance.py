@@ -171,37 +171,140 @@ def test_model_download_eta_is_hidden_outside_download_stage() -> None:
     )
 
 
-def test_ai_eta_only_appears_after_inference_has_a_stable_sample() -> None:
-    assert ai_module._estimated_ai_remaining_seconds(
+def test_ai_eta_requires_two_real_work_samples() -> None:
+    estimator = ai_module._WorkRateEstimator()
+
+    estimator.observe(completed_units=0, total_units=5, now=0)
+    assert estimator.reading(now=0).state == "calibrating"
+
+    estimator.observe(completed_units=1, total_units=5, now=60)
+    first = estimator.reading(now=60)
+    assert first.state == "calibrating"
+    assert first.sample_count == 0
+    assert first.seconds is None
+
+    estimator.observe(completed_units=2, total_units=5, now=120)
+    second = estimator.reading(now=120)
+    assert second.state == "calibrating"
+    assert second.sample_count == 1
+    assert second.seconds is None
+
+    estimator.observe(completed_units=3, total_units=5, now=180)
+    stable = estimator.reading(now=180)
+    assert stable.state == "stable"
+    assert stable.confidence == "low"
+    assert stable.sample_count == 2
+    assert stable.seconds == pytest.approx(120)
+    assert stable.lower_seconds == pytest.approx(72)
+    assert stable.upper_seconds == pytest.approx(168)
+
+
+def test_ai_eta_drops_warmup_and_reacts_to_a_real_slowdown() -> None:
+    estimator = ai_module._WorkRateEstimator()
+    estimator.observe(completed_units=0, total_units=10, now=0)
+    estimator.observe(completed_units=1, total_units=10, now=300)
+    estimator.observe(completed_units=2, total_units=10, now=360)
+
+    after_one_steady_sample = estimator.reading(now=360)
+    assert after_one_steady_sample.state == "calibrating"
+    assert after_one_steady_sample.sample_count == 1
+    assert after_one_steady_sample.seconds is None
+
+    estimator.observe(completed_units=3, total_units=10, now=420)
+    steady = estimator.reading(now=420)
+    assert steady.state == "stable"
+    assert steady.seconds == pytest.approx(420)
+
+    estimator.observe(completed_units=4, total_units=10, now=660)
+    slower = estimator.reading(now=660)
+    assert slower.state == "volatile"
+    assert slower.confidence == "low"
+    assert slower.seconds is not None
+    assert slower.seconds > steady.seconds
+
+
+def test_ai_eta_hides_an_expired_prediction_instead_of_sticking_at_zero() -> None:
+    estimator = ai_module._WorkRateEstimator()
+    estimator.observe(completed_units=0, total_units=5, now=0)
+    estimator.observe(completed_units=1, total_units=5, now=60)
+    estimator.observe(completed_units=2, total_units=5, now=120)
+    estimator.observe(completed_units=3, total_units=5, now=180)
+
+    assert estimator.reading(now=210).seconds == pytest.approx(90)
+    stalled = estimator.reading(now=300)
+    assert stalled.state == "recalibrating"
+    assert stalled.seconds is None
+    assert stalled.lower_seconds is None
+    assert stalled.upper_seconds is None
+
+
+def test_seedvr_chunk_phase_logs_drive_eta_from_completed_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    sample_video: Path,
+    ffmpeg: str,
+    ffprobe: str,
+) -> None:
+    source = _source(sample_video, probe_video(sample_video, ffprobe=ffprobe))
+    manager = AIEnhancementManager(
+        ffmpeg=ffmpeg,
+        ffprobe=ffprobe,
+        runtime_root=tmp_path / "runtime",
+        platform_supported=True,
+    )
+    job = AIEnhancementJob(
+        id="seed-progress",
+        source=source,
+        target=ai_module.AI_TARGETS["1080p"],
+        output_path=tmp_path / "output.mp4",
+        expected_width=1920,
+        expected_height=1080,
         status="running",
-        stage="inference",
-        progress=36,
-        stage_elapsed_seconds=20,
-    ) == pytest.approx(60.0)
-    assert (
-        ai_module._estimated_ai_remaining_seconds(
-            status="running",
-            stage="setup",
-            progress=36,
-            stage_elapsed_seconds=20,
-        )
-        is None
     )
-    assert (
-        ai_module._estimated_ai_remaining_seconds(
-            status="running",
-            stage="inference",
-            progress=36,
-            stage_elapsed_seconds=14,
-        )
-        is None
-    )
-    assert ai_module._estimated_ai_remaining_seconds(
-        status="completed",
-        stage="completed",
-        progress=100,
-        stage_elapsed_seconds=20,
-    ) == 0.0
+    observed_messages: list[str] = []
+    observed_readings: list[ai_module._RemainingTimeReading] = []
+    progress_times = iter((0.0, 60.0, 120.0, 180.0, 240.0))
+
+    monkeypatch.setattr(ai_module.time, "monotonic", lambda: next(progress_times))
+    monkeypatch.setattr(manager, "_models_downloaded", lambda _model_id=None: True)
+    monkeypatch.setattr(manager, "_finalize_complete_model_partials", lambda _job: None)
+    monkeypatch.setattr(manager, "inference_command", lambda *_args: ["seedvr-runner"])
+
+    def emit_real_runner_logs(_job, _command, **options):
+        on_line = options["on_line"]
+        for chunk, context in ((1, 0), (2, 4), (3, 4), (4, 4)):
+            on_line(f"Chunk {chunk}/5: 24 new + {context} context frames")
+            on_line("━━━━━━━━ Phase 1: VAE encoding ━━━━━━━━")
+            on_line("━━━━━━━━ Phase 2: DiT upscaling ━━━━━━━━")
+            observed_messages.append(job.message)
+            observed_readings.append(job.eta_estimator.reading(now=chunk * 60.0 - 60.0))
+        return deque()
+
+    monkeypatch.setattr(manager, "_run_process", emit_real_runner_logs)
+
+    manager._run_inference(job, sample_video, tmp_path / "restored.mp4")
+
+    assert observed_messages == [
+        "正在用 SeedVR2 3B FP16 处理分块 1/5（AI 生成）",
+        "正在用 SeedVR2 3B FP16 处理分块 2/5（AI 生成）",
+        "正在用 SeedVR2 3B FP16 处理分块 3/5（AI 生成）",
+        "正在用 SeedVR2 3B FP16 处理分块 4/5（AI 生成）",
+    ]
+    assert [reading.state for reading in observed_readings] == [
+        "calibrating",
+        "calibrating",
+        "calibrating",
+        "stable",
+    ]
+    assert observed_readings[-1].sample_count == 2
+    assert observed_readings[-1].seconds == pytest.approx(120)
+    assert observed_readings[-1].lower_seconds == pytest.approx(72)
+    assert observed_readings[-1].upper_seconds == pytest.approx(168)
+    finished = job.eta_estimator.reading(now=240)
+    assert finished.state == "finishing"
+    assert finished.sample_count == 3
+    manager._set_job(job, stage="verify")
+    assert job.eta_estimator.reading(now=240).sample_count == 3
 
 
 def test_model_ready_requires_exact_validation_cache(

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import app.ai_enhance as ai_module
 from app.ai_enhance import (
     AI_OUTPUT_COLOR_FILTER_GRAPH,
     AI_SWIFTVR_RUNNER_PATH,
@@ -899,19 +900,23 @@ def test_swiftvr_outer_pipeline_runs_one_direct_streaming_process(
         expected_width=1920,
         expected_height=1080,
         model_id=SWIFTVR_5B_BF16_ID,
-        input_frame_count=180,
+        input_frame_count=240,
         input_frame_rate="30/1",
         status="running",
     )
     commands: list[list[str]] = []
+    progress_times = iter((0.0, 60.0, 120.0, 180.0, 180.0))
+    monkeypatch.setattr(ai_module.time, "monotonic", lambda: next(progress_times))
 
     def capture(_job, command, **options):
         commands.append(command)
         if str(AI_SWIFTVR_RUNNER_PATH) in command and options.get("on_line"):
-            options["on_line"](
-                'SWIFTVR_PROGRESS {"stage":"inference","completed_frames":90,'
-                '"total_frames":180,"percent":50,"eta_seconds":123.5}'
-            )
+            for completed in (0, 60, 120, 180):
+                options["on_line"](
+                    "SWIFTVR_PROGRESS "
+                    f'{{"stage":"inference","completed_frames":{completed},'
+                    f'"total_frames":240,"percent":{completed / 2.4}}}'
+                )
         return deque()
 
     monkeypatch.setattr(manager, "_run_process", capture)
@@ -925,7 +930,12 @@ def test_swiftvr_outer_pipeline_runs_one_direct_streaming_process(
     assert command[command.index("--output") + 1].endswith("restored.mp4")
     assert all("ffv1" not in token.lower() for token in command)
     assert job.progress >= 90
-    assert job.snapshot()["estimated_remaining_seconds"] == 123.5
+    snapshot = job.snapshot()
+    assert snapshot["eta_state"] == "stable"
+    assert snapshot["eta_sample_count"] == 2
+    assert snapshot["estimated_remaining_seconds"] == pytest.approx(60)
+    assert snapshot["estimated_remaining_lower_seconds"] == pytest.approx(36)
+    assert snapshot["estimated_remaining_upper_seconds"] == pytest.approx(84)
 
 
 def test_swiftvr_installer_imports_runtime_dependencies_before_marker(

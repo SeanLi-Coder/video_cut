@@ -812,12 +812,73 @@ function formatRemainingTime(value) {
     : `预计还需：约 ${days} 天`;
 }
 
+function formatEtaDuration(value) {
+  const seconds = Math.max(0, Math.round(Number(value) || 0));
+  if (seconds < 60) return `${seconds} 秒`;
+  if (seconds < 3600) return `${Math.max(1, Math.round(seconds / 60))} 分钟`;
+  if (seconds < 86400) {
+    const totalMinutes = Math.round(seconds / 300) * 5;
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    return minutes > 0 ? `${hours} 小时 ${minutes} 分钟` : `${hours} 小时`;
+  }
+  const totalHours = Math.round(seconds / 3600);
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours > 0 ? `${days} 天 ${hours} 小时` : `${days} 天`;
+}
+
+function formatAiRemainingRange(
+  lowerValue,
+  upperValue,
+  { volatile = false, confidence = "" } = {},
+) {
+  const lower = Math.max(0, Number(lowerValue) || 0);
+  const upper = Math.max(lower, Number(upperValue) || 0);
+  const step = upper <= 120 ? 5 : upper <= 600 ? 30 : upper <= 3600 ? 60 : upper <= 86400 ? 300 : 3600;
+  const roundedLower = Math.max(step, Math.floor(lower / step) * step);
+  const roundedUpper = Math.max(roundedLower, Math.ceil(upper / step) * step);
+  const range = roundedLower === roundedUpper
+    ? formatEtaDuration(roundedUpper)
+    : `${formatEtaDuration(roundedLower)}–${formatEtaDuration(roundedUpper)}`;
+  const note = volatile ? "（速度有波动）" : confidence === "low" ? "（初步估算）" : "";
+  return `AI 生成预计还需：约 ${range}${note}`;
+}
+
 function remainingTimeText(snapshot, { cancelling = false } = {}) {
   if (cancelling) return "预计还需：正在停止…";
   const status = String(snapshot?.status || "").toLowerCase();
   const stage = String(snapshot?.stage || snapshot?.phase || status).toLowerCase();
   const active = ["queued", "pending", "waiting", "running", "processing", "exporting"].includes(status);
   if (!active) return "";
+  const aiEstimate = snapshot?.eta_scope === "ai_generation" || snapshot?.operation === "enhance";
+  if (aiEstimate) {
+    if (["verify", "verifying", "remux", "finalize", "finalizing"].includes(stage)
+      || normalizeProgress(snapshot?.progress) >= 90) {
+      return "AI 画面已生成：正在校验并封装…";
+    }
+    const etaState = String(snapshot?.eta_state || "").toLowerCase();
+    if (etaState === "finishing") {
+      return "AI 画面已生成：正在校验并封装…";
+    }
+    if (etaState === "recalibrating") {
+      return "AI 生成预计：速度有变化，正在重新校准…";
+    }
+    if (etaState === "calibrating" || stage !== "inference") {
+      return stage === "inference"
+        ? "AI 生成预计：正在校准，取得足够的实际处理样本后显示…"
+        : "AI 生成预计：等待实际处理开始…";
+    }
+    const lower = Number(snapshot?.estimated_remaining_lower_seconds);
+    const upper = Number(snapshot?.estimated_remaining_upper_seconds);
+    if (Number.isFinite(lower) && lower > 0 && Number.isFinite(upper) && upper >= lower) {
+      return formatAiRemainingRange(lower, upper, {
+        volatile: etaState === "volatile",
+        confidence: String(snapshot?.eta_confidence || "").toLowerCase(),
+      });
+    }
+    return "AI 生成预计：正在校准处理速度…";
+  }
   if (["verify", "verifying", "remux", "finalize", "finalizing"].includes(stage)
     || normalizeProgress(snapshot?.progress) >= 99) {
     return "预计还需：正在收尾…";
@@ -825,7 +886,7 @@ function remainingTimeText(snapshot, { cancelling = false } = {}) {
   const rawEstimate = snapshot?.estimated_remaining_seconds;
   if (rawEstimate !== null && rawEstimate !== undefined && rawEstimate !== "") {
     const estimate = Number(rawEstimate);
-    if (Number.isFinite(estimate) && estimate >= 0) return formatRemainingTime(estimate);
+    if (Number.isFinite(estimate) && estimate > 0) return formatRemainingTime(estimate);
   }
   return "预计还需：正在估算…";
 }

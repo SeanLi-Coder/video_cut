@@ -22,6 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
+from statistics import median
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
@@ -131,31 +132,155 @@ def _utf8_process_environment(base: dict[str, str] | None = None) -> dict[str, s
     return environment
 
 
-def _estimated_ai_remaining_seconds(
-    *,
-    status: str,
-    stage: str,
-    progress: float,
-    stage_elapsed_seconds: float,
-) -> float | None:
-    normalized_status = str(status).lower()
-    if normalized_status == "completed":
-        return 0.0
-    if normalized_status != "running" or str(stage).lower() != "inference":
-        return None
-    values = (progress, stage_elapsed_seconds)
-    if not all(math.isfinite(value) for value in values):
-        return None
-    if stage_elapsed_seconds < 15 or progress <= 19 or progress >= 90:
-        return None
-    inference_progress = progress - 18.0
-    progress_per_second = inference_progress / stage_elapsed_seconds
-    if progress_per_second <= 0:
-        return None
-    estimate = (90.0 - progress) / progress_per_second
-    if not math.isfinite(estimate) or estimate < 0:
-        return None
-    return round(min(estimate, MAX_ESTIMATED_REMAINING_SECONDS), 1)
+@dataclass(frozen=True, slots=True)
+class _RemainingTimeReading:
+    state: str
+    sample_count: int
+    seconds: float | None = None
+    lower_seconds: float | None = None
+    upper_seconds: float | None = None
+    confidence: str | None = None
+
+
+@dataclass
+class _WorkRateEstimator:
+    minimum_samples: int = 2
+    maximum_samples: int = 8
+    _warmup_complete: bool = field(default=False, init=False, repr=False)
+    _steady_samples: deque[float] = field(init=False, repr=False)
+    _sample_count: int = field(default=0, init=False, repr=False)
+    _total_units: float | None = field(default=None, init=False, repr=False)
+    _completed_units: float | None = field(default=None, init=False, repr=False)
+    _last_observed_at: float | None = field(default=None, init=False, repr=False)
+    _last_increment_units: float = field(default=1.0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.minimum_samples = max(2, int(self.minimum_samples))
+        self.maximum_samples = max(self.minimum_samples, int(self.maximum_samples))
+        self._steady_samples = deque(maxlen=self.maximum_samples)
+
+    def reset(self) -> None:
+        self._warmup_complete = False
+        self._steady_samples.clear()
+        self._sample_count = 0
+        self._total_units = None
+        self._completed_units = None
+        self._last_observed_at = None
+        self._last_increment_units = 1.0
+
+    def observe(
+        self,
+        *,
+        completed_units: float,
+        total_units: float,
+        now: float | None = None,
+    ) -> None:
+        observed_at = time.monotonic() if now is None else float(now)
+        values = (float(completed_units), float(total_units), observed_at)
+        if not all(math.isfinite(value) for value in values) or total_units <= 0:
+            return
+        total = float(total_units)
+        completed = min(total, max(0.0, float(completed_units)))
+        if (
+            self._total_units is None
+            or self._completed_units is None
+            or self._last_observed_at is None
+            or not math.isclose(total, self._total_units)
+            or completed < self._completed_units
+            or observed_at < self._last_observed_at
+        ):
+            self.reset()
+            self._total_units = total
+            self._completed_units = completed
+            self._last_observed_at = observed_at
+            return
+        if completed <= self._completed_units:
+            return
+        elapsed = observed_at - self._last_observed_at
+        increment = completed - self._completed_units
+        seconds_per_unit = elapsed / increment if increment > 0 else 0.0
+        if math.isfinite(seconds_per_unit) and seconds_per_unit > 0:
+            if not self._warmup_complete:
+                self._warmup_complete = True
+            else:
+                self._steady_samples.append(seconds_per_unit)
+                self._sample_count += 1
+                self._last_increment_units = increment
+        self._completed_units = completed
+        self._last_observed_at = observed_at
+
+    @staticmethod
+    def _median_absolute_deviation(samples: list[float], center: float) -> float:
+        return float(median(abs(sample - center) for sample in samples))
+
+    @staticmethod
+    def _exponential_average(samples: list[float]) -> float:
+        result = samples[0]
+        for sample in samples[1:]:
+            result = result * 0.55 + sample * 0.45
+        return result
+
+    def reading(self, *, now: float | None = None) -> _RemainingTimeReading:
+        sample_count = self._sample_count
+        if (
+            self._total_units is None
+            or self._completed_units is None
+            or self._last_observed_at is None
+            or sample_count < self.minimum_samples
+        ):
+            return _RemainingTimeReading("calibrating", sample_count)
+        if self._completed_units >= self._total_units:
+            return _RemainingTimeReading("finishing", sample_count)
+
+        samples = list(self._steady_samples)
+        if len(samples) < 2:
+            return _RemainingTimeReading("calibrating", sample_count)
+
+        sample_median = float(median(samples))
+        recent_rate = self._exponential_average(samples[-5:])
+        seconds_per_unit = max(sample_median, recent_rate)
+        if sample_count == 2:
+            margin = 0.40
+            confidence = "low"
+        else:
+            deviation = self._median_absolute_deviation(samples, sample_median)
+            relative_deviation = deviation / sample_median if sample_median > 0 else 1.0
+            margin = min(0.45, max(0.12, 1.3 * 1.4826 * relative_deviation))
+            confidence = "high" if len(samples) >= 5 and margin <= 0.20 else "medium"
+
+        lower_rate = max(0.001, seconds_per_unit * (1.0 - margin))
+        upper_rate = max(seconds_per_unit, seconds_per_unit * (1.0 + margin))
+        newest_rate = samples[-1]
+        volatile = newest_rate > sample_median * 1.5 or newest_rate < sample_median / 1.5
+        if volatile:
+            confidence = "low"
+            upper_rate = max(upper_rate, newest_rate * 1.20)
+
+        current_time = time.monotonic() if now is None else float(now)
+        if not math.isfinite(current_time) or current_time < self._last_observed_at:
+            return _RemainingTimeReading("recalibrating", sample_count)
+        since_observation = current_time - self._last_observed_at
+        expected_update_upper = upper_rate * max(1.0, self._last_increment_units)
+        if since_observation > max(60.0, expected_update_upper * 1.25):
+            return _RemainingTimeReading("recalibrating", sample_count)
+
+        remaining_units = self._total_units - self._completed_units
+        estimate = remaining_units * seconds_per_unit - since_observation
+        lower = remaining_units * lower_rate - since_observation
+        upper = remaining_units * upper_rate - since_observation
+        if estimate <= 0 or upper <= 0:
+            return _RemainingTimeReading("recalibrating", sample_count)
+        estimate = min(MAX_ESTIMATED_REMAINING_SECONDS, estimate)
+        lower = min(estimate, max(1.0, lower))
+        upper = min(MAX_ESTIMATED_REMAINING_SECONDS, max(estimate, upper))
+        return _RemainingTimeReading(
+            "volatile" if volatile else "stable",
+            sample_count,
+            seconds=round(estimate, 1),
+            lower_seconds=round(lower, 1),
+            upper_seconds=round(upper, 1),
+            confidence=confidence,
+        )
 
 
 def _estimated_model_download_remaining_seconds(
@@ -764,9 +889,11 @@ class AIEnhancementJob:
     error: str | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
-    stage_started_at: float | None = None
-    reported_eta_seconds: float | None = None
     finished_at: float | None = None
+    eta_estimator: _WorkRateEstimator = field(
+        default_factory=_WorkRateEstimator,
+        repr=False,
+    )
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     process: subprocess.Popen[Any] | None = field(default=None, repr=False)
     worker: threading.Thread | None = field(default=None, repr=False)
@@ -777,24 +904,21 @@ class AIEnhancementJob:
             end_time = self.finished_at or time.time()
             start_time = self.started_at or self.created_at
             elapsed_seconds = max(0.0, end_time - start_time)
-            stage_start_time = self.stage_started_at or start_time
-            stage_elapsed_seconds = max(0.0, end_time - stage_start_time)
-            estimated_remaining_seconds = _estimated_ai_remaining_seconds(
-                status=self.status,
-                stage=self.stage,
-                progress=self.progress,
-                stage_elapsed_seconds=stage_elapsed_seconds,
-            )
-            if (
-                self.status == "running"
-                and self.stage == "inference"
-                and self.reported_eta_seconds is not None
-                and math.isfinite(self.reported_eta_seconds)
-                and self.reported_eta_seconds >= 0
-            ):
-                estimated_remaining_seconds = round(
-                    min(MAX_ESTIMATED_REMAINING_SECONDS, self.reported_eta_seconds), 1
+            if self.status == "completed":
+                eta = _RemainingTimeReading(
+                    "completed",
+                    self.eta_estimator.reading().sample_count,
+                    seconds=0.0,
+                    lower_seconds=0.0,
+                    upper_seconds=0.0,
+                    confidence="high",
                 )
+            elif self.status == "running" and self.stage == "inference":
+                eta = self.eta_estimator.reading()
+            elif self.status == "running" and self.stage in {"verify", "remux"}:
+                eta = _RemainingTimeReading("finishing", 0)
+            else:
+                eta = _RemainingTimeReading("unavailable", 0)
             return {
                 "job_id": self.id,
                 "operation": "enhance",
@@ -806,7 +930,13 @@ class AIEnhancementJob:
                 "output_path": str(self.output_path) if self.status == "completed" else None,
                 "error": self.error,
                 "elapsed_seconds": round(elapsed_seconds, 1),
-                "estimated_remaining_seconds": estimated_remaining_seconds,
+                "estimated_remaining_seconds": eta.seconds,
+                "estimated_remaining_lower_seconds": eta.lower_seconds,
+                "estimated_remaining_upper_seconds": eta.upper_seconds,
+                "eta_state": eta.state,
+                "eta_confidence": eta.confidence,
+                "eta_sample_count": eta.sample_count,
+                "eta_scope": "ai_generation",
                 "target": self.target.id,
                 "target_label": self.target.label,
                 "target_width": self.expected_width,
@@ -2291,8 +2421,12 @@ class AIEnhancementManager:
     ) -> None:
         with job.lock:
             if stage is not None:
-                if stage != job.stage and isinstance(job, AIEnhancementJob):
-                    job.stage_started_at = time.time()
+                if (
+                    stage == "inference"
+                    and stage != job.stage
+                    and isinstance(job, AIEnhancementJob)
+                ):
+                    job.eta_estimator.reset()
                 job.stage = stage
             if progress is not None:
                 job.progress = max(job.progress, min(99.0, progress))
@@ -3678,11 +3812,16 @@ class AIEnhancementManager:
         current_chunk = 0
         total_chunks = 0
         phase_fraction = 0.0
+        phase_label = "准备"
 
         def parse_line(line: str) -> None:
-            nonlocal current_chunk, total_chunks, phase_fraction
+            nonlocal current_chunk, total_chunks, phase_fraction, phase_label
             lower = line.lower()
-            if "downloading" in lower or ".safetensors" in lower and "%" in line:
+            with job.lock:
+                download_in_progress = job.stage == "download"
+            if "downloading" in lower or (
+                download_in_progress and ".safetensors" in lower and "%" in line
+            ):
                 percent_match = re.search(r"(\d{1,3})%", line)
                 percent = min(100, int(percent_match.group(1))) if percent_match else 0
                 self._set_job(
@@ -3696,19 +3835,31 @@ class AIEnhancementManager:
                 )
                 return
             chunk_match = re.search(r"Chunk\s+(\d+)/(\d+)", line, re.IGNORECASE)
+            chunk_started = False
+            progress_event = False
             if chunk_match:
                 current_chunk = int(chunk_match.group(1))
                 total_chunks = max(1, int(chunk_match.group(2)))
                 phase_fraction = 0.0
-            if "phase 1" in lower or "encode" in lower:
-                phase_fraction = max(phase_fraction, 0.08)
-            elif "phase 2" in lower or "dit inference" in lower or "upscale" in lower:
-                phase_fraction = max(phase_fraction, 0.25)
-            elif "phase 3" in lower or "decode" in lower:
-                phase_fraction = max(phase_fraction, 0.78)
-            elif "phase 4" in lower or "post-process" in lower or "saving" in lower:
-                phase_fraction = max(phase_fraction, 0.94)
-            if "processing video" in lower or current_chunk:
+                phase_label = "准备"
+                chunk_started = True
+                progress_event = True
+            phase_match = re.search(r"\bPhase\s+([1-4])\s*:", line, re.IGNORECASE)
+            if phase_match:
+                phase_number = int(phase_match.group(1))
+                phase_fraction, phase_label = {
+                    1: (0.08, "编码"),
+                    2: (0.25, "AI 生成"),
+                    3: (0.78, "解码"),
+                    4: (0.94, "写入"),
+                }[phase_number]
+                progress_event = True
+            if "processing video" in lower and not current_chunk:
+                current_chunk = 1
+                total_chunks = 1
+                chunk_started = True
+                progress_event = True
+            if progress_event and current_chunk:
                 if not total_chunks:
                     total_chunks = 1
                     current_chunk = 1
@@ -3718,11 +3869,19 @@ class AIEnhancementManager:
                     stage="inference",
                     progress=18 + fraction * 72,
                     message=(
-                        f"正在转换 HDR 色彩并用 {MODEL_NAME} 逐帧生成 {job.target.label} 画面"
+                        f"正在转换 HDR 色彩并用 {MODEL_NAME} 处理"
+                        f"分块 {current_chunk}/{total_chunks}（{phase_label}）"
                         if color_plan.mode == "tone_map_hdr"
-                        else f"正在用 {MODEL_NAME} 逐帧生成 {job.target.label} 画面"
+                        else f"正在用 {MODEL_NAME} 处理分块 "
+                        f"{current_chunk}/{total_chunks}（{phase_label}）"
                     ),
                 )
+                if chunk_started:
+                    with job.lock:
+                        job.eta_estimator.observe(
+                            completed_units=current_chunk - 1,
+                            total_units=total_chunks,
+                        )
 
         self._finalize_complete_model_partials(job)
         command = self.inference_command(job, input_path, output_path)
@@ -3747,6 +3906,12 @@ class AIEnhancementManager:
             env=self._inference_environment(),
             on_line=parse_line,
         )
+        if total_chunks > 0:
+            with job.lock:
+                job.eta_estimator.observe(
+                    completed_units=total_chunks,
+                    total_units=total_chunks,
+                )
         self._set_job(job, stage="inference", progress=90, message="AI 画面生成完成")
 
     def _run_swiftvr_inference(
@@ -3780,7 +3945,7 @@ class AIEnhancementManager:
             stage = str(payload.get("stage") or "inference")
             if stage == "model_load":
                 with job.lock:
-                    job.reported_eta_seconds = None
+                    job.eta_estimator.reset()
                 self._set_job(
                     job,
                     stage="inference",
@@ -3790,25 +3955,17 @@ class AIEnhancementManager:
                 return
             completed = max(0, int(payload.get("completed_frames") or 0))
             total = max(1, int(payload.get("total_frames") or job.input_frame_count))
-            eta_value = payload.get("eta_seconds")
-            try:
-                reported_eta = float(eta_value) if eta_value is not None else None
-            except (TypeError, ValueError):
-                reported_eta = None
-            with job.lock:
-                job.reported_eta_seconds = (
-                    reported_eta
-                    if reported_eta is not None
-                    and math.isfinite(reported_eta)
-                    and reported_eta >= 0
-                    else None
-                )
             self._set_job(
                 job,
                 stage="inference",
                 progress=20 + min(100.0, max(0.0, percent)) * 0.66,
                 message=f"SwiftVR 正在流式修复并编码：{completed}/{total}",
             )
+            with job.lock:
+                job.eta_estimator.observe(
+                    completed_units=completed,
+                    total_units=total,
+                )
 
         self._run_process(
             job,
@@ -4140,7 +4297,6 @@ class AIEnhancementManager:
                 job.stage = "setup"
                 job.message = f"正在准备 {model_name} 的 {self.backend_label} AI 环境"
                 job.started_at = started_at
-                job.stage_started_at = started_at
             self._audit_frame_timing(job)
             if job.cancel_event.is_set():
                 raise InterruptedError
