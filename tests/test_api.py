@@ -185,7 +185,7 @@ def test_ai_multi_video_selection_keeps_valid_files_when_one_fails(
     assert payload["errors"] == [
         {
             "name": missing_video.name,
-            "path_display": str(missing_video),
+            "path_display": main_module._display_path(missing_video),
             "error": "所选视频不存在，请重新选择。",
         }
     ]
