@@ -118,7 +118,7 @@ def test_windows_portable_smoke_checks_authenticated_model_catalog() -> None:
     assert '[string]$SwiftTargets[0] -ne "1080p"' in smoke_script
 
 
-def test_release_docs_cover_private_access_and_checksum_comparison() -> None:
+def test_release_docs_cover_public_access_and_checksum_comparison() -> None:
     readme = _read("README.md")
     windows_readme = _read("WINDOWS_README.txt")
     build_match = re.search(
@@ -131,8 +131,9 @@ def test_release_docs_cover_private_access_and_checksum_comparison() -> None:
     release_archive = f"LocalVideoCutter-Windows-RTX5090-v{build_match.group(1)}.zip"
 
     for document in (readme, windows_readme):
-        assert "private" in document
-        assert "访问权限" in document
+        assert "public" in document
+        assert "无需登录" in document
+        assert "private 仓库" not in document
         assert ".zip.sha256" in document
         assert "文件第一列" in document
         assert release_archive in document

@@ -43,7 +43,7 @@ RTX 5090 需要已经正确安装 R580 或更新分支的 NVIDIA 驱动；程序
 
 本版本的 RTX 5090 与 SwiftVR 适配是在 Apple M2 开发机上完成，只通过静态、mock 和无 CUDA 自动化测试，不能视为已经在真实 5090 上验收。请先用短片测试模型安装、推理、显存峰值、取消、颜色、音频与成片，再处理重要长视频。
 
-这是未购买商业代码签名证书的未签名构建。Windows SmartScreen 可能首次显示“未知发布者”。本项目 GitHub 仓库是 private 仓库，下载 Releases 前必须登录已获访问权限的 GitHub 账号；如果 RTX 5090 电脑不方便登录，请先在有权限的电脑上下载并核对，再复制完整 ZIP。请同时下载同页对应的 .zip.sha256 文件，在 PowerShell 运行：
+这是未购买商业代码签名证书的未签名构建。Windows SmartScreen 可能首次显示“未知发布者”。本项目 GitHub 仓库是 public 仓库，无需登录即可下载 Releases；请只使用本项目官方 Releases 页面提供的文件。请同时下载同页对应的 .zip.sha256 文件，在 PowerShell 运行：
 
 Get-FileHash .\LocalVideoCutter-Windows-RTX5090-v1.11.0.zip -Algorithm SHA256
 Get-Content .\LocalVideoCutter-Windows-RTX5090-v1.11.0.zip.sha256

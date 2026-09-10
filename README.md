@@ -6,7 +6,7 @@
 
 ### 1. 下载并解压
 
-本仓库是 private 仓库。打开 Releases、下载 Release 文件或使用 **Code → Download ZIP** 前，必须先登录已获本仓库访问权限的 GitHub 账号。Windows 11 / RTX 5090 用户建议打开 [GitHub Releases](https://github.com/SeanLi-Coder/video_cut/releases/latest)，下载名称以 `LocalVideoCutter-Windows-RTX5090` 开头的 ZIP；macOS 或需要源码的用户可以在项目页面点击 **Code → Download ZIP**。如果 RTX 5090 电脑不方便登录 GitHub，请先在有权限的电脑上下载并核对文件，再把完整 ZIP 复制到 Windows 电脑。普通 Windows 便携 ZIP 不包含数十 GB 的离线依赖和模型；完全离线部署还需要取得同版本的完整 `offline` 和 `data` 文件夹，并按下文固定路径放置。
+本仓库是 public 仓库，无需登录 GitHub 即可打开 Releases 或下载源码。Windows 11 / RTX 5090 用户建议打开 [GitHub Releases](https://github.com/SeanLi-Coder/video_cut/releases/latest)，下载名称以 `LocalVideoCutter-Windows-RTX5090` 开头的 ZIP；macOS 或需要源码的用户可以在项目页面点击 **Code → Download ZIP**。普通 Windows 便携 ZIP 不包含数十 GB 的离线依赖和模型；完全离线部署还需要取得同版本的完整 `offline` 和 `data` 文件夹，并按下文固定路径放置。
 
 不要直接在 ZIP 压缩包预览窗口里运行，也不要只复制其中的 EXE。Windows 版请把整个文件夹完整解压到本地 SSD 的短路径可写目录，推荐 `C:\LVC` 或 `D:\LVC`；不要保留很长的压缩包目录名。macOS 版放在普通可写目录即可。
 
